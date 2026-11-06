@@ -130,7 +130,7 @@ window.IE_CHAPTERS = [
 "title": "TensorRT-LLM, NVIDIA Dynamo and edge runtimes",
 "slug": "3-6-trtllm-dynamo-edge",
 "part": 3,
-"ready": false
+"ready": true
 },
 {
 "n": "3.7",

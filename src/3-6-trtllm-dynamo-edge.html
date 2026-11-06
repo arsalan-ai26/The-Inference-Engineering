@@ -1,0 +1,253 @@
+<div class="kicker">Part 3 · Inference engines and serving · Chapter 3.6</div>
+<h1>TensorRT-LLM, NVIDIA Dynamo and edge runtimes</h1>
+<p class="lede">vLLM and SGLang are not the only engines. TensorRT-LLM trades ease of use for NVIDIA's most tuned kernels. NVIDIA Dynamo sits above any engine and turns many GPUs into one coordinated service. At the other end, llama.cpp and Ollama run quantized models on laptops, CPUs and Apple Silicon. This chapter explains what each one is for, how to compare engines fairly, and ends with a selection matrix you can use on real projects.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 4 hours with the lab</span>
+  <span class="chip">Needs: 1.3, 3.1 to 3.5</span>
+  <span class="chip">Compute: Colab CPU and T4</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What is the difference between TensorRT-LLM version 0.x and version 1.x?</li>
+    <li>Does NVIDIA Dynamo replace vLLM, SGLang or TensorRT-LLM?</li>
+    <li>An 8B model in GGUF Q4_K_M is about how large, and why is it larger than 8B × 4 bits?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Versions 0.x build a TensorRT engine ahead of time for one GPU and shape range. Versions 1.x run on a PyTorch-based backend with no TensorRT build step, using NVIDIA's kernels directly.</li>
+    <li>No. Dynamo is an orchestration layer that uses those engines as backends and adds disaggregation, KV-aware routing, KV cache management and planning across many GPUs.</li>
+    <li>About 4.9 GB (4.58 GiB). Q4_K_M averages about 4.9 bits per weight: block scales and minimums add bits, and some tensors are kept at higher precision.</li>
+  </ol></details>
+</div>
+
+<h2 id="trtllm">1. TensorRT-LLM</h2>
+<p>TensorRT-LLM is NVIDIA's open-source LLM inference engine. Its main advantage is access to kernels written by NVIDIA engineers for each new GPU generation, some of them closed source, and early support for NVIDIA-specific formats such as NVFP4 (chapter 1.3). It supports the full set of serving features: in-flight batching (NVIDIA's name for continuous batching), paged KV cache with reuse, chunked prefill, quantization, speculative decoding, parallelism and disaggregation.</p>
+<h3>Two generations, two ways to run</h3>
+<div class="tbl"><table>
+<tr><th></th><th>Version 0.x (TensorRT engines)</th><th>Version 1.x (PyTorch backend)</th></tr>
+<tr><td>How a model runs</td><td>Build a TensorRT engine ahead of time (<code>trtllm-build</code>) for one GPU architecture, with fixed limits such as maximum batch size and sequence length</td><td>Model code in PyTorch calling NVIDIA's custom kernels; no engine build</td></tr>
+<tr><td>Change a limit</td><td>Rebuild the engine</td><td>Change a setting and restart</td></tr>
+<tr><td>Serving</td><td>Often behind Triton Inference Server</td><td><code>trtllm-serve</code> (OpenAI-compatible) with flags plus a YAML config file</td></tr>
+<tr><td>Status</td><td>Still common in older deployments</td><td>Released in 2025; the current direction</td></tr>
+</table></div>
+<p><strong>Ahead-of-time compilation</strong> (version 0.x) is the TensorRT idea from chapter 3.1 applied to LLMs: knowing the GPU and the shape ranges in advance lets the compiler pick and fuse the fastest kernels for exactly those shapes. The <strong>plugin</strong> mechanism lets hand-written kernels (attention, fused projections, FP8 matmuls) stand in for parts of the graph that a generic compiler would handle poorly.</p>
+<div class="box watch">
+  <span class="lbl">Watch out: claims about rebuilds and "unmatched" speed</span>
+  <p>You may read that every change of batch size or sequence length in TensorRT-LLM needs a recompile, and that its FP8 throughput cannot be matched by other engines. The first is true of version 0.x engine builds, not of the version 1.x PyTorch backend. The second depends on model, GPU, settings and engine versions; engines leapfrog each other often. Measure on your workload (section 4).</p>
+</div>
+<p>When TensorRT-LLM tends to win: a popular, well-supported model on Hopper or Blackwell GPUs, a team willing to spend engineering time on configuration, and especially when you want the newest NVIDIA formats and kernels first. Install it through NVIDIA's official containers; the dependency stack is large.</p>
+
+<h2 id="dynamo">2. NVIDIA Dynamo: orchestration above the engine</h2>
+<p>An engine runs one model replica on one set of GPUs. A large service runs many replicas and wants them to cooperate. NVIDIA Dynamo, announced in March 2025 and open source under Apache 2.0, is a distributed serving framework that uses vLLM, SGLang or TensorRT-LLM as its engines and adds:</p>
+<div class="svgwrap"><svg viewBox="0 0 700 250" width="700" style="max-width:100%;height:auto" role="img" aria-label="Dynamo: frontend, KV-aware router, prefill and decode workers, KV transfer and planner">
+  <defs><marker id="ar36" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--ink2)"/></marker></defs>
+  <g font-size="12">
+    <rect x="10" y="95" width="100" height="56" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="60" y="119" text-anchor="middle" fill="var(--ink)">1. frontend</text><text x="60" y="135" text-anchor="middle" fill="var(--ink2)">OpenAI API</text>
+    <rect x="140" y="95" width="120" height="56" rx="8" fill="var(--kv-s)" stroke="var(--kv)"/><text x="200" y="119" text-anchor="middle" fill="var(--ink)">2. KV-aware</text><text x="200" y="135" text-anchor="middle" fill="var(--ink)">router</text>
+    <rect x="300" y="30" width="150" height="56" rx="8" fill="var(--pre-s)" stroke="var(--pre)"/><text x="375" y="54" text-anchor="middle" fill="var(--ink)">3. prefill workers</text><text x="375" y="70" text-anchor="middle" fill="var(--ink2)">engine: vLLM / SGLang / TRT-LLM</text>
+    <rect x="300" y="160" width="150" height="56" rx="8" fill="var(--dec-s)" stroke="var(--dec)"/><text x="375" y="184" text-anchor="middle" fill="var(--ink)">4. decode workers</text><text x="375" y="200" text-anchor="middle" fill="var(--ink2)">same engines</text>
+    <rect x="500" y="95" width="180" height="56" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="590" y="119" text-anchor="middle" fill="var(--ink)">5. KV cache manager</text><text x="590" y="135" text-anchor="middle" fill="var(--ink2)">GPU, CPU, SSD, remote</text>
+    <rect x="500" y="10" width="180" height="50" rx="8" fill="var(--panel)" stroke="var(--line)" stroke-dasharray="5 4"/><text x="590" y="32" text-anchor="middle" fill="var(--ink)">6. planner</text><text x="590" y="48" text-anchor="middle" fill="var(--ink2)">scales workers to SLOs</text>
+    <path d="M110 123H138M260 112L298 66M260 134L298 180" stroke="var(--ink2)" fill="none" marker-end="url(#ar36)"/>
+    <path d="M375 86V158" stroke="var(--kv)" stroke-width="2" fill="none" stroke-dasharray="5 3" marker-end="url(#ar36)"/><text x="384" y="128" fill="var(--kv)">KV transfer (NIXL)</text>
+    <path d="M450 58L498 110M450 188L498 140" stroke="var(--ink2)" fill="none" marker-end="url(#ar36)"/>
+  </g>
+</svg></div>
+<ol>
+  <li><strong>Frontend:</strong> an OpenAI-compatible API.</li>
+  <li><strong>KV-aware router:</strong> sends each request to the worker that already holds the most of its prefix in cache, balancing that against load (chapter 3.5, section 5).</li>
+  <li>and 4. <strong>Disaggregated serving:</strong> prefill and decode on separate pools of workers, each sized and tuned for its phase (chapter 4.6).</li>
+  <li><strong>KV cache transfer and management:</strong> NIXL, NVIDIA's transfer library, moves KV blocks between workers and memory tiers.</li>
+  <li><strong>Planner:</strong> scales prefill and decode workers up and down to meet TTFT and throughput targets as traffic changes.</li>
+</ol>
+<p>The current documentation (version 1.6 at the time of writing) lists support for NVIDIA and AMD GPUs and Intel XPUs, and deployment on Kubernetes, Slurm or a single machine. Components can be adopted one at a time.</p>
+<p><strong>When it is worth it:</strong> large models, heavy traffic, many GPUs, and workloads where prefix reuse or prefill-decode interference matter. For a few replicas of a small model, the extra moving parts usually cost more than they save; run the engine directly.</p>
+
+<h2 id="edge">3. Edge and local runtimes: llama.cpp, GGUF and Ollama</h2>
+<p>A different world runs on laptops, desktops, phones and CPU servers: one user, little memory, no data-center GPU. Here the goals are to fit the model at all and to make single-user decode fast.</p>
+<h3>llama.cpp</h3>
+<p>llama.cpp is a C/C++ inference engine built on the ggml tensor library, with no Python dependency. It runs on x86 CPUs (with AVX, AVX-512 and AMX), ARM and Apple Silicon (with Metal), NVIDIA GPUs (CUDA), AMD GPUs (HIP), and through Vulkan and SYCL. Its key features for local use:</p>
+<ul>
+  <li><strong>Integer quantization from 1.5 to 8 bits</strong> in its own block formats.</li>
+  <li><strong>CPU plus GPU hybrid inference:</strong> put as many layers as fit on the GPU and run the rest on the CPU, so models larger than GPU memory still run.</li>
+  <li><strong>An OpenAI-compatible server</strong> and a command-line chat. Recent releases use one <code>llama</code> command (<code>llama cli</code>, <code>llama serve</code>); older ones ship <code>llama-cli</code> and <code>llama-server</code> binaries.</li>
+</ul>
+<h3>GGUF</h3>
+<p>GGUF is the single-file format llama.cpp uses. Unlike safetensors, which stores only tensors (chapter 3.1), a GGUF file holds the tensors <em>and</em> a standard set of metadata: the architecture, hyperparameters, tokenizer and chat template. One file is enough to run the model. The Hugging Face Hub has a GGUF viewer and a conversion tool.</p>
+<p>The common quantization types use blocks with their own scales (chapter 1.3, section 6). The "K" types group blocks into super-blocks with 6-bit scales and minimums:</p>
+<div class="tbl"><table>
+<tr><th>Type</th><th class="n">Bits per weight</th><th class="n">Llama-3.1-8B-class size</th><th>Typical use</th></tr>
+<tr><td>Q8_0</td><td class="n">8.50</td><td class="n">7.95 GiB</td><td>Near-lossless reference</td></tr>
+<tr><td>Q6_K</td><td class="n">6.56</td><td class="n">6.14 GiB</td><td>High quality</td></tr>
+<tr><td>Q5_K_M</td><td class="n">5.70</td><td class="n">5.33 GiB</td><td>Good balance</td></tr>
+<tr><td>Q4_K_M</td><td class="n">4.89</td><td class="n">4.58 GiB</td><td>The most common default</td></tr>
+<tr><td>Q4_K_S</td><td class="n">4.67</td><td class="n">4.36 GiB</td><td>Smaller, slightly lower quality</td></tr>
+<tr><td>IQ2 to IQ3 types</td><td class="n">about 2 to 3.5</td><td class="n">smaller still</td><td>Fitting very large models; quality drops</td></tr>
+</table></div>
+<p class="note">Bits per weight and sizes from llama.cpp's quantization documentation, measured on an 8B model. "_M" variants keep some sensitive tensors at higher precision than "_S".</p>
+<h3>Ollama</h3>
+<p>Ollama wraps a llama.cpp-based engine in a simple model manager and service: <code>ollama run &lt;model&gt;</code> downloads and starts a model from its library, a local server exposes its own API and OpenAI- and Anthropic-compatible endpoints, and a "Modelfile" sets parameters and templates. It is the easiest way to run a model on a laptop or inside a desktop app.</p>
+
+<div class="widget" id="edW">
+  <div class="wt">Interactive: will it run on my machine, and how fast?</div>
+  <div class="ws">Single-user decode on a local machine is memory-bandwidth-bound (chapter 2.5): each token reads every weight once. With partial offload, the layers on the GPU are read at GPU speed and the rest at CPU RAM speed. A rough ceiling, before overheads.</div>
+  <div class="ctrls">
+    <label>Model size (billions) <select id="edP"><option value="0.5">0.5</option><option value="3.8">3.8</option><option value="8" selected>8</option><option value="14">14</option><option value="32">32</option><option value="70">70</option></select></label>
+    <label>Quantization <select id="edQ"><option value="16">F16 (16)</option><option value="8.5">Q8_0 (8.5)</option><option value="5.7">Q5_K_M (5.7)</option><option value="4.89" selected>Q4_K_M (4.89)</option><option value="3.5">IQ3 (about 3.5)</option></select></label>
+    <label>GPU memory (GB, 0 for none) <select id="edV"><option value="0">0</option><option value="8">8</option><option value="12" selected>12</option><option value="24">24</option></select></label>
+    <label>GPU bandwidth (GB/s) <select id="edGB"><option value="300">300 (laptop / L4-class)</option><option value="450" selected>450</option><option value="1000">1,000 (RTX 4090-class)</option></select></label>
+    <label>CPU memory bandwidth (GB/s) <select id="edCB"><option value="50">50 (dual-channel DDR4)</option><option value="90" selected>90 (DDR5)</option><option value="400">400 (Apple unified, high end)</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="edSvg" viewBox="0 0 680 80" width="680" style="max-width:100%;height:auto" role="img" aria-label="Share of the model on GPU and CPU"></svg></div>
+  <div class="stats" id="edStats"></div>
+</div>
+
+<h2 id="fair">4. Comparing engines fairly</h2>
+<p>Published engine comparisons often disagree, because small differences in setup change results by large factors. A fair comparison controls these:</p>
+<ol>
+  <li><strong>Same model files and precision.</strong> Same weights, same quantization method (an FP8 engine against a BF16 engine is not a comparison of engines).</li>
+  <li><strong>Same hardware and parallelism</strong>, with driver and engine versions recorded (chapter 1.6).</li>
+  <li><strong>Same workload.</strong> Prompt and output length distributions, arrival pattern, concurrency, and sharing (prefix caching helps some workloads enormously).</li>
+  <li><strong>Same output length control.</strong> Force identical output lengths (<code>min_tokens</code> and <code>ignore_eos</code>, or equivalents), or compare per token.</li>
+  <li><strong>Same sampling settings and correctness check.</strong> Compare outputs or logprobs against a reference (chapter 3.4) so a "fast" engine is not simply producing different text.</li>
+  <li><strong>Tuned fairly.</strong> Each engine with its recommended settings for that workload, not defaults for one and expert tuning for the other.</li>
+  <li><strong>Report the latency-throughput curve</strong> at several loads, plus TTFT and ITL percentiles, not one throughput number (chapter 6.1).</li>
+</ol>
+
+<h2 id="matrix">5. An engine selection matrix</h2>
+<div class="tbl"><table>
+<tr><th></th><th>vLLM</th><th>SGLang</th><th>TensorRT-LLM</th><th>llama.cpp / Ollama</th></tr>
+<tr><td>Scheduling</td><td>Continuous batching, chunked prefill, priorities</td><td>Continuous batching, chunked prefill, cache-aware ordering, overlap scheduling</td><td>In-flight batching, chunked prefill</td><td>Simple slots for a few parallel users</td></tr>
+<tr><td>KV cache</td><td>Paged, block-hash prefix caching, hybrid manager, offload connectors</td><td>Paged, radix-tree prefix cache</td><td>Paged with block reuse, offload</td><td>Contiguous per slot; quantized KV options</td></tr>
+<tr><td>Quantization</td><td>FP8, INT8, INT4 (AWQ, GPTQ), MX formats, many more</td><td>FP8, INT4, and others</td><td>FP8, NVFP4, INT8, INT4; NVIDIA's model optimizer</td><td>GGUF 1.5 to 8 bit</td></tr>
+<tr><td>Kernels</td><td>FlashAttention, FlashInfer, Triton, vendor kernels</td><td>FlashInfer, FlashAttention, custom</td><td>NVIDIA hand-tuned, some closed source</td><td>ggml backends (CPU SIMD, Metal, CUDA, Vulkan)</td></tr>
+<tr><td>Hardware</td><td>NVIDIA, AMD, TPU, CPU and others via plugins</td><td>NVIDIA, AMD and others</td><td>NVIDIA only</td><td>Almost anything, including laptops and phones</td></tr>
+<tr><td>Best fit</td><td>The default choice; widest model and hardware support</td><td>Heavy prefix sharing, agents, large MoE deployments</td><td>Maximum performance on NVIDIA with engineering time</td><td>Local, offline, single-user and edge</td></tr>
+</table></div>
+<p>Start with the default, measure, and switch only when a measured bottleneck points to another engine's strength. Many production teams run more than one engine, choosing per model.</p>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Disaggregation in TensorRT-LLM</span>
+  <p>TensorRT-LLM's disaggregated serving runs separate context (prefill) and generation (decode) instances and transfers KV caches between them, either through its own coordinator or under Dynamo. Its technical blog shows the main trade-off: disaggregation helps most when prompts are long and latency targets are strict, and can lose throughput when transfer cost is not hidden (chapter 4.6).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Apple Silicon and unified memory</span>
+  <p>Apple's chips share one memory pool between CPU and GPU, with high bandwidth on the larger models. That makes them unusually good at single-user decode of large quantized models: the whole model can sit in "GPU-visible" memory without a separate VRAM limit. Apple's MLX framework and llama.cpp's Metal backend both target it.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">CPU serving in the data center</span>
+  <p>Modern server CPUs with matrix extensions (for example Intel AMX) and many memory channels can serve small models or low traffic without GPUs. Decode speed still follows memory bandwidth: a server with 8 or 12 DDR5 channels can read several hundred GB/s.</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Comparing engines with different quantization, output lengths or arrival patterns.</li>
+  <li>Adopting Dynamo or disaggregation for a small deployment where a single engine would do.</li>
+  <li>Confusing TensorRT-LLM version 0.x engine-build instructions with version 1.x usage.</li>
+  <li>Choosing the smallest GGUF quantization by default; check quality on your task first.</li>
+  <li>Offloading only a few layers to a GPU and expecting GPU speed; the slowest part sets the pace.</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<p><strong>Goal:</strong> run a quantized model in llama.cpp, compare it with vLLM on the same machine, and fill your own selection matrix.</p>
+<h3>Part A: the 100 Days notebooks</h3>
+<p>Run days 11 (TensorRT-LLM) and 12 (NVIDIA Dynamo) of <em>100 Days of Inference</em>, or read them if you have no suitable GPU. Both use simulations and stand-ins where real hardware is needed.</p>
+<h3>Part B: llama.cpp on Colab</h3>
+<pre>!pip install -q llama-cpp-python          # builds a CPU version; takes a few minutes
+from huggingface_hub import hf_hub_download
+path = hf_hub_download("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q4_k_m.gguf")
+import os, time
+print(f"{os.path.getsize(path)/1e6:.0f} MB on disk")
+
+from llama_cpp import Llama
+llm = Llama(model_path=path, n_ctx=2048, n_threads=os.cpu_count(), verbose=False)
+t = time.perf_counter()
+out = llm.create_chat_completion(messages=[{"role": "user", "content": "Write 150 words about memory bandwidth."}], max_tokens=200)
+dt = time.perf_counter() - t
+n = out["usage"]["completion_tokens"]
+print(f"{n} tokens in {dt:.1f} s = {n/dt:.1f} tok/s on CPU")
+print(llm.metadata.get("general.architecture"), llm.metadata.get("tokenizer.chat_template", "")[:80])</pre>
+<p>Predict first: the file is about 4.9 bits per weight for most tensors. What size do you expect for a 0.49 B model? Is it larger or smaller, and why? (Hint: this model's embeddings are large relative to its size; check the file's per-tensor types in the Hugging Face GGUF viewer.)</p>
+<h3>Part C: same model, two engines</h3>
+<p>On a T4 runtime, serve the same model with vLLM in FP16 (chapter 3.1, Part D) and measure single-user tokens per second and 16-user total throughput with <code>load.py</code>. Then run llama.cpp with GPU offload: install a CUDA build (<code>CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python</code>, which compiles for several minutes) and pass <code>n_gpu_layers=-1</code>. Record:</p>
+<div class="tbl"><table>
+<tr><th>Engine</th><th>Precision</th><th>1 user tok/s</th><th>16 users total tok/s</th><th>GPU memory</th><th>Startup time</th></tr>
+<tr><td>vLLM</td><td>FP16</td><td></td><td></td><td></td><td></td></tr>
+<tr><td>llama.cpp (CPU)</td><td>Q4_K_M</td><td></td><td></td><td></td><td></td></tr>
+<tr><td>llama.cpp (GPU offload)</td><td>Q4_K_M</td><td></td><td></td><td></td><td></td></tr>
+</table></div>
+<p>Explain each column with chapters 2.5 and 3.2. Which engine wins at 1 user? At 16? Why does the answer change?</p>
+<h3>Part D: your own selection matrix</h3>
+<p>Write the matrix of section 5 for three real projects you know: for each, name the model, traffic pattern, hardware and latency target, choose an engine, and give two measured or measurable reasons. Keep it; chapter 6.10 asks you to defend a full engine choice.</p>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Who uses what</span>
+  <ul>
+    <li><strong>Inference platforms</strong> commonly run several engines and pick per model; one well-known provider reports using TensorRT-LLM most, alongside vLLM and SGLang.</li>
+    <li><strong>Large-scale MoE deployments</strong> pair SGLang or TensorRT-LLM with disaggregation and orchestration layers such as Dynamo.</li>
+    <li><strong>Desktop apps and coding agents</strong> embed llama.cpp or Ollama for private, offline models.</li>
+    <li><strong>GGUF</strong> is the standard way the community shares quantized versions of new open models, often within hours of a release.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz36"></div>
+<script type="application/json" id="qz36">[
+{"q":"What does TensorRT-LLM's plugin mechanism provide?","o":["A web UI","Hand-written kernels that replace parts of the graph a generic compiler handles poorly","A tokenizer","Model downloads"],"a":1,"e":"Plugins insert NVIDIA's tuned kernels (attention, fused matmuls) into the model."},
+{"q":"Dynamo's KV-aware router chooses a worker by:","o":["Random choice","Prefix-cache overlap balanced against load","GPU temperature","Model size"],"a":1,"e":"It routes to the worker likely to have the request's prefix cached."},
+{"q":"A GGUF file contains:","o":["Only tensors","Tensors plus metadata: architecture, hyperparameters, tokenizer, chat template","Only the tokenizer","A TensorRT engine"],"a":1,"e":"That is why one GGUF file is enough to run a model."},
+{"q":"Q4_K_M averages about how many bits per weight?","o":["4.0","4.9","8.5","2.0"],"a":1,"e":"Block scales and minimums plus some higher-precision tensors."},
+{"q":"A 14B model in Q4_K_M with half its layers on a GPU and half on DDR5 RAM. Decode speed is mostly limited by:","o":["The GPU","Reading the CPU half from system RAM","The tokenizer","Prefill"],"a":1,"e":"Each token must read the CPU-resident half at much lower bandwidth."},
+{"q":"Which is NOT needed for a fair engine comparison?","o":["Same quantization","Same output lengths","Same brand of laptop for the client","Same arrival pattern"],"a":2,"e":"The client machine matters little; model, precision, workload and outputs matter a lot."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>TensorRT-LLM brings NVIDIA's tuned kernels and formats; version 0.x builds engines ahead of time, version 1.x runs on a PyTorch backend.</li>
+  <li>NVIDIA Dynamo orchestrates engines across many GPUs: KV-aware routing, disaggregated prefill and decode, KV transfer and tiering, SLO-based planning.</li>
+  <li>llama.cpp runs quantized GGUF models on CPUs, Apple Silicon and GPUs, with CPU-GPU hybrid offload; Ollama packages it for easy local use.</li>
+  <li>GGUF bundles tensors with metadata; K-quants such as Q4_K_M use block scales and average about 4.9 bits per weight.</li>
+  <li>Compare engines with the same model, precision, hardware, workload, output lengths and correctness checks, across a latency-throughput curve.</li>
+  <li>Default to the engine with the widest support, and switch when measurements point elsewhere.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 4.3.3 and 4.4</td><td>TensorRT-LLM versions, when to use it, and Dynamo's role and limits.</td></tr>
+<tr><td><a href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.md">TensorRT-LLM: Disaggregated serving</a> (skim)</td><td>How context and generation instances split, and when it pays.</td></tr>
+<tr><td><a href="https://docs.nvidia.com/dynamo/latest/index.html">NVIDIA Dynamo documentation</a></td><td>Components (frontend, KV router, planner, KV cache manager), supported engines and platforms.</td></tr>
+<tr><td><a href="https://huggingface.co/docs/hub/gguf">Hugging Face: GGUF</a></td><td>The format, its metadata, the Hub viewer, and the quantization types with bits per weight.</td></tr>
+<tr><td><a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> and its quantization documentation</td><td>Supported backends, hybrid offload, and measured size and speed per quantization type.</td></tr>
+<tr><td><a href="https://docs.ollama.com/">Ollama documentation</a></td><td>Running local models, the API and compatible endpoints.</td></tr>
+<tr><td>Chi Wang and Peiheng Hu, <em>Hands-On LLM Serving and Optimization</em>, chapter 8</td><td>Why specialized frameworks exist and a survey of vLLM, TensorRT-LLM, SGLang and llama.cpp, with selection guidance.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, chapters 15 to 17</td><td>Dynamo, NIXL and disaggregated inference at scale.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, days 11 and 12</td><td>TensorRT-LLM and Dynamo notebooks with simulations.</td></tr>
+</table></div>
+<h3>Triaged out</h3>
+<div class="tbl"><table>
+<tr><th>Source</th><th>Reason</th></tr>
+<tr><td>Inference OSS Ecosystem featuring vLLM (NVIDIA session video)</td><td>Video only; Dynamo and engine roles are covered by the documentation above.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The day 11 README of <em>100 Days of Inference</em> says changing batch size or sequence length "means recompilation" and that TensorRT-LLM FP8 throughput cannot be matched by vLLM or SGLang. The first applies to version 0.x engine builds; the second is a workload-dependent claim (section 1 watch-out).</li>
+</ul>
+<p class="note">Facts checked on 6 November 2026. Dynamo version from its documentation on that date.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+function ed(){const P=+$('edP').value,q=+$('edQ').value,V=+$('edV').value,gb=+$('edGB').value,cb=+$('edCB').value;
+  const size=P*1e9*q/8/1e9;const kv=1;const gpuFit=Math.max(0,Math.min(size,V-kv*(V>0?1:0)));const frac=size?gpuFit/size:0;
+  const t=(gpuFit/gb+(size-gpuFit)/cb);const tps=t>0?1/t:0;
+  const s=$('edSvg');s.innerHTML='';const W=680;el('rect',{x:0,y:14,width:W*frac,height:34,fill:css('--kv')},s);el('rect',{x:W*frac,y:14,width:W*(1-frac),height:34,fill:css('--dec')},s);
+  el('text',{x:6,y:66,'font-size':12,fill:css('--kv')},s,`GPU ${(frac*100).toFixed(0)}%`);el('text',{x:W-6,y:66,'text-anchor':'end','font-size':12,fill:css('--dec')},s,`CPU RAM ${((1-frac)*100).toFixed(0)}%`);
+  $('edStats').innerHTML=[['Model file size',size.toFixed(1)+' GB'],['On GPU',gpuFit.toFixed(1)+' GB'],['Decode ceiling',tps.toFixed(1)+' tok/s'],['Bytes read per token',size.toFixed(1)+' GB']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['edP','edQ','edV','edGB','edCB'].forEach(id=>$(id).addEventListener('input',ed));IE.onTheme(ed);
+})();
+</script>
