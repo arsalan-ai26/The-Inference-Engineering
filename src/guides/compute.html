@@ -1,0 +1,123 @@
+<div class="kicker">Guide</div>
+<h1>Compute guide: free GPUs, rentals and costs</h1>
+<p class="lede">Where to run the labs in this book, what each option really gives you, what GPUs cost to rent, and how to turn an hourly price into a cost per million tokens. Prices and free-tier rules change often, so every figure here carries the date it was checked.</p>
+
+<h2 id="which">1. Which GPU for which part of the book</h2>
+<div class="tbl"><table>
+<tr><th>Work</th><th>Minimum GPU</th><th>Why</th></tr>
+<tr><td>Part 1 and most of Part 2 labs</td><td>None (CPU) or a free T4</td><td>Small models (GPT-2, Qwen2.5-0.5B), numerics and simulations</td></tr>
+<tr><td>Part 2 timing labs (2.4, 2.5) and Part 3 engine labs</td><td>A free T4 (16 GB)</td><td>vLLM requires a GPU of compute capability 7.0 or newer; the T4 is 7.5</td></tr>
+<tr><td>nano-vLLM, FlashAttention-based code</td><td>Ampere or newer (A10, L4, A100, RTX 30/40/50 series)</td><td>FlashAttention kernels need compute capability 8.0 or newer</td></tr>
+<tr><td>BF16 serving, FP8 experiments (Part 4)</td><td>L4, L40S, H100 or newer for FP8</td><td>The T4 has no BF16 or FP8 tensor cores</td></tr>
+<tr><td>Multi-GPU parallelism (chapter 4.5)</td><td>2 or more GPUs, ideally with NVLink</td><td>Tensor parallelism over PCIe alone is slow (chapter 1.6, expert layer)</td></tr>
+<tr><td>Large models (70B and up)</td><td>Several 80 GB GPUs, or 4-bit on one 48 to 80 GB GPU</td><td>Weights alone exceed one GPU in BF16 (chapter 1.3)</td></tr>
+</table></div>
+
+<h2 id="free">2. Free options</h2>
+<div class="tbl"><table>
+<tr><th>Option</th><th>What you get</th><th>Limits</th><th>Status</th></tr>
+<tr><td>Google Colab (free)</td><td>A notebook with "very limited access to GPUs"; users report a T4</td><td>Sessions up to 12 hours "depending on availability"; no published quota; idle runtimes stop</td><td>Open</td></tr>
+<tr><td>Kaggle Notebooks</td><td>T4-class and P100-class GPUs (T4 ×2 option)</td><td>12-hour GPU sessions; a weekly GPU quota shown in your settings, commonly reported as about 30 hours; the quota floats</td><td>Open</td></tr>
+<tr><td>Hugging Face ZeroGPU</td><td>Short GPU bursts for Spaces demos on RTX Pro 6000 Blackwell GPUs</td><td>A small daily quota on a free account; built for demos, not labs</td><td>Open</td></tr>
+<tr><td>Modal (Starter plan)</td><td>$30 per month of free serverless compute</td><td>Code-first (Python functions), not a notebook; usage beyond the credit is billed</td><td>Open</td></tr>
+<tr><td>Lightning AI (free plan)</td><td>One free active Studio with persistent storage (50 GB)</td><td>Restarts every 4 hours; the monthly free credit amount could not be confirmed</td><td>Open</td></tr>
+<tr><td>Paperspace Gradient (free)</td><td>A free M4000 (8 GB, from 2015) notebook</td><td>Auto-shutdown after at most 6 hours; capacity not guaranteed</td><td>Documented</td></tr>
+<tr><td>Amazon SageMaker Studio Lab</td><td>Short GPU sessions</td><td>No longer open to new customers</td><td>Closed to new users</td></tr>
+<tr><td>Colab Pro for Education</td><td>A free year of Colab Pro for US students and faculty</td><td>No longer available for new signups</td><td>Closed to new users</td></tr>
+</table></div>
+<p class="note">Status and limits as reported by GPUPerHour's survey of free GPU options on 21 September 2026, which quotes each provider's own pages. Cloud free trials (for example Google Cloud's $300 credit) exclude GPUs during the trial. Startup and academic programs (Google for Startups, AWS Activate, Microsoft for Startups, NVIDIA Inception, Modal academic grants) can give much larger credits if you qualify.</p>
+<div class="box ex">
+  <span class="lbl">A practical free setup for this book</span>
+  <ol>
+    <li>Use Colab for short labs. Save notebooks to Drive; expect to re-install packages each session.</li>
+    <li>Use Kaggle for longer runs (12-hour sessions) and two-GPU tests (T4 ×2).</li>
+    <li>Use Modal's monthly credit for a few hours on a modern GPU (L4, A10 or better) when a lab needs Ampere or newer.</li>
+  </ol>
+</div>
+
+<h2 id="rent">3. Renting GPUs: prices</h2>
+<p>Cheapest current "secure" on-demand price per GPU-hour, as tracked by GPUPerHour, checked on 6 November 2026. "Secure" excludes peer-to-peer and interruptible (spot) offers, which are often cheaper.</p>
+<div class="tbl"><table>
+<tr><th>GPU</th><th class="n">Memory</th><th class="n">Cheapest on-demand $/GPU-hour</th><th>Cheapest at check time</th><th>Good for</th></tr>
+<tr><td>RTX 4090</td><td class="n">24 GB</td><td class="n">$0.40</td><td>Vast.ai</td><td>Labs up to 8B in BF16 or larger in 4-bit; consumer card</td></tr>
+<tr><td>RTX A6000</td><td class="n">48 GB</td><td class="n">$0.44</td><td>see tracker</td><td>Larger models on one card; Ampere</td></tr>
+<tr><td>A100 PCIe 80 GB</td><td class="n">80 GB</td><td class="n">$0.68</td><td>LeaderGPU</td><td>Most Part 2 to 4 labs; no FP8</td></tr>
+<tr><td>RTX 5090</td><td class="n">32 GB</td><td class="n">$0.87</td><td>see tracker</td><td>Blackwell consumer card; FP8 and FP4 support</td></tr>
+<tr><td>L40S</td><td class="n">48 GB</td><td class="n">$0.97</td><td>see tracker</td><td>FP8 on Ada; good price per GB</td></tr>
+<tr><td>A100 SXM 80 GB</td><td class="n">80 GB</td><td class="n">$1.38</td><td>Massed Compute</td><td>NVLink multi-GPU on Ampere</td></tr>
+<tr><td>H100 PCIe</td><td class="n">80 GB</td><td class="n">$2.50</td><td>Hyperstack</td><td>Hopper features at lower cost</td></tr>
+<tr><td>H100 SXM</td><td class="n">80 GB</td><td class="n">$2.90 (30-day median $2.22)</td><td>Ori</td><td>The reference GPU for this book's examples</td></tr>
+<tr><td>MI300X</td><td class="n">192 GB</td><td class="n">$2.99</td><td>Hot Aisle</td><td>AMD; very large memory</td></tr>
+<tr><td>H200 NVL</td><td class="n">141 GB</td><td class="n">$4.07</td><td>Vast.ai</td><td>Long context and larger models per GPU</td></tr>
+<tr><td>H200 SXM</td><td class="n">141 GB</td><td class="n">$5.29</td><td>RunPod</td><td>As above, with NVLink</td></tr>
+<tr><td>B200 SXM</td><td class="n">180 GB</td><td class="n">$8.79</td><td>Lyceum</td><td>Blackwell, NVFP4</td></tr>
+<tr><td>B300 SXM</td><td class="n">288 GB class</td><td class="n">$8.99</td><td>RunPod</td><td>Newest Blackwell</td></tr>
+</table></div>
+<p class="note">Prices move daily and differ by region, commitment and stock. Use a live tracker (section 7) before you rent. Memory sizes are per GPU from vendor specifications; B300's figure is approximate.</p>
+<h3>Types of provider</h3>
+<ul>
+  <li><strong>Marketplaces</strong> (for example Vast.ai): many hosts, lowest prices, variable reliability and network. Good for labs.</li>
+  <li><strong>GPU clouds</strong> (for example RunPod, Lambda, Hyperstack, Nebius, CoreWeave): standard machines by the hour with SSH. Good for multi-GPU labs and benchmarks.</li>
+  <li><strong>Serverless</strong> (for example Modal, Baseten): pay per second for code or endpoints; no machine to manage.</li>
+  <li><strong>Hyperscalers</strong> (AWS, Google Cloud, Azure): integrated with everything else, usually higher on-demand prices, quotas to request.</li>
+</ul>
+
+<h2 id="tokens">4. From $/hour to $ per million tokens</h2>
+<div class="formula">tokens per hour = tokens per second × 3,600 × utilization<br>$ per million tokens = price per hour ÷ tokens per hour × 1,000,000</div>
+<div class="widget" id="cpW">
+  <div class="wt">Interactive: cost per million tokens</div>
+  <div class="ws">Use chapter 2.5's throughput estimate (or a measurement) for tokens per second. Utilization is the share of each hour the GPU does useful work; idle time still costs money.</div>
+  <div class="ctrls">
+    <label>Price per GPU-hour ($) <input type="number" id="cpP" value="2.90" step="0.05" style="width:90px"></label>
+    <label>GPUs per replica <select id="cpN"><option>1</option><option>2</option><option>4</option><option>8</option></select></label>
+    <label>Output tokens per second (whole replica) <input type="number" id="cpT" value="2130" step="100" style="width:110px"></label>
+    <label>Utilization: <span class="mono" id="cpUv"></span><input type="range" id="cpU" min="0.05" max="1" step="0.05" value="0.6"></label>
+  </div>
+  <div class="stats" id="cpStats"></div>
+</div>
+<div class="box ex">
+  <span class="lbl">Worked example</span>
+  <p>Llama 3.1 8B on one H100 at batch 32 with 8K contexts: at most about 2,130 tokens per second (chapter 2.4, Example C; a real engine reaches less). At $2.90 per hour and 60% utilization: 2.90 ÷ (2,130 × 3,600 × 0.6) × 10⁶ ≈ $0.63 per million output tokens. At batch 1 (at most about 209 tokens per second) the same GPU costs about $6.42 per million. Batching is the cost lever.</p>
+</div>
+
+<h2 id="budget">5. A budget for this book's labs</h2>
+<div class="tbl"><table>
+<tr><th>Part</th><th>Where</th><th class="n">Paid GPU-hours (estimate)</th><th class="n">Approximate cost</th></tr>
+<tr><td>1 to 3</td><td>Colab and Kaggle; one optional rented hour (chapter 1.6)</td><td class="n">0 to 3</td><td class="n">$0 to $3 on an RTX 4090 or A100</td></tr>
+<tr><td>4 (optimization)</td><td>FP8 and kernels need L40S or H100; parallelism needs 2 GPUs</td><td class="n">8 to 15</td><td class="n">$15 to $45</td></tr>
+<tr><td>5 (GPUs and kernels)</td><td>Profiling on Ampere or newer</td><td class="n">5 to 10</td><td class="n">$5 to $30</td></tr>
+<tr><td>6 (production)</td><td>Benchmarks and autoscaling on 1 to 4 GPUs</td><td class="n">10 to 20</td><td class="n">$20 to $60</td></tr>
+<tr><td>7 (fine-tuning)</td><td>LoRA on one 24 to 80 GB GPU</td><td class="n">5 to 15</td><td class="n">$5 to $40</td></tr>
+<tr><td>8 (capstones)</td><td>Depends on your project</td><td class="n">10 to 30</td><td class="n">$20 to $100</td></tr>
+</table></div>
+<p class="note">Estimates assume the cheapest suitable GPU from section 3 and that you stop machines between sessions. They are planning figures, not quotes.</p>
+
+<h2 id="safety">6. Avoiding surprise bills</h2>
+<ul>
+  <li>Set a spending limit or prepaid balance where the provider allows it.</li>
+  <li>Stop or delete machines when you finish; check the billing page afterwards (chapter 1.6, lab Part D).</li>
+  <li>Persistent disks and volumes may bill while the machine is off. Delete what you do not need.</li>
+  <li>Download models to the machine's local disk once per session instead of re-pulling them on every restart.</li>
+  <li>Prefer spot or interruptible instances only for work you can restart.</li>
+</ul>
+
+<h2 id="refs">7. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://gpuperhour.com/">GPUPerHour: live cloud GPU prices</a></td><td>The price table in section 3 (cheapest secure on-demand), checked 6 November 2026.</td></tr>
+<tr><td><a href="https://gpuperhour.com/blog/free-cloud-gpus-and-credits">GPUPerHour: Free cloud GPUs in 2026, what works and what closed</a></td><td>The free-tier table in section 2, verified against each provider's pages on 21 September 2026.</td></tr>
+<tr><td><a href="https://research.google.com/colaboratory/faq.html">Google Colab FAQ</a></td><td>The official wording on free-tier limits.</td></tr>
+<tr><td><a href="https://www.kaggle.com/docs/notebooks">Kaggle Notebooks documentation</a></td><td>Session limits and accelerator options.</td></tr>
+<tr><td><a href="https://modal.com/pricing">Modal pricing</a></td><td>The Starter plan's monthly credit.</td></tr>
+<tr><td><a href="https://www.thundercompute.com/blog/nvidia-h100-pricing">Thunder Compute: H100 pricing</a> and <a href="https://www.spheron.network/blog/runpod-vs-vastai-2026/">Spheron: RunPod vs Vast.ai</a></td><td>Further comparisons of H100 and consumer GPU prices across providers.</td></tr>
+</table></div>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$}=IE;
+function cp(){const P=+$('cpP').value,N=+$('cpN').value,T=+$('cpT').value,U=+$('cpU').value;$('cpUv').textContent=Math.round(U*100)+'%';
+  const per=P*N/(T*3600*U)*1e6;const day=P*N*24;
+  $('cpStats').innerHTML=[['$ per million output tokens','$'+per.toFixed(2)],['Replica cost per day','$'+IE.int(day)],['Tokens per day at this utilization',IE.int(T*86400*U/1e6)+' M']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['cpP','cpN','cpT','cpU'].forEach(id=>$(id).addEventListener('input',cp));cp();
+})();
+</script>

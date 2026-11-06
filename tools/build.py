@@ -43,6 +43,33 @@ for c in chapters:
 </html>
 '''
     open(os.path.join(ROOT, 'chapters', c['slug'] + '.html'), 'w').write(page)
+# guides: src/guides/<name>.html -> guides/<name>.html
+gdir = os.path.join(ROOT, 'src', 'guides')
+if os.path.isdir(gdir):
+    os.makedirs(os.path.join(ROOT, 'guides'), exist_ok=True)
+    for fn in sorted(os.listdir(gdir)):
+        if not fn.endswith('.html'): continue
+        frag = open(os.path.join(gdir, fn)).read()
+        scripts = ''
+        m = re.search(r'<!--SCRIPT-->(.*)$', frag, re.S)
+        if m: scripts, frag = m.group(1), frag[:m.start()]
+        t = re.search(r'<h1>(.*?)</h1>', frag, re.S).group(1)
+        page = head(re.sub('<[^>]+>', '', t), '../') + f'''
+<body data-chapter="">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Guide</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Contents"></nav>
+<main><article>
+{frag}
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+{scripts}
+</body>
+</html>
+'''
+        open(os.path.join(ROOT, 'guides', fn), 'w').write(page)
 # index
 cards = []
 for part in data['parts']:

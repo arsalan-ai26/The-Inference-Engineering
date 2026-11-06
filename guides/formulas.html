@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Formula sheet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Guide</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Contents"></nav>
+<main><article>
+<div class="kicker">Guide</div>
+<h1>Formula sheet</h1>
+<p class="lede">The working formulas from Parts 1 to 3 on one page, with what each symbol means and the chapter that derives it. Below them, one calculator chains the most-used ones for any dense model.</p>
+<h2 id="basics">1. Linear algebra and numbers</h2><div class="tbl"><table><tr><th>What</th><th>Formula</th><th>Notes</th><th>Chapter</th></tr>
+<tr><td>FLOPs of a matmul [m, k] @ [k, n]</td><td class="mono">2 × m × n × k</td><td>One multiply and one add per pair.</td><td><a href="../chapters/1-1-linear-algebra.html">1.1</a></td></tr>
+<tr><td>Bytes a matmul moves</td><td class="mono">≈ (m × k + k × n + m × n) × bytes per number</td><td>Read both inputs, write the output once.</td><td><a href="../chapters/1-1-linear-algebra.html">1.1</a></td></tr>
+<tr><td>FLOPs per token (forward pass)</td><td class="mono">≈ 2 × parameters</td><td>Ignores attention over the context, which chapter 2.5 adds.</td><td><a href="../chapters/1-1-linear-algebra.html">1.1</a></td></tr>
+<tr><td>Weight memory</td><td class="mono">≈ parameters × bytes per parameter</td><td>2 bytes for BF16, 1 for FP8 or INT8, about 0.5 for 4-bit.</td><td><a href="../chapters/1-3-number-formats.html">1.3</a></td></tr>
+<tr><td>Quantize and restore</td><td class="mono">stored = round(w ÷ scale); restored = stored × scale</td><td>The difference is the rounding error.</td><td><a href="../chapters/1-3-number-formats.html">1.3</a></td></tr>
+<tr><td>Effective bits with block scales</td><td class="mono">value bits + scale bits ÷ block size</td><td>For example NVFP4: 4 + 8 ÷ 16 = 4.5 bits.</td><td><a href="../chapters/1-3-number-formats.html">1.3</a></td></tr>
+<tr><td>Tensor memory in PyTorch</td><td class="mono">x.numel() × x.element_size() bytes</td><td></td><td><a href="../chapters/1-4-pytorch-literacy.html">1.4</a></td></tr>
+</table></div>
+<h2 id="sampling">2. Probabilities and sampling</h2><div class="tbl"><table><tr><th>What</th><th>Formula</th><th>Notes</th><th>Chapter</th></tr>
+<tr><td>Softmax</td><td class="mono">pᵢ = e^(zᵢ) ÷ Σⱼ e^(zⱼ)</td><td>Logits to probabilities.</td><td><a href="../chapters/1-2-probability-sampling.html">1.2</a></td></tr>
+<tr><td>Temperature</td><td class="mono">pᵢ = softmax(z ÷ T)ᵢ</td><td>T below 1 sharpens, above 1 flattens.</td><td><a href="../chapters/1-2-probability-sampling.html">1.2</a></td></tr>
+</table></div>
+<h2 id="model">3. The transformer</h2><div class="tbl"><table><tr><th>What</th><th>Formula</th><th>Notes</th><th>Chapter</th></tr>
+<tr><td>Neuron</td><td class="mono">output = activation(w · x + b)</td><td></td><td><a href="../chapters/1-5-neural-nets.html">1.5</a></td></tr>
+<tr><td>RMSNorm</td><td class="mono">x ÷ √(mean(x²) + ε) × g</td><td></td><td><a href="../chapters/1-5-neural-nets.html">1.5</a></td></tr>
+<tr><td>Pre-norm block</td><td class="mono">h = x + Attention(RMSNorm(x)); out = h + MLP(RMSNorm(h))</td><td>Residual stream plus two sub-layers.</td><td><a href="../chapters/2-2-attention.html">2.2</a></td></tr>
+<tr><td>Attention</td><td class="mono">softmax(Q Kᵀ ÷ √d + mask) V</td><td>d is the head size; the mask is causal.</td><td><a href="../chapters/2-2-attention.html">2.2</a></td></tr>
+<tr><td>RoPE angles</td><td class="mono">θᵢ = base^(−2i ÷ d) for pair i = 0 … d/2 − 1</td><td>Rotation by position makes q · k depend on n − m.</td><td><a href="../chapters/2-3-positional-encoding.html">2.3</a></td></tr>
+<tr><td>MoE output</td><td class="mono">Σ over chosen experts of wᵢ(x) × Expertᵢ(x)</td><td></td><td><a href="../chapters/2-6-dense-vs-moe.html">2.6</a></td></tr>
+<tr><td>Distinct experts read by a batch</td><td class="mono">≈ E × (1 − (1 − k/E)^B)</td><td>E experts, k per token, batch B. Grows fast with B.</td><td><a href="../chapters/2-6-dense-vs-moe.html">2.6</a></td></tr>
+</table></div>
+<h2 id="kv">4. KV cache and memory</h2><div class="tbl"><table><tr><th>What</th><th>Formula</th><th>Notes</th><th>Chapter</th></tr>
+<tr><td>KV bytes per token</td><td class="mono">2 × layers × KV heads × head size × bytes per value</td><td>2 for keys and values. Uses KV heads, not query heads.</td><td><a href="../chapters/2-4-kv-cache.html">2.4</a></td></tr>
+<tr><td>KV bytes per sequence</td><td class="mono">KV bytes per token × tokens in the sequence</td><td></td><td><a href="../chapters/2-4-kv-cache.html">2.4</a></td></tr>
+<tr><td>KV blocks</td><td class="mono">bytes per block = block size × KV bytes per token; blocks = KV pool ÷ bytes per block</td><td></td><td><a href="../chapters/3-3-paged-attention.html">3.3</a></td></tr>
+<tr><td>Concurrent sequences (upper bound)</td><td class="mono">KV pool bytes ÷ KV bytes per sequence</td><td>KV pool = GPU memory × utilization cap − weights − activations.</td><td><a href="../chapters/2-4-kv-cache.html">2.4</a></td></tr>
+</table></div>
+<h2 id="speed">5. Speed and the roofline</h2><div class="tbl"><table><tr><th>What</th><th>Formula</th><th>Notes</th><th>Chapter</th></tr>
+<tr><td>Decode step floor</td><td class="mono">step time ≥ (weight bytes + Σ KV bytes of the batch) ÷ memory bandwidth</td><td>The lower bound for one token step.</td><td><a href="../chapters/2-4-kv-cache.html">2.4</a></td></tr>
+<tr><td>End-to-end latency</td><td class="mono">E2E ≈ TTFT + (output tokens − 1) × TPOT</td><td></td><td><a href="../chapters/2-4-kv-cache.html">2.4</a></td></tr>
+<tr><td>Throughput</td><td class="mono">batch ÷ TPOT tokens per second</td><td></td><td><a href="../chapters/2-5-inference-arithmetic.html">2.5</a></td></tr>
+<tr><td>Roofline</td><td class="mono">achievable FLOP/s = min(peak FLOP/s, bandwidth × intensity)</td><td></td><td><a href="../chapters/2-5-inference-arithmetic.html">2.5</a></td></tr>
+<tr><td>Decode intensity (weights only)</td><td class="mono">FLOPs = 2PB; bytes ≈ P × b; intensity ≈ 2B ÷ b</td><td>P parameters, B batch, b bytes per weight.</td><td><a href="../chapters/2-5-inference-arithmetic.html">2.5</a></td></tr>
+<tr><td>Critical batch</td><td class="mono">B_crit ≈ ops:byte × b ÷ 2</td><td>About 295 for BF16 weights on an H100 (KV reads ignored).</td><td><a href="../chapters/2-5-inference-arithmetic.html">2.5</a></td></tr>
+<tr><td>Prefill intensity</td><td class="mono">≈ 2T ÷ b for T prompt tokens</td><td>Long prompts are compute-bound.</td><td><a href="../chapters/2-5-inference-arithmetic.html">2.5</a></td></tr>
+<tr><td>MFU and MBU</td><td class="mono">achieved FLOP/s ÷ peak; achieved bytes/s ÷ peak</td><td></td><td><a href="../chapters/2-5-inference-arithmetic.html">2.5</a></td></tr>
+</table></div>
+<h2 id="serving">6. Serving and cost</h2><div class="tbl"><table><tr><th>What</th><th>Formula</th><th>Notes</th><th>Chapter</th></tr>
+<tr><td>Little's law</td><td class="mono">requests in the system = arrival rate × average time in the system</td><td>Sizes concurrency from traffic and latency.</td><td><a href="../chapters/3-2-batching-scheduling.html">3.2</a></td></tr>
+<tr><td>Prefix cache block hash</td><td class="mono">hash(parent hash, this block's token IDs, extra keys)</td><td>A block matches only if everything before it matches.</td><td><a href="../chapters/3-5-prefix-caching-structured-output.html">3.5</a></td></tr>
+<tr><td>Cost per million tokens</td><td class="mono">price per hour ÷ (tokens per second × 3,600 × utilization) × 10⁶</td><td>See the compute guide calculator.</td><td><a href="compute.html#tokens">Guide</a></td></tr>
+</table></div>
+<h2 id="calc">7. Calculator: weights, KV cache and decode floor</h2>
+<div class="widget">
+<div class="wt">Interactive: one dense model on one GPU</div>
+<div class="ws">Defaults are Llama 3.1 8B (32 layers, 8 KV heads, head size 128) on an H100 SXM (80 GB, 3.35 TB/s), matching chapter 2.4 Example C. Memory checks use a 0.92 memory fraction and a 2 GB runtime reserve, as in chapter 2.4. Step time is a lower bound, so real engines are slower.</div>
+<div class="ctrls">
+<label>Parameters (billions) <input type="number" id="fP" value="8.03" step="0.1" style="width:80px"></label>
+<label>Weight bytes per parameter <select id="fWb"><option value="2">2 (BF16)</option><option value="1">1 (FP8/INT8)</option><option value="0.5">0.5 (4-bit)</option></select></label>
+<label>Layers <input type="number" id="fL" value="32" style="width:64px"></label>
+<label>KV heads <input type="number" id="fH" value="8" style="width:64px"></label>
+<label>Head size <input type="number" id="fD" value="128" style="width:64px"></label>
+<label>KV bytes per value <select id="fKb"><option value="2">2 (BF16)</option><option value="1">1 (FP8)</option></select></label>
+<label>Context tokens per sequence <input type="number" id="fT" value="8192" step="1024" style="width:90px"></label>
+<label>Batch <input type="number" id="fB" value="32" style="width:64px"></label>
+<label>GPU memory (GB) <input type="number" id="fM" value="80" style="width:64px"></label>
+<label>Bandwidth (TB/s) <input type="number" id="fBW" value="3.35" step="0.05" style="width:64px"></label>
+</div>
+<div class="stats" id="fStats"></div>
+</div>
+<h2 id="refs">References</h2><p>Each formula is derived, with sources, in the chapter linked beside it.</p>
+
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){const $=IE.$;const ids=['fP','fWb','fL','fH','fD','fKb','fT','fB','fM','fBW'];
+function run(){const v=Object.fromEntries(ids.map(i=>[i,+$(i).value]));
+const W=v.fP*1e9*v.fWb, kvt=2*v.fL*v.fH*v.fD*v.fKb, kvs=kvt*v.fT, kvb=kvs*v.fB;
+const step=(W+kvb)/(v.fBW*1e12);const cap=v.fM*1e9*0.92-2e9;const fit=(cap-W)/kvs;
+const S=[['Weights',IE.gb(W)+' GB'],['KV per token',IE.int(kvt/1024)+' KiB'],['KV per sequence',IE.gb(kvs)+' GB'],['KV for the batch',IE.gb(kvb)+' GB'],['Fits in memory?',(W+kvb)<=cap?'yes':'no'],['Max sequences at this context',fit>0?IE.int(Math.floor(fit)):'0'],['Decode step floor',(step*1e3).toFixed(1)+' ms'],['Per-user tokens/s (at most)',IE.int(1/step)],['Server tokens/s (at most)',IE.int(v.fB/step)]];
+$('fStats').innerHTML=S.map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+ids.forEach(i=>$(i).addEventListener('input',run));run();})();
+</script>
+</body>
+</html>

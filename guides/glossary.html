@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Glossary</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Guide</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Contents"></nav>
+<main><article>
+<style>dl.gl{margin:0}.ge{padding:8px 0;border-bottom:1px solid var(--line, #ddd)}.ge dt{font-weight:600}.ge dd{margin:2px 0 0}.chref{font-size:.85em;white-space:nowrap}</style>
+<div class="kicker">Guide</div>
+<h1>Glossary</h1>
+<p class="lede">Every term this book defines in Parts 1 to 3, in one place. Each entry links to the chapter that explains it with examples. Use the search box to filter.</p>
+<div class="widget"><div class="ctrls"><label>Filter <input type="search" id="gq" placeholder="for example: cache" style="width:220px"></label></div><div class="ws" id="gcount"></div></div>
+<h2 id="l-a">A</h2><dl class="gl">
+<div class="ge"><dt>Activation function</dt><dd>a fixed non-linear function applied to the result. <a class="chref" href="../chapters/1-5-neural-nets.html">Chapter 1.5</a></dd></div>
+<div class="ge"><dt>Active parameters</dt><dd>the weights one token actually uses: attention, embeddings and output head, shared experts, and k routed experts per layer. Sets <em>FLOPs per token</em>. <a class="chref" href="../chapters/2-6-dense-vs-moe.html">Chapter 2.6</a></dd></div>
+<div class="ge"><dt>Arithmetic intensity</dt><dd>(of an operation): its FLOPs ÷ the bytes it must read and write. <a class="chref" href="../chapters/2-5-inference-arithmetic.html">Chapter 2.5</a></dd></div>
+<div class="ge"><dt>Attention weight</dt><dd>how much one token reads from another. The weights for one query add up to 1. <a class="chref" href="../chapters/2-2-attention.html">Chapter 2.2</a></dd></div>
+</dl>
+<h2 id="l-b">B</h2><dl class="gl">
+<div class="ge"><dt>Batched matmul</dt><dd>a matmul on the last two dimensions, done independently for every index of the dimensions in front. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
+<div class="ge"><dt>BF16 (bfloat16)</dt><dd>A 16-bit float with FP32's 8 exponent bits and 7 mantissa bits: same range as FP32, less precision. The default weight format for serving. <a class="chref" href="../chapters/1-3-number-formats.html">Chapter 1.3</a></dd></div>
+<div class="ge"><dt>Bias</dt><dd>a fixed number subtracted from the stored exponent so that negative powers are possible. For an exponent with E bits, the bias is 2^(E−1) − 1. <a class="chref" href="../chapters/1-3-number-formats.html">Chapter 1.3</a></dd></div>
+<div class="ge"><dt>Bias (b)</dt><dd>a learned number added after the dot product. It shifts the output. <a class="chref" href="../chapters/1-5-neural-nets.html">Chapter 1.5</a></dd></div>
+<div class="ge"><dt>Block</dt><dd>storage for the keys and values of B consecutive tokens (B is the block size, commonly 16 in vLLM), for the layers that share a block layout. <a class="chref" href="../chapters/3-3-paged-attention.html">Chapter 3.3</a></dd></div>
+<div class="ge"><dt>Block table</dt><dd>one list per request. Entry i is the physical block that holds the request's tokens i × B to (i + 1) × B − 1. <a class="chref" href="../chapters/3-3-paged-attention.html">Chapter 3.3</a></dd></div>
+<div class="ge"><dt>BPE (byte-pair encoding)</dt><dd>A tokenizer training method that starts from bytes or characters and repeatedly merges the most frequent adjacent pair into a new token. <a class="chref" href="../chapters/2-1-tokenization.html">Chapter 2.1</a></dd></div>
+</dl>
+<h2 id="l-c">C</h2><dl class="gl">
+<div class="ge"><dt>Causal mask</dt><dd>A mask that stops each token attending to later tokens, so a token's output depends only on itself and earlier tokens. <a class="chref" href="../chapters/2-2-attention.html">Chapter 2.2</a></dd></div>
+<div class="ge"><dt>Chunked prefill</dt><dd>Splitting a long prompt's prefill into chunks that run in the same steps as other requests' decodes, so long prompts do not stall token output for everyone. <a class="chref" href="../chapters/3-2-batching-scheduling.html">Chapter 3.2</a></dd></div>
+<div class="ge"><dt>Compute-bound</dt><dd>An operation whose time is set by arithmetic speed (FLOP/s), not memory speed. Large-batch prefill is the main example. <a class="chref" href="../chapters/2-5-inference-arithmetic.html">Chapter 2.5</a></dd></div>
+<div class="ge"><dt>Compute capability</dt><dd>a version number for the GPU's architecture. T4 is 7.5, A100 8.0, L4 8.9, H100 9.0, B200 10.0. Software must include code compiled for your GPU's capability. <a class="chref" href="../chapters/1-6-remote-gpu-setup.html">Chapter 1.6</a></dd></div>
+<div class="ge"><dt>Constrained decoding (structured output)</dt><dd>Masking the logits at each step so only tokens that keep the output valid for a grammar or JSON schema can be sampled. <a class="chref" href="../chapters/3-5-prefix-caching-structured-output.html">Chapter 3.5</a></dd></div>
+<div class="ge"><dt>Context</dt><dd>all tokens the model can see at a step. This is the prompt plus all tokens made so far. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+<div class="ge"><dt>Continuous batching</dt><dd>Scheduling at the level of single token steps: finished requests leave and new ones join the running batch at every step, instead of waiting for a whole batch to finish. <a class="chref" href="../chapters/3-2-batching-scheduling.html">Chapter 3.2</a></dd></div>
+<div class="ge"><dt>CUDA graph</dt><dd>A recorded sequence of GPU kernel launches that can be replayed with one call, removing per-kernel CPU launch overhead in decode. <a class="chref" href="../chapters/3-4-engine-internals.html">Chapter 3.4</a></dd></div>
+<div class="ge"><dt>CUDA runtime</dt><dd>the libraries that programs call to run work on the GPU. PyTorch wheels bundle their own copy, so you do not need to install CUDA separately to use PyTorch. <a class="chref" href="../chapters/1-6-remote-gpu-setup.html">Chapter 1.6</a></dd></div>
+<div class="ge"><dt>CUDA toolkit</dt><dd>the compiler (<code>nvcc</code>) and headers. You need it only to compile CUDA code yourself, for example some custom kernels or packages built from source. <a class="chref" href="../chapters/1-6-remote-gpu-setup.html">Chapter 1.6</a></dd></div>
+</dl>
+<h2 id="l-d">D</h2><dl class="gl">
+<div class="ge"><dt>Decode</dt><dd>The phase that makes output tokens one at a time, each step reading all weights and the KV cache. Usually memory-bound. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+<div class="ge"><dt>Derivative</dt><dd>how much an output changes when you change one input by a tiny amount. If dL/dw = 3, increasing w by 0.001 increases L by about 0.003. <a class="chref" href="../chapters/1-5-neural-nets.html">Chapter 1.5</a></dd></div>
+<div class="ge"><dt>Disaggregated serving</dt><dd>Running prefill and decode on separate GPU pools and moving the KV cache between them, so each phase can be sized and batched for its own bottleneck. <a class="chref" href="../chapters/3-6-trtllm-dynamo-edge.html">Chapter 3.6</a></dd></div>
+<div class="ge"><dt>Driver</dt><dd>the low-level software that talks to the GPU. It is installed on the machine by the provider. It sets the highest CUDA version you can use. <a class="chref" href="../chapters/1-6-remote-gpu-setup.html">Chapter 1.6</a></dd></div>
+</dl>
+<h2 id="l-e">E</h2><dl class="gl">
+<div class="ge"><dt>E2E (end-to-end latency)</dt><dd>the full request time. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+<div class="ge"><dt>Element</dt><dd>one item in a vector. In code, <code>v[0]</code> is the first element. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
+<div class="ge"><dt>Embedding</dt><dd>The learned vector for a token ID, looked up from the embedding table at the start of the model. <a class="chref" href="../chapters/2-1-tokenization.html">Chapter 2.1</a></dd></div>
+<div class="ge"><dt>Encode / decode</dt><dd>text to IDs, and IDs back to text. <a class="chref" href="../chapters/2-1-tokenization.html">Chapter 2.1</a></dd></div>
+<div class="ge"><dt>Exponent bits</dt><dd>set the power of 2, so they set the <em>range</em>: how big and how small a number can be. <a class="chref" href="../chapters/1-3-number-formats.html">Chapter 1.3</a></dd></div>
+</dl>
+<h2 id="l-f">F</h2><dl class="gl">
+<div class="ge"><dt>FlashAttention</dt><dd>An attention kernel that computes attention in tiles held in on-chip memory, never writing the full score matrix to HBM. Same result, far less memory traffic. <a class="chref" href="../chapters/2-2-attention.html">Chapter 2.2</a></dd></div>
+<div class="ge"><dt>FP8</dt><dd>8-bit floating point (E4M3 or E5M2). Used for weights, activations or the KV cache on GPUs with FP8 tensor cores (Ada, Hopper, Blackwell). <a class="chref" href="../chapters/1-3-number-formats.html">Chapter 1.3</a></dd></div>
+<div class="ge"><dt>Free pool</dt><dd>the list of physical blocks not used by any request. <a class="chref" href="../chapters/3-3-paged-attention.html">Chapter 3.3</a></dd></div>
+</dl>
+<h2 id="l-g">G</h2><dl class="gl">
+<div class="ge"><dt>GGUF</dt><dd>The single-file model format used by llama.cpp, holding weights (often quantized) and metadata such as the tokenizer and chat template. <a class="chref" href="../chapters/3-1-formats-runtimes.html">Chapter 3.1</a></dd></div>
+<div class="ge"><dt>Goodput</dt><dd>Throughput counted only for requests that meet their latency targets (SLOs). <a class="chref" href="../chapters/3-2-batching-scheduling.html">Chapter 3.2</a></dd></div>
+<div class="ge"><dt>GQA (grouped-query attention)</dt><dd>Attention where groups of query heads share one key head and one value head, which shrinks the KV cache by the group factor. <a class="chref" href="../chapters/2-2-attention.html">Chapter 2.2</a></dd></div>
+<div class="ge"><dt>Gradient</dt><dd>the list of derivatives of the loss with respect to every parameter. <a class="chref" href="../chapters/1-5-neural-nets.html">Chapter 1.5</a></dd></div>
+<div class="ge"><dt>Gradient descent</dt><dd>move each weight a small step against its gradient: w ← w − (learning rate × dL/dw). <a class="chref" href="../chapters/1-5-neural-nets.html">Chapter 1.5</a></dd></div>
+</dl>
+<h2 id="l-h">H</h2><dl class="gl">
+<div class="ge"><dt>HBM (high-bandwidth memory)</dt><dd>The GPU's main memory. Its bandwidth (for example about 3.35 TB/s on an H100 SXM) sets the decode speed limit. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+</dl>
+<h2 id="l-i">I</h2><dl class="gl">
+<div class="ge"><dt>ITL (inter-token latency)</dt><dd>the time between two specific tokens. TPOT is the mean of the ITLs. Benchmarks report ITL percentiles to show jitter. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+</dl>
+<h2 id="l-k">K</h2><dl class="gl">
+<div class="ge"><dt>Key (k)</dt><dd>what this token offers to be found by. Compared with queries. <a class="chref" href="../chapters/2-2-attention.html">Chapter 2.2</a></dd></div>
+<div class="ge"><dt>Key (K) and value (V) vectors</dt><dd>from 2.2, each attention layer turns each token into a query, a key and a value. A token's query asks "which earlier tokens matter to me?". Every token's key answers "this is what I contain". Every token's value is "this is what I pass on if you attend to me". <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+<div class="ge"><dt>KV cache</dt><dd>Stored key and value vectors of every past token in every layer, so each new token step computes only the new token's keys and values. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+</dl>
+<h2 id="l-l">L</h2><dl class="gl">
+<div class="ge"><dt>Learning rate</dt><dd>the step size. Too small: training is slow. Too large: the loss jumps around or explodes. <a class="chref" href="../chapters/1-5-neural-nets.html">Chapter 1.5</a></dd></div>
+<div class="ge"><dt>Logit</dt><dd>the raw score the model gives one token. It can be any real number. A higher logit means "more likely next". <a class="chref" href="../chapters/1-2-probability-sampling.html">Chapter 1.2</a></dd></div>
+<div class="ge"><dt>LoRA</dt><dd>A fine-tuning method that trains two small low-rank matrices per adapted weight instead of the full weight. Serving engines can load many LoRA adapters over one base model. <a class="chref" href="../chapters/3-5-prefix-caching-structured-output.html">Chapter 3.5</a></dd></div>
+</dl>
+<h2 id="l-m">M</h2><dl class="gl">
+<div class="ge"><dt>Mantissa bits</dt><dd>(also called fraction or significand): set the digits after the binary point, so they set the <em>precision</em>: how finely you can tell two nearby numbers apart. <a class="chref" href="../chapters/1-3-number-formats.html">Chapter 1.3</a></dd></div>
+<div class="ge"><dt>Matrix</dt><dd>a 2-D grid of numbers with <em>rows</em> and <em>columns</em>. A matrix with m rows and n columns has shape <strong>[m, n]</strong>. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
+<div class="ge"><dt>MBU (model bandwidth utilization)</dt><dd>Achieved memory bandwidth ÷ peak bandwidth during decode. Measures how close decode gets to the memory floor. <a class="chref" href="../chapters/2-5-inference-arithmetic.html">Chapter 2.5</a></dd></div>
+<div class="ge"><dt>Memory-bound</dt><dd>An operation whose time is set by how fast bytes move from memory, not by arithmetic. Small-batch decode is the main example. <a class="chref" href="../chapters/2-5-inference-arithmetic.html">Chapter 2.5</a></dd></div>
+<div class="ge"><dt>Memory per sequence is constant</dt><dd>, whatever the context: a few MB per sequence instead of a cache that grows. <strong>Decode cost per token is constant</strong> too: no attention over n past tokens. The price is <strong>recall</strong>: a fixed-size state cannot store every detail of a million tokens, so pure linear models are weaker at exact retrieval ("what was the number on page 3?"). <a class="chref" href="../chapters/2-7-frontier-architectures.html">Chapter 2.7</a></dd></div>
+<div class="ge"><dt>MFU (model FLOPs utilization)</dt><dd>Achieved FLOP/s ÷ peak FLOP/s. Used mostly for prefill and training. <a class="chref" href="../chapters/2-5-inference-arithmetic.html">Chapter 2.5</a></dd></div>
+<div class="ge"><dt>MLA (multi-head latent attention)</dt><dd>Attention that caches one small compressed latent vector per token per layer instead of full keys and values, then expands it when needed. Used by DeepSeek V2 and V3. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+<div class="ge"><dt>MoE (mixture of experts)</dt><dd>A model whose feed-forward layers hold many experts; a router sends each token to a few of them. Memory follows total parameters; compute follows active parameters. <a class="chref" href="../chapters/2-6-dense-vs-moe.html">Chapter 2.6</a></dd></div>
+</dl>
+<h2 id="l-n">N</h2><dl class="gl">
+<div class="ge"><dt>NVFP4</dt><dd>NVIDIA's 4-bit floating-point format for Blackwell GPUs, with a scale factor per block of 16 values. <a class="chref" href="../chapters/1-3-number-formats.html">Chapter 1.3</a></dd></div>
+</dl>
+<h2 id="l-o">O</h2><dl class="gl">
+<div class="ge"><dt>OpenAI-compatible API</dt><dd>An HTTP API that copies OpenAI's chat completions and completions endpoints, so the same client code works with vLLM, SGLang and other servers. <a class="chref" href="../chapters/3-1-formats-runtimes.html">Chapter 3.1</a></dd></div>
+<div class="ge"><dt>Ops:byte ratio</dt><dd>(of hardware): peak FLOP/s ÷ peak bytes/s. How many FLOPs the GPU can do in the time it reads one byte. <a class="chref" href="../chapters/2-5-inference-arithmetic.html">Chapter 2.5</a></dd></div>
+</dl>
+<h2 id="l-p">P</h2><dl class="gl">
+<div class="ge"><dt>PagedAttention</dt><dd>Storing the KV cache in fixed-size blocks anywhere in GPU memory, with a block table per request, and an attention kernel that reads through the table. Removes most fragmentation. <a class="chref" href="../chapters/3-3-paged-attention.html">Chapter 3.3</a></dd></div>
+<div class="ge"><dt>Parameters</dt><dd>all weights and biases together. "8B parameters" counts these. <a class="chref" href="../chapters/1-5-neural-nets.html">Chapter 1.5</a></dd></div>
+<div class="ge"><dt>Preemption</dt><dd>Pausing a running request when KV memory runs out, by freeing its blocks (recompute later) or copying them to CPU memory (swap). <a class="chref" href="../chapters/3-2-batching-scheduling.html">Chapter 3.2</a></dd></div>
+<div class="ge"><dt>Prefill</dt><dd>The phase that processes the whole prompt in one parallel pass and writes its KV cache. Usually compute-bound; sets TTFT. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+<div class="ge"><dt>Prefix caching</dt><dd>Keeping the KV blocks of earlier requests and reusing them when a new request starts with the same tokens, skipping their prefill. <a class="chref" href="../chapters/3-5-prefix-caching-structured-output.html">Chapter 3.5</a></dd></div>
+<div class="ge"><dt>Probability distribution</dt><dd>a list of non-negative numbers that add up to 1. Each number is the chance of one outcome. <a class="chref" href="../chapters/1-2-probability-sampling.html">Chapter 1.2</a></dd></div>
+</dl>
+<h2 id="l-q">Q</h2><dl class="gl">
+<div class="ge"><dt>Quantization</dt><dd>Storing weights, activations or the KV cache in fewer bits (for example INT8, FP8, INT4) to cut memory and bandwidth, at some accuracy risk. <a class="chref" href="../chapters/1-3-number-formats.html">Chapter 1.3</a></dd></div>
+<div class="ge"><dt>Query (q)</dt><dd>what this token is looking for. <a class="chref" href="../chapters/2-2-attention.html">Chapter 2.2</a></dd></div>
+</dl>
+<h2 id="l-r">R</h2><dl class="gl">
+<div class="ge"><dt>Radix tree (prefix tree)</dt><dd>A tree keyed by token sequences. SGLang's RadixAttention uses it to find the longest cached prefix of a new request. <a class="chref" href="../chapters/3-5-prefix-caching-structured-output.html">Chapter 3.5</a></dd></div>
+<div class="ge"><dt>RMSNorm</dt><dd>A normalization layer that divides a vector by its root mean square and multiplies by learned gains. Used instead of LayerNorm in most current LLMs. <a class="chref" href="../chapters/1-5-neural-nets.html">Chapter 1.5</a></dd></div>
+<div class="ge"><dt>Roofline</dt><dd>A plot of attainable FLOP/s against arithmetic intensity: a sloped memory roof and a flat compute roof meeting at the ops:byte ratio. <a class="chref" href="../chapters/2-5-inference-arithmetic.html">Chapter 2.5</a></dd></div>
+<div class="ge"><dt>RoPE (rotary position embedding)</dt><dd>Encoding position by rotating each pair of query and key dimensions by an angle proportional to the token's position, so attention scores depend on relative distance. <a class="chref" href="../chapters/2-3-positional-encoding.html">Chapter 2.3</a></dd></div>
+</dl>
+<h2 id="l-s">S</h2><dl class="gl">
+<div class="ge"><dt>safetensors</dt><dd>A simple, safe file format for tensors (a JSON header plus raw bytes), the standard for Hugging Face model weights. <a class="chref" href="../chapters/3-1-formats-runtimes.html">Chapter 3.1</a></dd></div>
+<div class="ge"><dt>Sampling (temperature, top-k, top-p)</dt><dd>Picking the next token from the probability distribution. Temperature sharpens or flattens it; top-k keeps the k most likely tokens; top-p keeps the smallest set whose probabilities reach p. <a class="chref" href="../chapters/1-2-probability-sampling.html">Chapter 1.2</a></dd></div>
+<div class="ge"><dt>Scalar</dt><dd>one number, for example 0.7. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
+<div class="ge"><dt>Shape</dt><dd>the size of each dimension, written as a list. [2, 8, 4096] means 2 × 8 × 4,096 numbers. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
+<div class="ge"><dt>Sign bit</dt><dd>0 for positive, 1 for negative. <a class="chref" href="../chapters/1-3-number-formats.html">Chapter 1.3</a></dd></div>
+<div class="ge"><dt>Sliding-window attention</dt><dd>Attention where each token sees only the last W tokens, which caps that layer's KV cache at W tokens. <a class="chref" href="../chapters/2-2-attention.html">Chapter 2.2</a></dd></div>
+<div class="ge"><dt>SLO (service level objective)</dt><dd>A target for a latency or availability metric, for example p95 TTFT under 500 ms. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+<div class="ge"><dt>Softmax</dt><dd>The function that turns a list of logits into probabilities: exponentiate each, then divide by the sum. <a class="chref" href="../chapters/1-2-probability-sampling.html">Chapter 1.2</a></dd></div>
+<div class="ge"><dt>Speculative decoding</dt><dd>A cheap draft proposes several tokens; the big model checks them all in one pass and keeps the accepted ones. Output distribution is unchanged; latency drops when acceptance is high. <a class="chref" href="../chapters/2-7-frontier-architectures.html">Chapter 2.7</a></dd></div>
+<div class="ge"><dt>State space model (linear attention, Mamba)</dt><dd>A layer that keeps a fixed-size state per sequence instead of a growing KV cache. Constant memory and per-token cost; weaker exact recall. <a class="chref" href="../chapters/2-7-frontier-architectures.html">Chapter 2.7</a></dd></div>
+</dl>
+<h2 id="l-t">T</h2><dl class="gl">
+<div class="ge"><dt>Tensor</dt><dd>a grid of numbers with any number of dimensions. A scalar has 0, a vector 1, a matrix 2. LLM code uses 3-D and 4-D tensors all the time. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
+<div class="ge"><dt>Tensor parallelism</dt><dd>Splitting each weight matrix across GPUs so every GPU computes part of every layer, with all-reduce communication after each split layer. <a class="chref" href="../chapters/2-5-inference-arithmetic.html">Chapter 2.5</a></dd></div>
+<div class="ge"><dt>Throughput</dt><dd>Tokens produced per second across all requests on a server or GPU. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+<div class="ge"><dt>Token</dt><dd>one piece of text in the tokenizer's vocabulary. <a class="chref" href="../chapters/2-1-tokenization.html">Chapter 2.1</a></dd></div>
+<div class="ge"><dt>Token ID</dt><dd>the integer for a token. The model only ever sees IDs. <a class="chref" href="../chapters/2-1-tokenization.html">Chapter 2.1</a></dd></div>
+<div class="ge"><dt>Token step</dt><dd>one run of the model that makes one new token for one sequence. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+<div class="ge"><dt>Total parameters</dt><dd>every weight in the model, including all experts. Sets <em>memory</em>. <a class="chref" href="../chapters/2-6-dense-vs-moe.html">Chapter 2.6</a></dd></div>
+<div class="ge"><dt>TPOT (time per output token)</dt><dd>the average time between output tokens after the first. It is set by decode step time. Longer context and a bigger batch make it longer. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+<div class="ge"><dt>Transpose</dt><dd>the same matrix with rows and columns swapped. Shape [m, n] becomes [n, m]. Written Aᵀ, or <code>A.T</code> in code. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
+<div class="ge"><dt>TTFT (time to first token)</dt><dd>from request arrival to the first output token. It includes queue time and prefill. Long prompts make TTFT longer. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+</dl>
+<h2 id="l-v">V</h2><dl class="gl">
+<div class="ge"><dt>Value (v)</dt><dd>the information this token passes on when another token attends to it. <a class="chref" href="../chapters/2-2-attention.html">Chapter 2.2</a></dd></div>
+<div class="ge"><dt>Vector</dt><dd>an ordered list of numbers, for example [0.2, −1.3, 0.5]. The number of items is its <strong>dimension</strong> or <strong>length</strong>. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
+<div class="ge"><dt>Vocabulary</dt><dd>the full list of tokens the model knows. Chapter 2.1 explains how text becomes tokens. <a class="chref" href="../chapters/1-2-probability-sampling.html">Chapter 1.2</a></dd></div>
+</dl>
+<h2 id="l-w">W</h2><dl class="gl">
+<div class="ge"><dt>Weight matrix</dt><dd>a matrix of learned numbers inside a model layer. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
+<div class="ge"><dt>Weight (w)</dt><dd>a learned number that says how much one input matters. <a class="chref" href="../chapters/1-5-neural-nets.html">Chapter 1.5</a></dd></div>
+</dl>
+<h2 id="refs">References</h2><p>Definitions are condensed from the chapters of this book; each chapter's own references list the sources behind them.</p>
+
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){const q=IE.$('gq'),es=[...document.querySelectorAll('.ge')];function f(){const v=q.value.trim().toLowerCase();let c=0;es.forEach(e=>{const ok=!v||e.textContent.toLowerCase().includes(v);e.hidden=!ok;if(ok)c++;});document.querySelectorAll('dl.gl').forEach(dl=>{const h=dl.previousElementSibling;const any=[...dl.children].some(x=>!x.hidden);dl.hidden=!any;h.hidden=!any;});IE.$('gcount').textContent=c+' of '+es.length+' terms';}q.addEventListener('input',f);f();})();
+</script>
+</body>
+</html>

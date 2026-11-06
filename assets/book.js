@@ -46,7 +46,7 @@
       const a = document.createElement('a'); a.href = '#' + h.id; a.textContent = h.textContent;
       li.appendChild(a); ol.appendChild(li);
     });
-    nav.innerHTML = `<div class="book"><a href="../index.html" style="color:inherit">The Inference Engineering Book</a> · Part ${part}</div>`;
+    nav.innerHTML = `<div class="book"><a href="../index.html" style="color:inherit">The Inference Engineering Book</a> · ${part ? 'Part ' + part : 'Guide'}</div>`;
     nav.appendChild(ol);
     const links = [...ol.querySelectorAll('a')];
     const obs = new IntersectionObserver((es) => es.forEach((e) => {
