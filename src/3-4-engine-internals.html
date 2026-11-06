@@ -1,0 +1,330 @@
+<div class="kicker">Part 3 · Inference engines and serving · Chapter 3.4</div>
+<h1>Engine internals</h1>
+<p class="lede">Chapters 3.1 to 3.3 introduced the parts of an inference engine one at a time. This chapter puts them together and opens the code. You will follow one engine step from scheduling to streamed token, read the real scheduler of a 1,200-line engine, see how inputs for a mixed batch are prepared, and learn the debugging method engine teams use when output is silently wrong.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 5 hours with the lab</span>
+  <span class="chip">Needs: 3.1, 3.2, 3.3</span>
+  <span class="chip">Compute: code reading on any machine; T4 for Part D; Ampere or newer for Part C</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Name the five things an engine does in every step, in order.</li>
+    <li>What is a "slot mapping", and why does the model runner need it?</li>
+    <li>Why does monkey-patching vLLM's scheduler from your own script often not work?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Schedule (choose requests and token counts), prepare inputs, run the forward pass, sample next tokens, post-process (append tokens, check stop rules, free finished requests, stream output).</li>
+    <li>For each new token in the batch, the physical KV slot (block ID × block size + offset) where its key and value must be written. The attention kernel writes the new K and V there before reading the cache.</li>
+    <li>The scheduler runs inside the engine-core process, not in the process where your script patched it, so the engine keeps using the original code. Plugins are the supported way.</li>
+  </ol></details>
+</div>
+
+<h2 id="loop">1. The engine loop</h2>
+<p>Every LLM engine is, at heart, one loop that never stops while there is work:</p>
+<div class="svgwrap"><svg viewBox="0 0 700 250" width="700" style="max-width:100%;height:auto" role="img" aria-label="The engine loop: schedule, prepare, forward, sample, post-process">
+  <defs><marker id="ar34" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--ink2)"/></marker></defs>
+  <g font-size="12">
+    <rect x="20" y="30" width="150" height="62" rx="10" fill="var(--kv-s)" stroke="var(--kv)"/><text x="95" y="56" text-anchor="middle" fill="var(--ink)" font-weight="700">1. schedule</text><text x="95" y="74" text-anchor="middle" fill="var(--ink2)">who runs, how many tokens</text>
+    <rect x="275" y="30" width="150" height="62" rx="10" fill="var(--panel2)" stroke="var(--line)"/><text x="350" y="56" text-anchor="middle" fill="var(--ink)" font-weight="700">2. prepare inputs</text><text x="350" y="74" text-anchor="middle" fill="var(--ink2)">ids, positions, slots</text>
+    <rect x="530" y="30" width="150" height="62" rx="10" fill="var(--pre-s)" stroke="var(--pre)"/><text x="605" y="56" text-anchor="middle" fill="var(--ink)" font-weight="700">3. forward pass</text><text x="605" y="74" text-anchor="middle" fill="var(--ink2)">GPU, one batch</text>
+    <rect x="530" y="160" width="150" height="62" rx="10" fill="var(--panel2)" stroke="var(--line)"/><text x="605" y="186" text-anchor="middle" fill="var(--ink)" font-weight="700">4. sample</text><text x="605" y="204" text-anchor="middle" fill="var(--ink2)">next token per sequence</text>
+    <rect x="275" y="160" width="150" height="62" rx="10" fill="var(--dec-s)" stroke="var(--dec)"/><text x="350" y="186" text-anchor="middle" fill="var(--ink)" font-weight="700">5. post-process</text><text x="350" y="204" text-anchor="middle" fill="var(--ink2)">append, stop, free, stream</text>
+    <rect x="20" y="160" width="150" height="62" rx="10" fill="var(--panel)" stroke="var(--line)" stroke-dasharray="5 4"/><text x="95" y="186" text-anchor="middle" fill="var(--ink)">new requests</text><text x="95" y="204" text-anchor="middle" fill="var(--ink2)">from the API server</text>
+    <path d="M170 61H273M425 61H528M605 92V158M530 191H427M275 191H172" stroke="var(--ink2)" fill="none" marker-end="url(#ar34)"/>
+    <path d="M95 160V94" stroke="var(--ink2)" fill="none" marker-end="url(#ar34)"/>
+  </g>
+</svg></div>
+<ol>
+  <li><strong>Schedule.</strong> Look at waiting and running requests, the token budget and free KV blocks (chapters 3.2 and 3.3). Decide which requests run this step, how many tokens each processes, and allocate blocks.</li>
+  <li><strong>Prepare inputs.</strong> Flatten all scheduled tokens into one array, with their positions, the KV slot each new token writes, and each sequence's block table and context length.</li>
+  <li><strong>Forward pass.</strong> Run the model once over the whole flattened batch.</li>
+  <li><strong>Sample.</strong> Take the logits at the last position of each sequence and pick the next token with that request's sampling settings (chapter 1.2).</li>
+  <li><strong>Post-process.</strong> Append tokens, check stop conditions, free finished requests' blocks, and send new text to the API server for streaming.</li>
+</ol>
+
+<h2 id="parts">2. The parts and the processes</h2>
+<div class="tbl"><table>
+<tr><th>Part</th><th>Owns</th><th>Chapter</th></tr>
+<tr><td>Request / sequence object</td><td>Prompt and output token IDs, sampling settings, state (waiting, running, finished), block table, how many tokens are already in the KV cache</td><td>3.1</td></tr>
+<tr><td>Scheduler</td><td>Waiting and running queues, the token budget, preemption decisions</td><td>3.2</td></tr>
+<tr><td>Block (KV cache) manager</td><td>Free block pool, reference counts, block hashes for prefix reuse</td><td>3.3, 3.5</td></tr>
+<tr><td>Model runner (one per GPU)</td><td>Weights, the KV cache tensors, input preparation, CUDA graphs, attention metadata</td><td>3.1</td></tr>
+<tr><td>Sampler</td><td>Temperature, top-k, top-p, penalties, logprobs, structured-output masks</td><td>1.2, 3.5</td></tr>
+<tr><td>API server and output processor</td><td>HTTP, chat templates, tokenization, incremental detokenization, streaming</td><td>2.1, 3.1</td></tr>
+</table></div>
+<p>Production engines split these across operating-system processes, so that slow Python work in one does not stall the GPU. vLLM's current architecture has:</p>
+<ul>
+  <li><strong>API server process(es):</strong> HTTP, tokenization and multimodal input loading, streaming. They talk to the engine core over ZMQ sockets.</li>
+  <li><strong>One engine-core process per data-parallel rank:</strong> runs the scheduler and KV cache manager in a busy loop and coordinates the workers.</li>
+  <li><strong>One worker process per GPU:</strong> loads weights, runs forward passes, manages GPU memory. With tensor parallelism of 4, one engine core has 4 workers.</li>
+</ul>
+<p>This matters for deployment: an engine needs several CPU cores per GPU, and a starved CPU shows up as low GPU utilization.</p>
+
+<h2 id="nano">3. Reading a real scheduler: nano-vLLM</h2>
+<p>nano-vLLM re-implements vLLM's core ideas in about 1,200 lines of Python (paged KV cache with prefix caching, CUDA graphs, tensor parallelism), and its authors report throughput comparable to vLLM on its benchmark. It is the best code to read first. Its whole engine step is:</p>
+<pre>def step(self):
+    seqs, is_prefill = self.scheduler.schedule()
+    token_ids = self.model_runner.call("run", seqs, is_prefill)
+    self.scheduler.postprocess(seqs, token_ids, is_prefill)
+    return [(s.seq_id, s.completion_token_ids) for s in seqs if s.is_finished]</pre>
+<p>And the core of its scheduler, slightly shortened:</p>
+<pre>def schedule(self):
+    scheduled, num_batched_tokens = [], 0
+    # 1. prefill first: admit waiting sequences while the token budget and blocks allow
+    while self.waiting and len(scheduled) &lt; self.max_num_seqs:
+        seq = self.waiting[0]
+        remaining = self.max_num_batched_tokens - num_batched_tokens
+        num_cached_blocks = self.block_manager.can_allocate(seq)   # -1 if not enough free blocks
+        if remaining == 0 or num_cached_blocks == -1: break
+        num_tokens = seq.num_tokens - num_cached_blocks * self.block_size   # prefix-cache hits are skipped
+        if remaining &lt; num_tokens and scheduled: break                       # only the first seq may be chunked
+        self.block_manager.allocate(seq, num_cached_blocks)
+        seq.num_scheduled_tokens = min(num_tokens, remaining)
+        ...
+        scheduled.append(seq)
+    if scheduled:
+        return scheduled, True                     # this step is a prefill step
+    # 2. otherwise decode: one token per running sequence, preempting from the back if blocks run out
+    while self.running and len(scheduled) &lt; self.max_num_seqs:
+        seq = self.running.popleft()
+        while not self.block_manager.can_append(seq):
+            if self.running: self.preempt(self.running.pop())   # newest running sequence loses its blocks
+            else: self.preempt(seq); break
+        else:
+            seq.num_scheduled_tokens = 1
+            self.block_manager.may_append(seq)
+            scheduled.append(seq)
+    return scheduled, False                        # this step is a decode step</pre>
+<p>Read it against chapter 3.2. Four design choices stand out:</p>
+<ol>
+  <li><strong>Prefill priority, separate steps.</strong> A step is either all prefill or all decode. If anything is waiting and fits, the step prefills. This gives fast TTFT but pauses decoding during prefills.</li>
+  <li><strong>Limited chunking.</strong> Only the first waiting sequence may be split to fit the budget.</li>
+  <li><strong>Prefix caching in admission.</strong> <code>can_allocate</code> hashes the prompt block by block and counts blocks already in the cache; only uncached tokens are scheduled.</li>
+  <li><strong>Recompute preemption from the back.</strong> When a decode needs a block and none are free, the most recently scheduled running sequence is sent back to the waiting queue with its blocks freed.</li>
+</ol>
+<p>Its defaults are also instructive: a token budget of 16,384, up to 512 sequences, 90% memory use, and a KV block size of 256 tokens (much larger than vLLM's usual 16). The KV cache is one tensor of shape [2, layers, blocks, block size, KV heads, head size], sized at startup from free memory after a warm-up pass. CUDA graphs are captured for decode batch sizes 1, 2, 4, 8, then every 16 up to the maximum; prefill, and batches above 512, run eagerly.</p>
+
+<h2 id="compare">4. The same ideas in vLLM and mini-SGLang</h2>
+<div class="tbl"><table>
+<tr><th>Design point</th><th>nano-vLLM</th><th>vLLM (current engine)</th><th>mini-SGLang</th></tr>
+<tr><td>Step contents</td><td>All prefill or all decode</td><td>Mixed: decodes first, then prefill chunks in the leftover budget</td><td>Prefill batch if possible, else decode batch</td></tr>
+<tr><td>Chunked prefill</td><td>First waiting sequence only</td><td>Yes, by default</td><td>Yes</td></tr>
+<tr><td>Prefix reuse</td><td>Block hashing</td><td>Block hashing (automatic prefix caching)</td><td>Radix tree over token sequences (chapter 3.5)</td></tr>
+<tr><td>CPU/GPU overlap</td><td>No</td><td>Yes (asynchronous scheduling)</td><td>Yes ("overlap scheduling")</td></tr>
+<tr><td>Processes</td><td>Main process plus one per extra GPU</td><td>API server, engine core, workers</td><td>API server, scheduler, workers</td></tr>
+</table></div>
+<p>mini-SGLang (about 5,000 lines) shows overlap scheduling clearly. Its main loop launches the forward pass for batch n on the GPU, and <em>while it runs</em>, processes the results of batch n − 1 on the CPU:</p>
+<pre>def overlap_loop(self, last_data):
+    for msg in self.receive_msg(blocking=...):      # new requests, aborts
+        self._process_one_msg(msg)
+    forward_input = self._schedule_next_batch()     # prefill batch, else decode batch
+    ongoing = None
+    if forward_input is not None:
+        with self.engine_stream_ctx:                # launch on the GPU stream, do not wait
+            ongoing = (forward_input, self._forward(forward_input))
+    self._process_last_data(last_data)              # CPU work for the PREVIOUS step overlaps the GPU
+    return ongoing</pre>
+<p>The CPU cost of scheduling and output processing is hidden behind GPU work. The catch is subtle: when step n is scheduled, the tokens of step n − 1 are not known yet on the CPU, so the code must handle requests that finished one step "late" (the source has a comment about avoiding a double free for exactly this case).</p>
+
+<div class="widget" id="enW">
+  <div class="wt">Interactive: one engine, step by step</div>
+  <div class="ws">Four requests, a token budget of 12 per step, 4 tokens per KV block. Pick a policy and press Step. The panel shows what the scheduler chose, the flattened inputs the model runner builds, and the block tables.</div>
+  <div class="ctrls">
+    <div class="seg" role="group" aria-label="Policy"><button data-pol="nano" class="on">Prefill-first, separate steps (nano-vLLM style)</button><button data-pol="mixed">Decode-first, mixed chunks (vLLM style)</button></div>
+    <button class="pri" id="enStep">Step</button><button id="enReset">Reset</button>
+  </div>
+  <div id="enOut" style="margin-top:12px"></div>
+</div>
+
+<h2 id="inputs">5. Preparing inputs for a mixed batch</h2>
+<p>The model runner turns the scheduler's decision into tensors. For a step with one sequence prefilling 5 tokens (positions 0 to 4) and two sequences decoding one token each (at positions 9 and 6), it builds:</p>
+<div class="tbl"><table>
+<tr><th>Tensor</th><th>Contents</th><th>Purpose</th></tr>
+<tr><td><code>input_ids</code></td><td>[a0, a1, a2, a3, a4, b9, c6] (7 tokens, flattened)</td><td>All tokens of the step in one array; no padding</td></tr>
+<tr><td><code>positions</code></td><td>[0, 1, 2, 3, 4, 9, 6]</td><td>For RoPE (chapter 2.3); each token's own position in its sequence</td></tr>
+<tr><td><code>slot_mapping</code></td><td>physical slot for each new token, for example block 7 × 4 + offset</td><td>Where to write each token's new K and V</td></tr>
+<tr><td>query start offsets</td><td>[0, 5, 6, 7]</td><td>Where each sequence's tokens begin in the flat array</td></tr>
+<tr><td>context lengths</td><td>[5, 10, 7]</td><td>How many cached tokens each sequence's queries attend to</td></tr>
+<tr><td>block tables</td><td>one row of physical block IDs per sequence</td><td>Where to read each sequence's cached K and V (chapter 3.3)</td></tr>
+<tr><td>sample indices</td><td>[4, 5, 6]</td><td>Which rows of the output to sample from: the last token of each sequence</td></tr>
+</table></div>
+<p>The linear layers do not care about sequence boundaries: they process all 7 rows as one matrix (chapter 1.1). Only attention needs the metadata, so engines bundle it into an "attention metadata" object that each attention backend (FlashAttention, FlashInfer and others) reads in its own format.</p>
+
+<h2 id="graphs">6. CUDA graphs inside the runner</h2>
+<p>Decode steps are short and launch-bound for small and medium models (chapter 2.5). Engines capture a CUDA graph for each of a set of batch sizes at startup and, at each decode step, pad the batch up to the nearest captured size and replay the graph. Inputs are copied into fixed buffers before replay, because a graph always reads the same memory addresses. That is why <code>max-num-seqs</code> also sets buffer and graph sizes, and why startup takes longer with graphs enabled (in vLLM, <code>--enforce-eager</code> turns them off for debugging).</p>
+
+<h2 id="extend">7. Changing an engine: plugins, not forks</h2>
+<p>Teams often need a custom scheduler rule, a new model, a different KV policy or extra metrics. Three options:</p>
+<ul>
+  <li><strong>Fork the engine.</strong> Full control, but every upstream release must be merged by hand.</li>
+  <li><strong>Monkey-patch</strong> from your script. Fragile, and often silently ineffective: in vLLM the scheduler runs inside the engine-core process, which does not see patches applied in the API process.</li>
+  <li><strong>Plugins.</strong> vLLM loads registered Python entry points in every process at startup. Plugins can register out-of-tree models, platforms and general modifications, and are the supported path. Community lists of vLLM plugins and vendor plugins (for example Snowflake's ArcticInference, which adds speculative decoding and other optimizations) show the pattern at scale.</li>
+</ul>
+
+<h2 id="debug">8. Debugging silent errors</h2>
+<p>The hardest engine bugs do not crash. A published example from AI21: their hybrid Mamba-attention model produced pure gibberish about once per thousand prompts in vLLM, but never in Hugging Face <code>transformers</code>. The cause: under heavy memory pressure, state slots were recycled quickly, and in rare scheduling cases a new request was treated as if it were already decoding. It then read the previous occupant's Mamba state instead of starting from zero. Attention layers are protected from this by sequence-length masking (stale KV beyond a sequence's length is never read), but a recurrent state carries its whole history in one tensor, so stale state corrupts everything that follows.</p>
+<p>The method they used is the standard one, and you should learn it:</p>
+<ol>
+  <li><strong>Find a reference.</strong> A slow but trusted implementation, usually <code>transformers</code>.</li>
+  <li><strong>Compare logprobs on the same tokens.</strong> Take the tokens the engine generated and ask the reference for the logprob it would give each one. Normal runs differ only by small floating-point noise.</li>
+  <li><strong>Watch for confident nonsense.</strong> Corruption shows as tokens the engine was sure of but the reference finds extremely unlikely.</li>
+  <li><strong>Make it repeatable.</strong> Use temperature 0 and the same load pattern until one request fails every time, then shrink the case.</li>
+</ol>
+<p>Lab Part D does steps 1 to 3 on a healthy model, so you know what "normal" looks like.</p>
+
+<h2 id="expert">9. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Model runner rewrites</span>
+  <p>The model runner is where most engine performance work lands: input preparation on the GPU instead of the CPU, persistent buffers, fewer host-device syncs, and better attention metadata building. vLLM has gone through more than one generation of its GPU model runner for these reasons. Read the pull requests of such rewrites to see which overheads matter at scale.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Data parallelism and MoE coordination</span>
+  <p>With data parallelism, each rank has its own engine core and scheduler. For MoE models with expert parallelism, all ranks must run their forward passes in lockstep, even if one has no work, because experts communicate across ranks every layer. vLLM adds a coordinator process for this (chapter 4.5).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Returning routing and internal state</span>
+  <p>Reinforcement-learning pipelines sometimes need more than tokens: for example, which experts each token was routed to, so the trainer can replay the same routing. Engines have added options to return such internal data alongside outputs. Supporting this touches the model code, the runner and the output path.</p>
+</div>
+
+<h2 id="mistakes">10. Common mistakes</h2>
+<ul>
+  <li>Reading engine code from the HTTP layer down. Start from the step function and the scheduler.</li>
+  <li>Patching engine internals from a client script and assuming the engine-core process sees the change.</li>
+  <li>Giving an engine too few CPU cores for its processes.</li>
+  <li>Debugging output quality by eye. Compare logprobs against a reference implementation.</li>
+  <li>Disabling CUDA graphs (<code>--enforce-eager</code>) for debugging and forgetting to turn them back on.</li>
+</ul>
+
+<h2 id="lab">11. Lab</h2>
+<p><strong>Goal:</strong> read real engine code until you can draw its loop, then compare an engine against a reference implementation.</p>
+<h3>Part A: read nano-vLLM</h3>
+<pre>git clone --depth 1 https://github.com/GeeeekExplorer/nano-vllm.git
+cd nano-vllm/nanovllm
+wc -l engine/*.py            # scheduler, block manager, sequence, model runner, engine</pre>
+<p>Answer these from the code (an AI assistant may explain lines, but find the answers yourself):</p>
+<ol>
+  <li>In <code>engine/scheduler.py</code>, under what condition is a step a prefill step?</li>
+  <li>In <code>engine/block_manager.py</code>, how does <code>compute_hash</code> make a block's hash depend on every earlier block? Why is that needed?</li>
+  <li>In <code>engine/model_runner.py</code>, find where the number of KV blocks is computed. Which memory numbers does it subtract?</li>
+  <li>Find the list of CUDA graph batch sizes. Which batches run without graphs?</li>
+  <li>In <code>scheduler.postprocess</code>, what two conditions finish a sequence?</li>
+</ol>
+<details><summary>Answers</summary><ol>
+  <li>When at least one waiting sequence fits the token budget and the free blocks. Then the step contains only prefills.</li>
+  <li>Each block's hash is computed from its tokens plus the previous block's hash, so equal hashes mean equal full prefixes, not just equal blocks. Two prompts that share block 5's tokens but differ earlier must not share block 5's KV, because the K and V depend on everything before them.</li>
+  <li>Blocks = (total memory × gpu_memory_utilization − used − peak + current) ÷ bytes per block, measured after a warm-up pass: memory for weights and the peak activation use are excluded.</li>
+  <li>[1, 2, 4, 8] then every 16 up to the maximum batch. Prefill steps, eager mode, and batches above 512 tokens run without graphs.</li>
+  <li>The token is the end-of-sequence token (unless <code>ignore_eos</code>), or the completion reached <code>max_tokens</code>.</li>
+</ol></details>
+<h3>Part B: draw the loop</h3>
+<p>Draw nano-vLLM's engine loop as a diagram with at most 8 boxes, numbered in order, from <code>add_request</code> to a finished sequence. Mark where blocks are allocated, where they are freed, and where preemption can happen. Then draw mini-SGLang's overlap loop and mark which work runs on the CPU while the GPU computes.</p>
+<pre>git clone --depth 1 https://github.com/sgl-project/mini-sglang.git
+less mini-sglang/python/minisgl/scheduler/scheduler.py      # overlap_loop, normal_loop, _schedule_next_batch</pre>
+<h3>Part C (optional, needs an Ampere-or-newer GPU): run nano-vLLM</h3>
+<p>nano-vLLM depends on FlashAttention kernels that need compute capability 8.0 or newer, so it does not run on a T4. On a rented L4, A10 or better, follow its README to download Qwen3-0.6B, then run <code>example.py</code> and <code>bench.py</code>. Change <code>max_num_batched_tokens</code> and <code>enforce_eager</code> and record throughput for each.</p>
+<h3>Part D: compare an engine against a reference (T4)</h3>
+<pre>import torch, math
+from vllm import LLM, SamplingParams
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+llm = LLM(model=name, dtype="half", gpu_memory_utilization=0.5, max_model_len=2048)
+prompts = ["Explain what a scheduler does in one paragraph.", "List three prime numbers and why."]
+outs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=64, logprobs=1))
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
+tok = AutoTokenizer.from_pretrained(name)
+ref = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16).cuda().eval()
+for o in outs:
+    p_ids, g_ids = o.prompt_token_ids, list(o.outputs[0].token_ids)
+    eng_lp = [o.outputs[0].logprobs[i][t].logprob for i, t in enumerate(g_ids)]
+    ids = torch.tensor([p_ids + g_ids], device="cuda")
+    with torch.inference_mode():
+        lp = torch.log_softmax(ref(ids).logits[0].float(), -1)
+    ref_lp = [lp[len(p_ids) - 1 + i, t].item() for i, t in enumerate(g_ids)]
+    diff = [abs(a - b) for a, b in zip(eng_lp, ref_lp)]
+    print(f"max |engine - reference| logprob diff: {max(diff):.3f}   mean: {sum(diff)/len(diff):.4f}")</pre>
+<p>Predict first: how large will the differences be for a healthy engine in FP16? Then deliberately corrupt the comparison (for example, shift <code>ref_lp</code> by one position) and see what a real bug looks like in these numbers.</p>
+<details><summary>What to expect</summary><p>Mean differences around 0.01 or below, with occasional larger values (up to a few tenths) where two tokens were nearly tied. These come from different kernels and summation order (chapter 1.2, determinism). A bug shows as large differences on many tokens, often with the engine very confident (logprob near 0) while the reference gives a very low logprob.</p></details>
+
+<h2 id="realworld">12. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Engines in practice</span>
+  <ul>
+    <li><strong>Engine teams</strong> run logprob and output comparisons against reference implementations in continuous integration for every supported model.</li>
+    <li><strong>Platform teams</strong> customize engines through plugins (custom schedulers, metrics, model variants) and keep close to upstream releases.</li>
+    <li><strong>Small educational engines</strong> such as nano-vLLM and mini-SGLang are used as starting points for research prototypes, because their core loops fit in one reading session.</li>
+    <li><strong>Capacity planning</strong> includes CPU cores per GPU, because API servers, engine cores and workers are separate processes.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">13. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz34"></div>
+<script type="application/json" id="qz34">[
+{"q":"In nano-vLLM, if a request is waiting and fits the budget and free blocks, the next step is:","o":["A decode step","A prefill-only step","A mixed step","Skipped"],"a":1,"e":"Its scheduler gives prefill priority and keeps prefill and decode in separate steps."},
+{"q":"Why does a block's prefix-cache hash include the previous block's hash?","o":["To make hashing faster","Because a block's K and V depend on all earlier tokens, so equal blocks with different histories must not be shared","To save memory","It does not"],"a":1,"e":"Chained hashes identify full prefixes."},
+{"q":"What does the slot mapping tell the attention kernel?","o":["Which GPU to use","Where to write each new token's K and V in the paged cache","The vocabulary","The sampling settings"],"a":1,"e":"Slot = physical block × block size + offset."},
+{"q":"Overlap scheduling hides:","o":["GPU kernel time","CPU scheduling and output processing time behind GPU execution","Network latency","KV memory"],"a":1,"e":"The CPU works on step n−1's results while the GPU runs step n."},
+{"q":"Why do engines pad decode batches to fixed sizes?","o":["To save memory","To replay CUDA graphs captured for those sizes","To improve sampling","Because attention needs it"],"a":1,"e":"A CUDA graph is captured for one shape."},
+{"q":"The best first test when an engine's output looks wrong is:","o":["Raise the temperature","Compare its logprobs on the same tokens with a reference implementation","Add more GPUs","Change the tokenizer"],"a":1,"e":"Logprob comparison separates numeric noise from real corruption."}
+]</script>
+
+<h2 id="summary">14. Summary</h2>
+<ul>
+  <li>An engine step is: schedule, prepare inputs, forward, sample, post-process.</li>
+  <li>Engines split work across processes: API server, engine core (scheduler, KV manager) and one worker per GPU.</li>
+  <li>nano-vLLM's scheduler: prefill-first separate steps, limited chunking, prefix hashing at admission, recompute preemption from the back. vLLM mixes decodes and prefill chunks in one step.</li>
+  <li>The runner flattens a mixed batch into token, position and slot arrays plus attention metadata; linear layers ignore sequence boundaries.</li>
+  <li>CUDA graphs are captured per batch size and replayed with padding.</li>
+  <li>Extend engines with plugins; debug silent errors by comparing logprobs with a reference.</li>
+</ul>
+
+<h2 id="refs">15. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://neutree.ai/blog/nano-vllm-part-1">Neutree: Inside Nano-vLLM, part 1</a></td><td>A guided tour of nano-vLLM's architecture, request flow and scheduling.</td></tr>
+<tr><td><a href="https://github.com/GeeeekExplorer/nano-vllm">nano-vLLM</a></td><td>The code quoted in section 3: scheduler, block manager, model runner.</td></tr>
+<tr><td><a href="https://github.com/sgl-project/mini-sglang">mini-SGLang</a></td><td>A compact SGLang with radix cache, chunked prefill and the overlap loop in section 4.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/design/arch_overview.html">vLLM: Architecture overview</a></td><td>The API server, engine core and worker processes, and how they communicate.</td></tr>
+<tr><td><a href="https://blog.vllm.ai/2025/11/20/vllm-plugin-system.html">vLLM blog: Building clean vLLM modifications with the plugin system</a></td><td>Kept from triage: why forks and monkey-patches fail, and how plugins work.</td></tr>
+<tr><td><a href="https://www.ai21.com/blog/vllm-debugging-mamba-bug/">AI21: One token to corrupt them all</a></td><td>Kept from triage: the stale Mamba-state bug and the logprob comparison method.</td></tr>
+<tr><td><a href="https://github.com/BudEcosystem/Awesome-vLLM-plugins">Awesome vLLM Plugins</a> and <a href="https://github.com/snowflakedb/ArcticInference">ArcticInference</a></td><td>Kept from triage: examples of the plugin ecosystem.</td></tr>
+<tr><td>Chi Wang and Peiheng Hu, <em>Hands-On LLM Serving and Optimization</em>, chapter 3</td><td>Designing and implementing a serving system from scratch.</td></tr>
+<tr><td>Fuheng Wu, <em>Distributed AI Systems</em>, chapters 6 and 7</td><td>vLLM and SGLang internals in distributed deployments.</td></tr>
+</table></div>
+<h3>Triaged out</h3>
+<div class="tbl"><table>
+<tr><th>Source</th><th>Reason</th></tr>
+<tr><td>vLLM Architectural Deep Dive (slides), The Rise of vLLM (video), SGLang talk (video)</td><td>Slides and videos without reachable text; the code and design docs above cover the same ground.</td></tr>
+<tr><td>vLLM-style engine on CPU (Medium)</td><td>Overlaps with nano-vLLM, which is the better reading target.</td></tr>
+<tr><td>vLLM Metal plugin; SGLang routed-experts PR; SGLang roadmap; GPU Model Runner V2 PR; internals thread on X</td><td>Narrow or fast-changing items; mentioned only as examples in sections 7 and 9.</td></tr>
+</table></div>
+<p class="note">Facts checked on 6 November 2026. Code excerpts from the nano-vLLM and mini-SGLang repositories as of that date.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$}=IE;const BUD=12,BS=4;let pol='nano',S;
+function init(){S={step:0,next:0,reqs:[{id:'A',p:9,o:3},{id:'B',p:3,o:5},{id:'C',p:6,o:4},{id:'D',p:14,o:2}].map(r=>({...r,done:0,gen:0,state:'waiting',blocks:[]})),free:[...Array(40).keys()],log:''};render();}
+function need(r,tok){const total=r.done+tok;const want=Math.ceil(total/BS);while(r.blocks.length<want)r.blocks.push(S.free.shift());}
+function step(){S.step++;const run=S.reqs.filter(r=>r.state==='running'),wait=S.reqs.filter(r=>r.state==='waiting');let sched=[];let left=BUD;
+  if(pol==='nano'){for(const r of wait){if(left<=0)break;const rem=r.p-r.done;if(rem>left&&sched.length)break;const take=Math.min(rem,left);sched.push([r,take,'prefill']);left-=take;}
+    if(!sched.length)for(const r of run)sched.push([r,1,'decode']);}
+  else{for(const r of run){if(left<=0)break;sched.push([r,1,'decode']);left--;}for(const r of wait){if(left<=0)break;const take=Math.min(r.p-r.done,left);sched.push([r,take,'prefill']);left-=take;}}
+  const ids=[],pos=[],slots=[],starts=[],ctx=[],samp=[];let off=0;
+  for(const [r,take,kind] of sched){need(r,take);starts.push(off);for(let i=0;i<take;i++){const p=r.done+i;ids.push(r.id.toLowerCase()+p);pos.push(p);slots.push(r.blocks[Math.floor(p/BS)]*BS+p%BS);}off+=take;ctx.push(r.done+take);
+    r.done+=take;if(kind==='prefill'&&r.done<r.p){r.state='waiting';}else{r.state='running';samp.push(off-1);r.gen++;if(kind==='decode'||r.done>=r.p){} }}
+  for(const [r] of sched){if(r.state==='running'&&r.gen>=r.o){r.state='finished';S.free.push(...r.blocks);r.freed=r.blocks.slice();r.blocks=[];}}
+  S.last={sched,ids,pos,slots,starts,ctx,samp};render();}
+function render(){const L=S.last;const row=(k,v)=>`<tr><td>${k}</td><td class="mono" style="font-size:12.5px">${v}</td></tr>`;
+  const reqs=S.reqs.map(r=>`<tr><td><b>${r.id}</b></td><td>${r.p}</td><td>${r.o}</td><td>${Math.min(r.done,r.p)}/${r.p}</td><td>${r.gen}/${r.o}</td><td><span class="pill" style="background:${r.state==='running'?'var(--kv-s)':r.state==='finished'?'var(--good-s)':'var(--panel2)'}">${r.state}</span></td><td class="mono" style="font-size:12px">[${r.blocks.join(', ')}]${r.freed&&r.state==='finished'?' freed':''}</td></tr>`).join('');
+  let stepInfo='<p class="note">Press Step.</p>';
+  if(L){const kinds=[...new Set(L.sched.map(s=>s[2]))].join(' + ')||'nothing';stepInfo=`<p><b>Step ${S.step}</b>: ${kinds}. Scheduled ${L.sched.map(([r,t,k])=>`${r.id} ×${t} (${k})`).join(', ')||'none'}; ${L.ids.length} of ${BUD} budget tokens used.</p>
+    <div class="tbl"><table>${row('input_ids',`[${L.ids.join(', ')}]`)}${row('positions',`[${L.pos.join(', ')}]`)}${row('slot_mapping',`[${L.slots.join(', ')}]`)}${row('query starts',`[${L.starts.join(', ')}]`)}${row('context lengths',`[${L.ctx.join(', ')}]`)}${row('sample rows',`[${L.samp.join(', ')}]`)}</table></div>`;}
+  const all=S.reqs.every(r=>r.state==='finished');
+  $('enOut').innerHTML=stepInfo+`<div class="tbl"><table><tr><th>Req</th><th>Prompt</th><th>Max out</th><th>Prefilled</th><th>Generated</th><th>State</th><th>Block table</th></tr>${reqs}</table></div>`+(all?`<p class="note">All requests finished in ${S.step} steps. Reset and try the other policy: compare the number of steps and when each request got its first token.</p>`:'');
+  $('enStep').disabled=all;}
+document.querySelectorAll('#enW [data-pol]').forEach(b=>b.onclick=()=>{pol=b.dataset.pol;document.querySelectorAll('#enW [data-pol]').forEach(x=>x.classList.toggle('on',x===b));init();});
+$('enStep').onclick=step;$('enReset').onclick=init;init();
+})();
+</script>

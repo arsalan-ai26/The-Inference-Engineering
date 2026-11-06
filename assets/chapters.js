@@ -116,7 +116,7 @@ window.IE_CHAPTERS = [
 "title": "Engine internals",
 "slug": "3-4-engine-internals",
 "part": 3,
-"ready": false
+"ready": true
 },
 {
 "n": "3.5",
