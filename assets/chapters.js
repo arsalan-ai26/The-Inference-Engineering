@@ -60,7 +60,7 @@ window.IE_CHAPTERS = [
 "title": "Positional information",
 "slug": "2-3-positional-encoding",
 "part": 2,
-"ready": false
+"ready": true
 },
 {
 "n": "2.4",

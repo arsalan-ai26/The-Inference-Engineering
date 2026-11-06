@@ -1,0 +1,293 @@
+<div class="kicker">Part 2 · Transformers and LLM inference mechanics · Chapter 2.3</div>
+<h1>Positional information</h1>
+<p class="lede">Attention, as built in chapter 2.2, cannot tell "dog bites man" from "man bites dog". Something must tell the model where each token is. Modern LLMs do it by rotating the query and key vectors, a method called RoPE. This chapter explains why it works, how it sets a model's context limit, and how serving engines stretch that limit.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 1.1 (dot product), 2.1, 2.2</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why is attention without positions "order-blind"?</li>
+    <li>RoPE rotates q at position m and k at position n. What does their dot product depend on?</li>
+    <li>A model was trained to 8K tokens. Name one way to run it at 64K, and one cost.</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Scores are dot products between token vectors, and the weighted sum does not care about order. Shuffle the tokens and each token's output just moves with it.</li>
+    <li>Only on the vectors and the distance m − n, not on m and n themselves.</li>
+    <li>RoPE scaling (position interpolation, NTK-aware scaling, YaRN or the Llama 3 method). Costs: some quality loss, especially without fine-tuning; static scaling can hurt short prompts; and 8 times the KV cache and much more attention work.</li>
+  </ol></details>
+</div>
+
+<h2 id="problem">1. The problem: attention is order-blind</h2>
+<p>Look at the attention formula again: softmax(QKᵀ/√d)V. Each score is a dot product of two token vectors. Nothing in it says which token came first. If you shuffle the input tokens, every token gets the same output as before, just in a new place. Mathematically, attention without positions is <strong>permutation-equivariant</strong>.</p>
+<p>The causal mask (chapter 2.2) adds a little order information, because token 5 sees 5 tokens and token 50 sees 50. But it does not tell the model how far apart two specific tokens are. Language depends heavily on order and distance, so the model needs explicit position information.</p>
+
+<h2 id="absolute">2. First solution: add a position vector</h2>
+<p>The original transformer and GPT-2 add a position vector to each token's embedding before the first layer:</p>
+<div class="formula">x_i = token_embedding[id_i] + position_embedding[i]</div>
+<ul>
+  <li><strong>Sinusoidal</strong> (original transformer): fixed sine and cosine waves of many frequencies. Not learned.</li>
+  <li><strong>Learned</strong> (GPT-2, BERT): a second embedding table with one row per position. GPT-2 has 1,024 rows of 768.</li>
+</ul>
+<p>Learned absolute positions have a hard limit: position 1,025 has no row. GPT-2 simply cannot read longer input. Both kinds also encode <em>absolute</em> position, while language mostly cares about <em>relative</em> position: "the word two places before me" matters more than "the word at position 4,817".</p>
+
+<h2 id="rope">3. RoPE: encode position as a rotation</h2>
+<p><strong>Rotary position embedding</strong> (RoPE) takes a different route. It does not add anything to the embeddings. Inside every attention layer, it rotates each query and key vector by an angle that depends on the token's position.</p>
+<p>Start with two dimensions. Treat the first two elements of q as a point on a plane. For a token at position m, rotate that point by the angle m × θ. Do the same to k at position n with angle n × θ. Now use one property of rotations:</p>
+<div class="formula">rotate(q, mθ) · rotate(k, nθ) = q · rotate(k, (n − m)θ)</div>
+<p>The dot product depends only on the <strong>difference</strong> n − m. Move both tokens 100 places later, and the score is identical. So attention scores become a function of the content and the relative distance only, which is what language needs.</p>
+
+<div class="widget" id="rotW">
+  <div class="wt">Interactive: rotation keeps only the distance</div>
+  <div class="ws">A query (indigo) at position m and a key (amber) at position n, rotated by m·θ and n·θ. Change both positions by the same amount with the "shift both" slider: the angle between them, and so the dot product, stays the same.</div>
+  <div class="ctrls">
+    <label>Query position m: <span class="mono" id="rMv"></span><input type="range" id="rM" min="0" max="40" value="6"></label>
+    <label>Key position n: <span class="mono" id="rNv"></span><input type="range" id="rN" min="0" max="40" value="2"></label>
+    <label>Shift both by: <span class="mono" id="rSv"></span><input type="range" id="rS" min="0" max="60" value="0"></label>
+    <label>θ (radians per position): <span class="mono" id="rTv"></span><input type="range" id="rT" min="0.02" max="1" step="0.01" value="0.3"></label>
+  </div>
+  <div class="svgwrap"><svg id="rotSvg" viewBox="0 0 360 300" width="360" style="max-width:100%;height:auto" role="img" aria-label="Rotated query and key vectors"></svg></div>
+  <div class="stats" id="rotStats"></div>
+</div>
+
+<h3>Many frequencies</h3>
+<p>A real head has d = 128 dimensions, not 2. RoPE splits them into 64 pairs and gives each pair its own rotation speed:</p>
+<div class="formula">θ_i = base^(−2i / d)      for pair i = 0, 1, ..., d/2 − 1</div>
+<p>Pair 0 rotates by 1 radian per position: it spins fast and tells apart neighbouring tokens. The last pairs rotate very slowly: they change only over thousands of tokens and carry long-range position. Together they work like the hands of a clock, from seconds to years. The <strong>base</strong> (called <code>rope_theta</code> in configs) sets how slow the slowest pairs are.</p>
+<div class="tbl"><table>
+<tr><th>Model</th><th class="n">rope_theta</th><th class="n">Trained or native context</th><th>Scaling in config</th></tr>
+<tr><td>Mistral-7B-v0.1</td><td class="n">10,000</td><td class="n">8K (4,096 window)</td><td>none</td></tr>
+<tr><td>Llama 3.1 8B and 70B</td><td class="n">500,000</td><td class="n">8,192 → 131,072</td><td>"llama3", factor 8</td></tr>
+<tr><td>Qwen2.5-0.5B-Instruct</td><td class="n">1,000,000</td><td class="n">32,768</td><td>none (YaRN optional)</td></tr>
+<tr><td>Qwen3-8B</td><td class="n">1,000,000</td><td class="n">40,960</td><td>none (YaRN optional)</td></tr>
+<tr><td>DeepSeek-V3</td><td class="n">10,000</td><td class="n">4,096 → 163,840</td><td>YaRN, factor 40</td></tr>
+</table></div>
+
+<h3>Where RoPE sits in the code</h3>
+<pre>q = q_proj(h).view(B, T, H, d).transpose(1, 2)      # [B, H, T, d]
+k = k_proj(h).view(B, T, Hkv, d).transpose(1, 2)    # [B, Hkv, T, d]
+cos, sin = rotary_emb(positions)                    # precomputed per position: [T, d]
+q = q * cos + rotate_half(q) * sin                  # rotate each pair
+k = k * cos + rotate_half(k) * sin
+# values are NOT rotated; attention as in chapter 2.2</pre>
+<p>Three facts matter for inference:</p>
+<ul>
+  <li><strong>Only q and k are rotated.</strong> Values carry content, not position.</li>
+  <li><strong>Keys are rotated before they are cached</strong> (chapter 2.4). A cached key already carries its position, so the engine must pass the correct position for every new token. Off-by-one position bugs produce subtly wrong output, not errors.</li>
+  <li><strong>RoPE is cheap.</strong> It is element-wise work on q and k. Engines precompute the cos and sin tables and fuse the rotation into the projection or attention kernel.</li>
+</ul>
+
+<h2 id="limit">4. Context length: where models break</h2>
+<p>A model is trained on sequences up to some length L. Each RoPE pair has a <strong>wavelength</strong>: the number of positions for one full turn, 2π / θ_i. During training, the slow pairs never complete a turn, so the model only ever saw part of their range. Feed it a longer sequence, and those pairs reach angles the model never learned. Attention patterns break, and output degrades fast.</p>
+<p>The fix is <strong>RoPE scaling</strong>: change the rotation speeds so that a longer sequence maps into angles the model already knows.</p>
+<div class="tbl"><table>
+<tr><th>Method</th><th>Idea</th><th>Trade-off</th></tr>
+<tr><td>Position interpolation (PI)</td><td>Divide every position by the scale factor s</td><td>Simple, but squeezes the fast pairs too, so nearby tokens become hard to tell apart; needs fine-tuning</td></tr>
+<tr><td>NTK-aware scaling</td><td>Raise the base instead, so slow pairs slow down a lot and fast pairs barely change</td><td>Works reasonably without fine-tuning; less precise at large factors</td></tr>
+<tr><td>YaRN</td><td>Per-frequency: keep fast pairs, interpolate slow pairs, blend in between; add an attention temperature</td><td>Best quality for the fine-tuning budget; used by DeepSeek and offered for Qwen</td></tr>
+<tr><td>Llama 3 scaling</td><td>Per-frequency like YaRN: keep pairs with short wavelengths, divide slow ones by 8, smooth ramp between</td><td>Built into Llama 3.1's config; model was trained with it</td></tr>
+</table></div>
+
+<div class="widget" id="freqW">
+  <div class="wt">Interactive: what scaling does to each frequency</div>
+  <div class="ws">Each dot is one of the 64 rotation pairs of a 128-dimension head. The vertical position is its wavelength (log scale). The dashed line is the original training length. Pairs above the line never complete a full turn in training. Pick a method to see how it changes the wavelengths.</div>
+  <div class="ctrls">
+    <label>Base (rope_theta) <select id="fB"><option value="10000">10,000</option><option value="500000" selected>500,000</option><option value="1000000">1,000,000</option></select></label>
+    <label>Original length <select id="fL"><option value="4096">4,096</option><option value="8192" selected>8,192</option><option value="32768">32,768</option></select></label>
+    <label>Scale factor <select id="fS"><option>2</option><option>4</option><option selected>8</option><option>16</option><option>32</option></select></label>
+    <div class="seg" role="group" aria-label="Method"><button data-m="none">None</button><button data-m="pi">PI</button><button data-m="ntk">NTK-aware</button><button data-m="llama3" class="on">Llama 3</button></div>
+  </div>
+  <div class="svgwrap"><svg id="fSvg" viewBox="0 0 680 280" width="680" style="max-width:100%;height:auto" role="img" aria-label="RoPE wavelengths per dimension pair"></svg></div>
+  <div class="legend"><span><i style="background:var(--mute)"></i>Original</span><span><i style="background:var(--kv)"></i>After scaling</span></div>
+  <p class="note" id="fMsg"></p>
+</div>
+
+<h2 id="serving">5. What this means for serving</h2>
+<ul>
+  <li><strong>The engine must use the model's exact RoPE settings.</strong> The base, the scaling type and its parameters come from <code>config.json</code>. A missing or wrong <code>rope_scaling</code> block gives a model that looks fine on short prompts and fails on long ones.</li>
+  <li><strong>Static scaling can hurt short prompts.</strong> Some engines apply YaRN with one fixed factor to every request, whatever its length. The Qwen model cards warn that this static form may reduce quality on short texts, and advise enabling it only when you need long context.</li>
+  <li><strong><code>--max-model-len</code> is your choice, within the model's limit.</strong> Setting it longer than the model supports is usually refused or warned about by the engine. Setting it shorter saves memory for more users (chapter 2.4).</li>
+  <li><strong>Long context is expensive regardless of positions.</strong> Scaling makes 128K tokens <em>possible</em>; it does not make them cheap. KV memory grows linearly and prefill attention grows with the square of the length.</li>
+</ul>
+<div class="box watch">
+  <span class="lbl">Watch out: "supports 128K" is not "works well at 128K"</span>
+  <p>The advertised context length is what the positions allow. Recall and reasoning far into a long context are often weaker than near the end. Long-context benchmarks that test retrieval and multi-step reasoning across the whole window give a more honest picture than "needle in a haystack" tests alone.</p>
+</div>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Partial and decoupled RoPE</span>
+  <p>Some models rotate only part of each head. DeepSeek's multi-head latent attention keeps a separate small RoPE key (64 dimensions) next to the compressed latent, because a rotation cannot be folded into the compressed projection. That extra key is why MLA's cache per token is 512 + 64 values per layer (chapter 2.4).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Layers with no positions</span>
+  <p>Some recent designs mix RoPE layers with layers that use no position encoding at all (often called NoPE). The causal mask alone gives these layers weak order information, and they tend to generalize better to long inputs. Hybrid patterns of this kind appear in several 2025 and 2026 open models.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Dropping positions after training</span>
+  <p>Research from early 2026 (DroPE) proposes training with RoPE, then removing positional embeddings and briefly recalibrating at the original length. The authors report better length generalization than RoPE scaling methods for models up to 7B parameters. It is a research result; check whether it has reached the models you serve before relying on it.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Position IDs are not always 0, 1, 2, ...</span>
+  <p>Engines compute position IDs per sequence, not per batch slot. With packed batches, prefix caching (chapter 4.4) and multimodal inputs, positions can restart, skip or become multi-dimensional (vision-language models such as Qwen2-VL use separate position axes for time, height and width). Getting them right is part of every new model's bring-up in an engine.</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Thinking RoPE adds a vector to the embeddings. It rotates q and k inside every attention layer.</li>
+  <li>Rotating the values too. Only queries and keys carry position.</li>
+  <li>Ignoring <code>rope_scaling</code> when porting or serving a model.</li>
+  <li>Assuming a larger <code>rope_theta</code> alone makes a model handle longer context. The model must also be trained, or scaled and tuned, for it.</li>
+  <li>Expecting quality at the advertised maximum context to equal quality at short context.</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<p><strong>Goal:</strong> see order-blindness, build RoPE, prove its relative property and inspect real configs.</p>
+<h3>Part A: attention without positions is order-blind</h3>
+<pre>import torch, math
+torch.manual_seed(0)
+F = torch.nn.functional
+T, d = 6, 16
+x = torch.randn(T, d)
+Wq, Wk, Wv = (torch.randn(d, d) for _ in range(3))
+def attn(x):                       # no mask, no positions
+    q, k, v = x @ Wq, x @ Wk, x @ Wv
+    return F.softmax(q @ k.T / math.sqrt(d), -1) @ v
+perm = torch.randperm(T)
+print(torch.allclose(attn(x)[perm], attn(x[perm]), atol=1e-5))   # True: shuffling input just shuffles output</pre>
+<h3>Part B: write RoPE</h3>
+<pre>def rope_tables(T, d, base=10000.0):
+    inv = base ** (-torch.arange(0, d, 2).float() / d)        # [d/2] frequencies theta_i
+    ang = torch.arange(T).float()[:, None] * inv[None, :]     # [T, d/2] angles m * theta_i
+    ang = torch.cat([ang, ang], dim=-1)                       # [T, d] (Llama/Qwen "half" layout)
+    return ang.cos(), ang.sin()
+
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat([-x2, x1], dim=-1)
+
+def apply_rope(x, cos, sin):
+    # TODO: one line, using cos, sin and rotate_half
+    ...
+
+cos, sin = rope_tables(200, d)
+q, k = torch.randn(d), torch.randn(d)
+def score(m, n): return (apply_rope(q, cos[m], sin[m]) @ apply_rope(k, cos[n], sin[n])).item()
+print(score(10, 3), score(110, 103), score(57, 50))      # all equal: distance 7
+print(score(10, 3), score(10, 9))                        # different distances, different scores</pre>
+<details><summary>Solution</summary><pre>    return x * cos + rotate_half(x) * sin</pre>
+<p>This "half" layout pairs element i with element i + d/2, which is what Llama and Qwen code does. The original paper pairs neighbouring elements (0 with 1, 2 with 3). Both are valid if used consistently, but weights trained with one layout give wrong results with the other. This is a classic bug when converting checkpoints.</p></details>
+<h3>Part C: check against a real implementation</h3>
+<pre>from transformers import AutoConfig, AutoModelForCausalLM
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+cfg = AutoConfig.from_pretrained(name)
+def rope_info(c):                    # transformers v5 keeps RoPE settings in c.rope_parameters; v4 used rope_theta / rope_scaling
+    rp = getattr(c, "rope_parameters", None) or {}
+    return rp.get("rope_theta", getattr(c, "rope_theta", None)), rp or getattr(c, "rope_scaling", None)
+theta, rp = rope_info(cfg)
+print("rope_theta:", theta, "max positions:", cfg.max_position_embeddings, "rope settings:", rp)
+m = AutoModelForCausalLM.from_pretrained(name)
+hd = cfg.hidden_size // cfg.num_attention_heads
+pos = torch.arange(50)[None]
+cos_hf, sin_hf = m.model.rotary_emb(torch.zeros(1, 50, hd), pos)
+c2, s2 = rope_tables(50, hd, theta)
+print(torch.allclose(cos_hf[0], c2, atol=1e-4), torch.allclose(sin_hf[0], s2, atol=1e-4))</pre>
+<h3>Part D: compare model configs</h3>
+<pre>for name in ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen3-8B", "mistralai/Mistral-7B-v0.1", "deepseek-ai/DeepSeek-V3"]:
+    try:
+        c = AutoConfig.from_pretrained(name, trust_remote_code=False)
+        theta, rp = rope_info(c)
+        print(f"{name:32s} theta={theta}  max={c.max_position_embeddings}  rope={rp}")
+    except Exception as e:
+        print(name, "could not load config:", type(e).__name__)</pre>
+<p>Some repositories are gated (for example Llama) and need a Hugging Face login. Compare your output with the table in section 3.</p>
+<h3>Part E: the hard limit of learned positions</h3>
+<pre>g = AutoModelForCausalLM.from_pretrained("openai-community/gpt2")
+print(g.transformer.wpe.weight.shape)          # [1024, 768]: one row per position
+ids = torch.randint(0, 50000, (1, 1100))
+try:
+    g(ids)
+except Exception as e:
+    print("fails beyond 1024 positions:", type(e).__name__)</pre>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Positions in production</span>
+  <ul>
+    <li><strong>Engines</strong> read RoPE settings from the model config and support the common scaling types (linear, dynamic NTK, YaRN, Llama 3). Overriding them is possible but rarely wise.</li>
+    <li><strong>Long-context deployments</strong> often enable YaRN only on a separate long-context endpoint, keeping the default endpoint unscaled for short prompts.</li>
+    <li><strong>Model release notes</strong> state the native training length and the extended length. Plan capacity for the length you actually allow, not the maximum.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz23"></div>
+<script type="application/json" id="qz23">[
+{"q":"Without any position information, shuffling the input tokens of attention:","o":["Changes every output value","Shuffles the outputs in the same way","Causes an error","Has no effect at all"],"a":1,"e":"Attention without positions is permutation-equivariant."},
+{"q":"RoPE is applied to:","o":["The embeddings only","Q and K in every attention layer","V only","The output head"],"a":1,"e":"Queries and keys are rotated by position; values are not."},
+{"q":"With RoPE, the score between a query at position 110 and a key at 103 equals the score at positions:","o":["10 and 3 (same vectors)","110 and 3","0 and 0","It never repeats"],"a":0,"e":"Only the distance, 7, matters."},
+{"q":"Which RoPE pairs carry long-range position?","o":["The fast-rotating pairs","The slow-rotating pairs","Only pair 0","None"],"a":1,"e":"Slow pairs change over thousands of tokens."},
+{"q":"Position interpolation divides every position by the factor s. Its main weakness:","o":["It needs more memory","It also squeezes the fast pairs, blurring nearby positions","It removes the causal mask","It only works for GPT-2"],"a":1,"e":"Per-frequency methods (YaRN, Llama 3) keep fast pairs unchanged."},
+{"q":"A model looks fine on short prompts in your engine but fails on long ones. The first thing to check:","o":["Temperature","The rope_scaling settings the engine applied","The tokenizer vocabulary","The batch size"],"a":1,"e":"Missing or wrong RoPE scaling breaks only long inputs."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>Attention alone is order-blind; models need position information.</li>
+  <li>GPT-2 adds learned absolute position vectors, with a hard limit of 1,024 positions.</li>
+  <li>RoPE rotates q and k by position-dependent angles, so attention scores depend on relative distance.</li>
+  <li>Each pair of dimensions rotates at its own speed; <code>rope_theta</code> sets the slowest.</li>
+  <li>Beyond the trained length, slow pairs reach unseen angles; RoPE scaling (PI, NTK, YaRN, Llama 3) remaps them.</li>
+  <li>Engines must apply the exact RoPE settings; long context stays costly in memory and compute.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://blog.eleuther.ai/rotary-embeddings/">EleutherAI: Rotary Embeddings, a Relative Revolution</a></td><td>The clearest explanation of RoPE's rotation idea and its relative property.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2104.09864">Su et al., RoFormer: Enhanced Transformer with Rotary Position Embedding</a></td><td>The original RoPE paper.</td></tr>
+<tr><td>Sebastian Raschka, <em>Build a Large Language Model (From Scratch)</em>, section 2.8</td><td>Absolute positional embeddings in code, as used by GPT-2.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2306.15595">Chen et al., Extending Context Window via Positional Interpolation</a></td><td>Position interpolation.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2309.00071">Peng et al., YaRN: Efficient Context Window Extension</a></td><td>Per-frequency interpolation with an attention temperature; the method used by DeepSeek and offered for Qwen.</td></tr>
+<tr><td><a href="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct">Qwen2.5 model card: processing long texts</a></td><td>How to enable YaRN, and the warning that static YaRN may hurt short texts.</td></tr>
+<tr><td><a href="https://pub.sakana.ai/DroPE/">Sakana AI: DroPE</a></td><td>Kept from triage: a 2026 research result on removing positional embeddings after pretraining.</td></tr>
+<tr><td>Model configs on Hugging Face (Llama 3.1, Qwen2.5, Qwen3, Mistral, DeepSeek-V3)</td><td>The rope_theta and rope_scaling values in section 3.</td></tr>
+</table></div>
+<p class="note">Facts checked on 6 November 2026.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+const q0=[1.0,0.35],k0=[0.8,-0.5];
+const rot=(v,a)=>[v[0]*Math.cos(a)-v[1]*Math.sin(a),v[0]*Math.sin(a)+v[1]*Math.cos(a)];
+function rd(){const m=+$('rM').value,n=+$('rN').value,sh=+$('rS').value,th=+$('rT').value;$('rMv').textContent=m;$('rNv').textContent=n;$('rSv').textContent=sh;$('rTv').textContent=th.toFixed(2);
+  const M=m+sh,N=n+sh;const q=rot(q0,M*th),k=rot(k0,N*th);const s=$('rotSvg');s.innerHTML='';const O=[180,150],R=110;
+  el('circle',{cx:O[0],cy:O[1],r:R,fill:'none',stroke:css('--line')},s);el('line',{x1:O[0]-R-10,x2:O[0]+R+10,y1:O[1],y2:O[1],class:'axis'},s);el('line',{y1:O[1]-R-10,y2:O[1]+R+10,x1:O[0],x2:O[0],class:'axis'},s);
+  [[q,'--pre',`q at ${M}`],[k,'--dec',`k at ${N}`]].forEach(([v,c,t])=>{const x=O[0]+v[0]*R,y=O[1]-v[1]*R;el('line',{x1:O[0],y1:O[1],x2:x,y2:y,stroke:css(c),'stroke-width':3},s);el('circle',{cx:x,cy:y,r:5,fill:css(c)},s);el('text',{x:x+8,y:y-6,'font-size':12,fill:css(c)},s,t);});
+  const dot=q[0]*k[0]+q[1]*k[1];
+  $('rotStats').innerHTML=[['Positions (after shift)',`${M} and ${N}`],['Distance m − n',M-N],['q · k',dot.toFixed(4)]].map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');}
+['rM','rN','rS','rT'].forEach(id=>$(id).addEventListener('input',rd));IE.onTheme(rd);
+let FM='llama3';
+function fd(){const base=+$('fB').value,L=+$('fL').value,s=+$('fS').value,d=128;
+  const orig=[],sc=[];for(let i=0;i<d/2;i++){const th=Math.pow(base,-2*i/d);orig.push(2*Math.PI/th);let t2=th;
+    if(FM==='pi')t2=th/s;else if(FM==='ntk'){const b2=base*Math.pow(s,d/(d-2));t2=Math.pow(b2,-2*i/d);}
+    else if(FM==='llama3'){const lf=1,hf=4,lw=L/lf,hw=L/hf,wl=2*Math.PI/th;if(wl<hw)t2=th;else if(wl>lw)t2=th/s;else{const sm=(L/wl-lf)/(hf-lf);t2=(1-sm)*th/s+sm*th;}}
+    sc.push(2*Math.PI/t2);}
+  const svg=$('fSvg');svg.innerHTML='';const W=680,H=280,l=60,r=20,t=14,b=36;const all=orig.concat(sc);const lo=Math.log10(Math.min(...all)),hi=Math.log10(Math.max(...all));
+  const X=i=>l+i/(d/2-1)*(W-l-r),Y=v=>H-b-(Math.log10(v)-lo)/(hi-lo)*(H-t-b);
+  for(let e=Math.ceil(lo);e<=Math.floor(hi);e++){el('line',{x1:l,x2:W-r,y1:Y(10**e),y2:Y(10**e),class:'axis'},svg);el('text',{x:l-6,y:Y(10**e)+4,'text-anchor':'end',class:'tick'},svg,e<=3?String(10**e):'1e'+e);}
+  [L,L*s].forEach((v,j)=>{if(Math.log10(v)<=hi){el('line',{x1:l,x2:W-r,y1:Y(v),y2:Y(v),stroke:css(j?'--kv':'--dec'),'stroke-dasharray':'6 4'},svg);el('text',{x:W-r,y:Y(v)-5,'text-anchor':'end','font-size':11,fill:css(j?'--kv':'--dec')},svg,j?`target ${IE.int(v)}`:`trained ${IE.int(v)}`);}});
+  orig.forEach((v,i)=>el('circle',{cx:X(i),cy:Y(v),r:2.5,fill:css('--mute')},svg));
+  if(FM!=='none')sc.forEach((v,i)=>el('circle',{cx:X(i),cy:Y(v),r:3,fill:css('--kv')},svg));
+  el('text',{x:l+(W-l-r)/2,y:H-8,'text-anchor':'middle',class:'tick'},svg,'dimension pair i (fast → slow)');
+  const above=orig.filter(v=>v>L).length,keep=sc.filter((v,i)=>Math.abs(v-orig[i])/orig[i]<0.01).length;
+  const msg={none:`${above} of 64 pairs have wavelengths longer than the training length: the model never saw them complete a turn.`,pi:'Position interpolation stretches every wavelength by the same factor. Even the fast pairs slow down, so nearby positions become harder to tell apart.',ntk:'NTK-aware scaling raises the base. Fast pairs barely change; slow pairs stretch by up to the full factor.',llama3:`Llama 3 scaling keeps ${keep} fast pairs exactly, stretches the slowest pairs by ${s}×, and blends the pairs in between.`};
+  $('fMsg').textContent=msg[FM];}
+document.querySelectorAll('#freqW [data-m]').forEach(b=>b.onclick=()=>{FM=b.dataset.m;document.querySelectorAll('#freqW [data-m]').forEach(x=>x.classList.toggle('on',x===b));fd();});
+['fB','fL','fS'].forEach(id=>$(id).addEventListener('input',fd));IE.onTheme(fd);
+})();
+</script>
