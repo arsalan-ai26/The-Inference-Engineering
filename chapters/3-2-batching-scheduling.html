@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>3.2 Batching and scheduling</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="3.2">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 3 · Chapter 3.2</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 3 · Inference engines and serving · Chapter 3.2</div>
+<h1>Batching and scheduling</h1>
+<p class="lede">Chapter 2.5 showed that a decode step costs almost the same for 1 sequence as for 64. Turning that fact into real throughput is the job of the scheduler: the part of an engine that decides, every few milliseconds, which requests run and how many tokens each one processes. This chapter builds the scheduler up from the simplest batch to continuous batching with chunked prefill, and shows how its settings trade time to first token against smooth streaming.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 5 hours with the lab</span>
+  <span class="chip">Needs: 2.4, 2.5, 3.1</span>
+  <span class="chip">Compute: Colab CPU for the simulator; T4 for vLLM tuning</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What is the difference between static batching and continuous batching?</li>
+    <li>A 30,000-token prompt arrives while 50 users are streaming. Without chunked prefill, what do those users see?</li>
+    <li>You lower <code>max-num-batched-tokens</code> from 16,384 to 2,048. What happens to TTFT and to inter-token latency?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Static batching fixes a group of requests and runs it until the longest one finishes. Continuous batching re-forms the batch at every step: finished requests leave and new ones join immediately.</li>
+    <li>A long pause in their token streams while the whole prefill runs in one step (hundreds of milliseconds or more).</li>
+    <li>Inter-token latency gets smoother and lower, because each step carries less prefill work. TTFT for long prompts gets longer, because their prefill is split over more steps.</li>
+  </ol></details>
+</div>
+
+<h2 id="why">1. Why batching is the main lever</h2>
+<p>From chapter 2.5: a decode step reads all the weights once, whatever the batch size. At batch 1 the GPU's math units are idle more than 99% of the time. At batch 64, total throughput is about 30 times higher while each user slows only about 2 times. So a server that runs requests one at a time wastes almost all of its GPU.</p>
+<p>The question is <em>how</em> to batch. Requests arrive at random times, have prompts of different lengths, and want outputs of different lengths. A good batching method keeps the GPU full without making anyone wait too long.</p>
+
+<h2 id="static">2. Static batching</h2>
+<p>The simplest method, borrowed from classic machine learning serving:</p>
+<ol>
+  <li>Collect requests until the batch is full (or a timer expires).</li>
+  <li>Pad all prompts to the longest prompt in the batch.</li>
+  <li>Generate until <em>every</em> request in the batch is finished.</li>
+  <li>Return the results, and start the next batch.</li>
+</ol>
+<p>This fails for LLMs because output lengths vary enormously. One request wants 20 tokens, another 2,000. The short one finishes early but its slot stays empty until the long one is done, and new arrivals wait outside. <strong>Dynamic batching</strong> (form a batch from whatever arrived within a short window) helps with arrivals but has the same problem: the batch is fixed for its whole life.</p>
+
+<h2 id="continuous">3. Continuous batching</h2>
+<p>The fix is to schedule at the level of a <strong>step</strong> (one forward pass), not a request. This is called <strong>continuous batching</strong>, also known as iteration-level scheduling. It was introduced by the Orca system (OSDI 2022) and is used by every modern engine.</p>
+<ol>
+  <li>At each step, the scheduler looks at every request.</li>
+  <li>Requests that finished in the last step leave the batch and free their KV memory.</li>
+  <li>Waiting requests join the batch if there is room (in sequences, tokens and KV memory).</li>
+  <li>The model runs one forward pass for everyone: new requests do their prefill, running ones decode one token.</li>
+</ol>
+<p>No slot is idle for long, and a new request starts within one step of a slot opening. Published benchmarks from 2023 measured up to 23 times higher throughput than static batching for the same model, by combining continuous batching with better KV memory management (chapter 3.3).</p>
+
+<div class="widget" id="cbW">
+  <div class="wt">Interactive: static vs continuous batching</div>
+  <div class="ws">Eight batch slots, the same 24 requests with random output lengths, all arriving at the start. Each bar is one request in a slot. Grey is a slot doing nothing. Change the length spread to see why static batching wastes the GPU.</div>
+  <div class="ctrls">
+    <div class="seg" role="group" aria-label="Mode"><button data-mode="static">Static</button><button data-mode="cont" class="on">Continuous</button></div>
+    <label>Output length spread <select id="cbSp"><option value="1">small (all similar)</option><option value="4" selected>medium</option><option value="12">large (10 to 1,000+ tokens)</option></select></label>
+    <button id="cbNew">New requests</button>
+  </div>
+  <div class="svgwrap"><svg id="cbSvg" viewBox="0 0 680 250" width="680" style="max-width:100%;height:auto" role="img" aria-label="Slot timeline of batched requests"></svg></div>
+  <div class="stats" id="cbStats"></div>
+</div>
+
+<h2 id="prefill">4. The prefill problem</h2>
+<p>Continuous batching mixes two very different kinds of work in one step:</p>
+<ul>
+  <li><strong class="t-dec">Decode</strong> for running requests: 1 token each, memory-bound, cheap.</li>
+  <li><strong class="t-pre">Prefill</strong> for new requests: the whole prompt, compute-bound, possibly thousands of tokens.</li>
+</ul>
+<p>The step takes as long as its total work. If a new 30,000-token prompt is prefilled in one step, that step may take a second or more, and every streaming user sees a pause of that length. The time between two output tokens is the <strong>inter-token latency</strong> (ITL, chapter 2.4). Long prefills cause ITL spikes.</p>
+<p>Two simple policies both fail:</p>
+<ul>
+  <li><strong>Prefill first:</strong> run new prompts as soon as they arrive. Good TTFT, bad ITL spikes.</li>
+  <li><strong>Decode first:</strong> finish decodes before starting new prompts. Smooth ITL, but new requests wait and TTFT suffers.</li>
+</ul>
+
+<h2 id="chunked">5. Chunked prefill and the token budget</h2>
+<p><strong>Chunked prefill</strong> removes the dilemma. Each step has a fixed <strong>token budget</strong>: the maximum number of tokens it may process (in vLLM, <code>max-num-batched-tokens</code>). The scheduler fills the budget in this order:</p>
+<ol>
+  <li>One token for every running decode request.</li>
+  <li>The remaining budget goes to prefill, taking a <em>chunk</em> of a waiting prompt (the rest continues in later steps).</li>
+</ol>
+<p>Each step now has a bounded size, so ITL stays smooth. And because the prefill chunks ride along with decodes, the GPU does useful compute-bound work in steps that would otherwise be memory-bound. The Sarathi-Serve paper calls these "stall-free" schedules. vLLM enables chunked prefill by default in its current engine and gives decodes priority.</p>
+
+<div class="widget" id="chW">
+  <div class="wt">Interactive: the token budget, step by step</div>
+  <div class="ws">A long prompt arrives while some users are decoding. Each column is one engine step: amber is decode tokens, indigo is prefill tokens. The line is the step time, which is what streaming users feel as ITL. Step time model: about 4.8 ms of weight reading plus compute for the step's tokens (Llama 3.1 8B on an H100, chapter 2.5).</div>
+  <div class="ctrls">
+    <label>Running decodes <select id="chD"><option>8</option><option selected>32</option><option>128</option></select></label>
+    <label>New prompt (tokens) <select id="chP"><option>2048</option><option selected>8192</option><option>32768</option></select></label>
+    <label>Token budget per step <select id="chB"><option value="0">no chunking</option><option>512</option><option selected>2048</option><option>8192</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="chSvg" viewBox="0 0 680 270" width="680" style="max-width:100%;height:auto" role="img" aria-label="Step composition and step time with chunked prefill"></svg></div>
+  <div class="stats" id="chStats"></div>
+</div>
+<div class="box ex">
+  <span class="lbl">The trade-off in one sentence</span>
+  <p>A <strong>smaller</strong> budget gives smoother ITL but a longer TTFT for long prompts (their prefill is spread over more steps). A <strong>larger</strong> budget gives faster TTFT and higher throughput, but bigger ITL spikes. vLLM's documentation suggests about 2,048 for the best ITL and above 8,192 for the best throughput, especially for small models on large GPUs.</p>
+</div>
+
+<h2 id="knobs">6. The scheduler's knobs</h2>
+<div class="tbl"><table>
+<tr><th>vLLM setting</th><th>What it limits</th><th>Raise it to</th><th>Lower it to</th></tr>
+<tr><td><code>--max-num-seqs</code></td><td>Sequences in one step (also sizes buffers and CUDA graphs)</td><td>Raise throughput when memory allows</td><td>Lower ITL per user; cut memory</td></tr>
+<tr><td><code>--max-num-batched-tokens</code></td><td>Tokens in one step (the chunked-prefill budget)</td><td>Faster TTFT and throughput</td><td>Smoother ITL</td></tr>
+<tr><td><code>--gpu-memory-utilization</code></td><td>Share of GPU memory the engine uses; sets the KV pool (chapter 2.4)</td><td>More concurrent requests</td><td>Leave room for other processes</td></tr>
+<tr><td><code>--max-model-len</code></td><td>Longest sequence allowed</td><td>Serve long contexts</td><td>Fit more requests</td></tr>
+<tr><td><code>--scheduling-policy</code></td><td><code>fcfs</code> (first come, first served) or <code>priority</code> (lower value first, then arrival)</td><td colspan="2">Use <code>priority</code> to protect interactive traffic from batch jobs</td></tr>
+<tr><td><code>--long-prefill-token-threshold</code></td><td>Caps how much budget one long prompt can take per step</td><td colspan="2">Keeps one huge prompt from starving shorter new prompts</td></tr>
+</table></div>
+<p class="note">Names from the current vLLM engine-arguments documentation. SGLang and TensorRT-LLM have equivalents with different names (for example SGLang's <code>--chunked-prefill-size</code> and <code>--max-running-requests</code>).</p>
+
+<h2 id="queue">7. Queues, fairness and bounded waiting</h2>
+<p>Every server has a maximum throughput. If requests arrive faster than that, the queue grows without limit, and waiting time grows with it. This is basic queueing, and it bites production systems: teams have reported requests waiting tens of minutes in an engine's queue under sustained overload.</p>
+<div class="widget" id="lqW">
+  <div class="wt">Interactive: load vs queueing</div>
+  <div class="ws">Requests arrive at random at the chosen rate. The server finishes at most its capacity per second. As load approaches capacity, waiting time rises sharply; above it, the queue grows forever.</div>
+  <div class="ctrls">
+    <label>Load (arrival rate ÷ capacity): <span class="mono" id="lqLv"></span><input type="range" id="lqL" min="0.3" max="1.2" step="0.05" value="0.8"></label>
+    <button id="lqRun">Run 10 minutes</button>
+  </div>
+  <div class="svgwrap"><svg id="lqSvg" viewBox="0 0 680 220" width="680" style="max-width:100%;height:auto" role="img" aria-label="Queue length over time"></svg></div>
+  <div class="stats" id="lqStats"></div>
+</div>
+<p>Engines and the systems around them use four tools:</p>
+<ul>
+  <li><strong>Admission control.</strong> Reject or redirect requests when the queue is too long, rather than accepting work you cannot finish in time (chapter 6.4).</li>
+  <li><strong>Timeouts and cancellation.</strong> When a client disconnects or times out, the engine <em>aborts</em> the request: it leaves the batch and its KV blocks return to the free pool at once. Without this, abandoned requests keep consuming GPU time.</li>
+  <li><strong>Priorities.</strong> With a priority policy, interactive requests go before batch jobs. Low-priority work must still make progress, or it starves.</li>
+  <li><strong>Fair sharing.</strong> With many clients, first come, first served lets one heavy client fill the queue. The Virtual Token Counter (VTC) scheduler tracks tokens served per client (weighting input and output tokens) and always serves the client with the lowest count, which bounds how far any backlogged client can fall behind.</li>
+</ul>
+<p>Across many engine instances, a router places requests (chapter 6.4). Systems such as Llumnix go further and <strong>migrate</strong> running requests, with their KV cache, between instances to rebalance load, free memory, or speed up high-priority requests. Its authors report an order-of-magnitude improvement in tail latency.</p>
+
+<h2 id="tradeoff">8. Throughput, latency and goodput</h2>
+<p>Batching always trades per-user speed for total throughput. The right operating point depends on a service-level objective (SLO), for example "TTFT p95 under 1 s and ITL p95 under 50 ms". <strong>Goodput</strong> is the throughput of requests that meet the SLO. A server that pushes raw throughput by running huge batches may have lower goodput than one that runs smaller batches and keeps latency in bounds. Chapter 6.1 shows how to measure it.</p>
+<p>A useful identity, Little's law, links the three numbers for any stable system:</p>
+<div class="formula">requests in the system = arrival rate × average time in the system</div>
+<p>At 10 requests per second and 6 seconds per request, about 60 requests are in flight on average. That number must fit in <code>max-num-seqs</code> and in KV memory, or they wait in the queue.</p>
+
+<h2 id="expert">9. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Mixed batches and attention kernels</span>
+  <p>A continuous batch holds sequences at different stages and lengths: some prefilling a chunk, others decoding with long histories. Engines flatten all tokens into one array and pass metadata (start offset and context length of each sequence) to attention kernels that handle variable lengths. They often run prefill tokens and decode tokens through different attention kernels within the same step.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Asynchronous scheduling</span>
+  <p>Scheduling and input preparation take CPU time. If the GPU waits for the scheduler at every step, small models lose much of their speed. Engines overlap the scheduling of step n + 1 with the GPU execution of step n. This is one reason engine cores run in a separate process from the API server.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Preemption policies</span>
+  <p>When KV memory runs out mid-generation, the scheduler must evict a running request. It can drop its KV blocks and recompute them later (recompute), or copy them to CPU memory and back (swap). Recompute is usually cheaper on modern GPUs for short sequences. Repeated preemption is a sign that <code>max-num-seqs</code> is too high for the memory (chapter 3.3).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Prefill and decode on different GPUs</span>
+  <p>Chunked prefill shares one GPU between two kinds of work. The other answer is to separate them: run prefill on some GPUs and decode on others, and move the KV cache between them. This disaggregation (chapter 4.6) removes the interference entirely, at the cost of KV transfer and more complex scheduling.</p>
+</div>
+
+<h2 id="mistakes">10. Common mistakes</h2>
+<ul>
+  <li>Benchmarking with every request arriving at once and identical lengths. Real traffic has random arrivals and mixed lengths; scheduler behaviour changes completely.</li>
+  <li>Raising <code>max-num-seqs</code> without checking KV memory, then suffering constant preemption.</li>
+  <li>Setting <code>max-num-batched-tokens</code> for throughput on a chat service and getting ITL spikes.</li>
+  <li>Running near 100% load and wondering why latency explodes. Plan for headroom (often 60% to 80% of measured capacity).</li>
+  <li>Not aborting requests when clients disconnect.</li>
+</ul>
+
+<h2 id="lab">11. Lab</h2>
+<p><strong>Goal:</strong> predict, then simulate, then measure how batching and the token budget change throughput, TTFT and ITL.</p>
+<h3>Part A: a continuous-batching simulator</h3>
+<p>The AI may write the simulator. Your job: set the workload and predict the results before each run. This complete version uses the step-time model of chapter 2.5.</p>
+<pre>import random, statistics as st
+
+def step_time(n_decode, n_prefill_tokens, ctx_tokens):
+    # Llama-3.1-8B-like model on one H100 (chapter 2.5): the larger of memory time and compute time
+    mem = (16.06e9 + ctx_tokens * 131072) / (3.35e12 * 0.7)
+    comp = 2 * 8.03e9 * (n_decode + n_prefill_tokens) / (989e12 * 0.6)
+    return max(mem, comp) + 0.002                      # plus 2 ms fixed overhead per step
+
+def simulate(reqs, mode=&quot;continuous&quot;, max_seqs=32, budget=None):
+    &quot;&quot;&quot;reqs: list of (arrival_s, prompt_len, output_len). Returns throughput and latency stats.&quot;&quot;&quot;
+    queue = sorted(reqs); running, done, t = [], [], 0.0
+    while queue or running:
+        can_admit = (mode == &quot;continuous&quot;) or not running     # static: only when the batch is empty
+        while can_admit and queue and queue[0][0] &lt;= t and len(running) &lt; max_seqs:
+            a, p, o = queue.pop(0)
+            running.append(dict(a=a, p=p, o=o, pre=p, gen=0, first=None, gaps=[], last=None))
+        if not running:                                      # idle: jump to the next arrival
+            t = queue[0][0]; continue
+        decoding = [r for r in running if r[&quot;pre&quot;] == 0 and r[&quot;gen&quot;] &lt; r[&quot;o&quot;]]
+        left = budget - len(decoding) if budget else float(&quot;inf&quot;)
+        prefill_tokens, finishing_prefill = 0, []
+        for r in running:                                    # chunked prefill uses the leftover budget
+            if r[&quot;pre&quot;] &gt; 0 and left &gt; 0:
+                take = min(r[&quot;pre&quot;], left)
+                r[&quot;pre&quot;] -= take; prefill_tokens += take; left -= take
+                if r[&quot;pre&quot;] == 0: finishing_prefill.append(r)
+        ctx = sum(r[&quot;p&quot;] - r[&quot;pre&quot;] + r[&quot;gen&quot;] for r in running)
+        t += step_time(len(decoding), prefill_tokens, ctx)
+        for r in decoding + finishing_prefill:               # each emits one token this step
+            r[&quot;gen&quot;] += 1
+            if r[&quot;first&quot;] is None: r[&quot;first&quot;] = t
+            else: r[&quot;gaps&quot;].append(t - r[&quot;last&quot;])
+            r[&quot;last&quot;] = t
+        for r in running:
+            if r[&quot;gen&quot;] &gt;= r[&quot;o&quot;] and &quot;end&quot; not in r:
+                r[&quot;end&quot;] = t; done.append(r)
+        if mode == &quot;continuous&quot;:
+            running = [r for r in running if &quot;end&quot; not in r]
+        elif all(&quot;end&quot; in r for r in running):               # static: release only when all finish
+            running = []
+    q = lambda xs, f: sorted(xs)[min(len(xs) - 1, int(f * len(xs)))]
+    ttft = [r[&quot;first&quot;] - r[&quot;a&quot;] for r in done]
+    long_ttft = [r[&quot;first&quot;] - r[&quot;a&quot;] for r in done if r[&quot;p&quot;] &gt; 4000] or [0]
+    gaps = [g for r in done for g in r[&quot;gaps&quot;]]
+    return dict(tok_per_s=round(sum(r[&quot;o&quot;] for r in done) / t), ttft_p50=round(q(ttft, .5), 3),
+                ttft_p99=round(q(ttft, .99), 3), long_prompt_ttft_p50=round(q(long_ttft, .5), 3), itl_p99_ms=round(1000 * q(gaps, .99), 1) if gaps else None, itl_max_ms=round(1000 * max(gaps), 1) if gaps else None)
+
+random.seed(0)
+t = 0.0; reqs = []
+for i in range(400):                          # Poisson arrivals at 8 requests per second
+    t += random.expovariate(8.0)
+    reqs.append((t, random.randint(100, 1500), random.choice([20, 50, 200, 800])))
+for mode in [&quot;static&quot;, &quot;continuous&quot;]:
+    print(mode, simulate(reqs, mode))</pre>
+<p>Predict first: by roughly what factor will continuous batching beat static batching in output tokens per second for this workload? Which latency number will change the most?</p>
+<details><summary>What you should see</summary><p>About 850 vs 1,850 tokens per second (about 2.2 times). The biggest change is TTFT: static batching makes new requests wait for whole batches to finish, so the queue builds and median TTFT reaches tens of seconds, while continuous batching keeps it around tens of milliseconds. Then change the arrival rate (the 8.0) and the output-length choices: the gap shrinks when outputs are all the same length, and grows when they vary widely.</p></details>
+<h3>Part B: add chunked prefill</h3>
+<pre>long_mix = [(i * 0.5, random.choice([200, 200, 200, 16000]), 200) for i in range(300)]   # 2 requests/s, 1 in 4 is a 16K prompt
+for budget in [None, 8192, 2048, 512]:
+    print(&quot;budget&quot;, budget, simulate(long_mix, &quot;continuous&quot;, max_seqs=64, budget=budget))</pre>
+<p>Predict first, for no budget and budgets of 8,192, 2,048 and 512: which gives the fastest TTFT for the long prompts, and which the smallest worst-case ITL (<code>itl_max_ms</code>)?</p>
+<details><summary>What you should see</summary><p>Worst-case ITL falls from about 435 ms with no chunking to about 224, 57 and 16 ms as the budget shrinks: streaming users stop seeing long pauses. The long prompts' median TTFT rises slightly, from about 0.44 s to about 0.51 s, because their prefill is spread over more steps. That is the trade-off of section 5. Try a load high enough to build a queue (for example one request every 0.1 s) and see how overload changes every number.</p></details>
+<h3>Part C: tune a real engine</h3>
+<p>On a T4 with vLLM serving Qwen2.5-0.5B (chapter 3.1, Part D), use the built-in benchmark client. Run each line against a fresh server started with the settings in the comment:</p>
+<pre># server A: vllm serve Qwen/Qwen2.5-0.5B-Instruct --dtype half --max-model-len 4096 --max-num-seqs 64  --max-num-batched-tokens 8192
+# server B: same, with --max-num-batched-tokens 1024
+# server C: same, with --max-num-seqs 8
+vllm bench serve --model Qwen/Qwen2.5-0.5B-Instruct --dataset-name random \
+    --random-input-len 2048 --random-output-len 128 --num-prompts 200 --request-rate 8</pre>
+<p>The report includes request throughput, output tokens per second, and TTFT, TPOT and ITL percentiles. Fill a table with A, B and C, and explain each difference using the knob table in section 6. Then try <code>--request-rate inf</code> (all at once) and see how it hides the queueing behaviour of section 7.</p>
+<h3>Part D: cancellation frees memory</h3>
+<p>Start 32 long requests with <code>max_tokens</code> 2,000, watch <code>vllm:kv_cache_usage_perc</code> in <code>/metrics</code> (chapter 3.1, Part E), then kill the client process. How fast does KV usage drop, and what does <code>vllm:num_requests_running</code> do?</p>
+
+<h2 id="realworld">12. In the real world</h2>
+<div class="box real">
+  <span class="lbl">How production systems schedule</span>
+  <ul>
+    <li><strong>All major engines</strong> (vLLM, SGLang, TensorRT-LLM) use continuous batching with chunked prefill by default or as a standard option.</li>
+    <li><strong>Chat products</strong> tune for ITL and TTFT SLOs with modest token budgets; <strong>offline batch jobs</strong> (evaluation, data generation) use large budgets and high concurrency for throughput.</li>
+    <li><strong>Multi-tenant platforms</strong> add priority classes, per-tenant rate limits and fair queueing in front of or inside the engine.</li>
+    <li><strong>Capacity planning</strong> uses measured goodput at the SLO, not peak throughput.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">13. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz32"></div>
+<script type="application/json" id="qz32">[
+{"q":"In static batching, when can a new request start?","o":["At the next step","When the whole current batch has finished","Immediately","Only at server restart"],"a":1,"e":"The batch is fixed until its longest request ends."},
+{"q":"Continuous batching schedules at the level of:","o":["Requests","Forward-pass steps (iterations)","Tokens in the vocabulary","GPUs"],"a":1,"e":"Every step, the batch is re-formed."},
+{"q":"Why do long prefills hurt streaming users without chunking?","o":["They use more KV heads","The step that runs them takes much longer, so every decode in that step waits","They change the sampler","They lower the batch size"],"a":1,"e":"A step's time is set by its total work."},
+{"q":"With chunked prefill, the scheduler first gives the step budget to:","o":["The longest prompt","One token for every running decode","The newest request","Random requests"],"a":1,"e":"Decodes go first; leftover budget goes to prefill chunks."},
+{"q":"Raising max-num-batched-tokens usually:","o":["Improves ITL","Improves TTFT and throughput but can worsen ITL spikes","Has no effect","Reduces memory use"],"a":1,"e":"Bigger steps finish prefills sooner but stall decodes longer."},
+{"q":"Arrival rate is 110% of capacity for an hour. Queue time:","o":["Stays constant","Grows steadily for the whole hour","Falls","Is zero thanks to batching"],"a":1,"e":"Above capacity, the backlog grows without bound."},
+{"q":"A client disconnects mid-generation. A good engine:","o":["Keeps generating","Aborts the request and returns its KV blocks to the free pool","Restarts","Moves it to the CPU"],"a":1,"e":"Abort frees the batch slot and memory at once."},
+{"q":"10 requests/s arrive and each takes 4 s end to end. How many are in flight on average?","o":["4","10","40","2.5"],"a":2,"e":"Little's law: 10 × 4 = 40."}
+]</script>
+
+<h2 id="summary">14. Summary</h2>
+<ul>
+  <li>Batching is cheap for memory-bound decode, so the scheduler's job is to keep batches full without long waits.</li>
+  <li>Static and dynamic batching fix a batch for its life; continuous batching re-forms it every step.</li>
+  <li>Mixing long prefills with decodes causes ITL spikes; chunked prefill caps each step with a token budget, decodes first.</li>
+  <li>Small budget: smooth ITL, slower long-prompt TTFT. Large budget: fast TTFT and throughput, bigger spikes.</li>
+  <li>Key vLLM knobs: max-num-seqs, max-num-batched-tokens, gpu-memory-utilization, max-model-len, scheduling-policy.</li>
+  <li>Above capacity, queues grow without limit: use admission control, timeouts, aborts, priorities and fair scheduling.</li>
+</ul>
+
+<h2 id="refs">15. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://www.anyscale.com/blog/continuous-batching-llm-inference">Anyscale: How continuous batching enables 23x throughput</a></td><td>Static vs continuous batching with diagrams and benchmark results.</td></tr>
+<tr><td><a href="https://www.usenix.org/conference/osdi22/presentation/yu">Yu et al., Orca (OSDI 2022)</a></td><td>The original iteration-level scheduling design.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2403.02310">Agrawal et al., Sarathi-Serve</a></td><td>Chunked prefills and stall-free scheduling for the throughput-latency trade-off.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/configuration/optimization.html">vLLM: Optimization and tuning</a></td><td>Chunked prefill in the current engine, decode priority and recommended budget values.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/configuration/engine_args.html">vLLM: Engine arguments</a></td><td>Exact meaning of every knob in section 6.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2401.00588">Sheng et al., Fairness in Serving Large Language Models</a></td><td>Token-weighted fairness and the Virtual Token Counter scheduler.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2406.03243">Sun et al., Llumnix</a></td><td>Live migration of requests and KV state between instances for load balance and priorities.</td></tr>
+<tr><td><a href="https://blog.dotieuthien.com/posts/vllm">dotieuthien: vLLM, why requests take hours under load</a></td><td>Kept from triage: a production case of queue starvation under sustained overload, with a reproduction.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 4.3.1</td><td>vLLM's scheduling features in the context of choosing an engine.</td></tr>
+<tr><td>Chi Wang and Peiheng Hu, <em>Hands-On LLM Serving and Optimization</em>, chapter 6</td><td>Continuous batching with worked examples among the essential optimizations.</td></tr>
+</table></div>
+<p class="note">Facts checked on 6 November 2026.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+let CB='cont',L=[];
+function newReq(){const sp=+$('cbSp').value;L=[...Array(24)].map(()=>Math.round(20*Math.exp(Math.random()*Math.log(1+sp*4))+10*Math.random()));}
+function cb(){const S=8;const lens=L.slice();let bars=[],t=0;
+  if(CB==='static'){let i=0;while(i<lens.length){const b=lens.slice(i,i+S);const m=Math.max(...b);b.forEach((v,k)=>{bars.push([k,t,v,1]);if(v<m)bars.push([k,t+v,m-v,0]);});t+=m;i+=S;}}
+  else{const free=new Array(S).fill(0);lens.forEach(v=>{let k=free.indexOf(Math.min(...free));bars.push([k,free[k],v,1]);free[k]+=v;});t=Math.max(...free);for(let k=0;k<S;k++)if(free[k]<t)bars.push([k,free[k],t-free[k],0]);}
+  const s=$('cbSvg');s.innerHTML='';const W=680,H=250,l=60,r=10,top=10,bt=30,rh=(H-top-bt)/S;const X=v=>l+v/t*(W-l-r);
+  bars.forEach(([k,a,d,u],i)=>el('rect',{x:X(a)+0.5,y:top+k*rh+2,width:Math.max(0,X(a+d)-X(a)-1),height:rh-4,rx:3,fill:u?(i%2?css('--kv'):css('--pre')):css('--panel2'),stroke:u?'none':css('--line')},s));
+  for(let k=0;k<S;k++)el('text',{x:l-6,y:top+k*rh+rh/2+4,'text-anchor':'end',class:'tick'},s,'slot '+(k+1));
+  el('text',{x:W-r,y:H-8,'text-anchor':'end',class:'tick'},s,`${t} steps`);
+  const work=lens.reduce((a,b)=>a+b,0);
+  $('cbStats').innerHTML=[['Total steps',t],['Slot utilization',(work/(t*S)*100).toFixed(0)+'%'],['Throughput (tokens per step)',(work/t).toFixed(1)]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+document.querySelectorAll('#cbW [data-mode]').forEach(b=>b.onclick=()=>{CB=b.dataset.mode;document.querySelectorAll('#cbW [data-mode]').forEach(x=>x.classList.toggle('on',x===b));cb();});
+$('cbSp').onchange=()=>{newReq();cb();};$('cbNew').onclick=()=>{newReq();cb();};newReq();IE.onTheme(cb);
+function stepMs(nd,np){return Math.max(16.06e9/(3.35e12*0.7),2*8.03e9*(nd+np)/(989e12*0.6))*1e3+2;}
+function ch(){const D=+$('chD').value,P=+$('chP').value,B=+$('chB').value;let left=P,steps=[];
+  for(let i=0;i<3;i++)steps.push([D,0]);
+  while(left>0){const take=B?Math.min(left,Math.max(0,B-D)):left;steps.push([D,take]);left-=take;if(B&&B<=D)break;}
+  for(let i=0;i<3;i++)steps.push([D+1,0]);
+  const times=steps.map(([d,p])=>stepMs(d,p));const s=$('chSvg');s.innerHTML='';const W=680,H=270,l=60,r=60,t=16,bt=34;
+  const n=steps.length,bw=(W-l-r)/n,tmax=Math.max(...steps.map(z=>z[0]+z[1])),ymax=Math.max(...times)*1.1;
+  const Y=v=>H-bt-v/tmax*(H-t-bt),Y2=v=>H-bt-v/ymax*(H-t-bt);
+  steps.forEach(([d,p],i)=>{const x=l+i*bw+1;el('rect',{x,y:Y(d),width:bw-2,height:H-bt-Y(d),fill:css('--dec')},s);if(p)el('rect',{x,y:Y(d+p),width:bw-2,height:Y(d)-Y(d+p),fill:css('--pre')},s);});
+  el('path',{d:times.map((v,i)=>(i?'L':'M')+(l+i*bw+bw/2)+' '+Y2(v)).join(' '),fill:'none',stroke:css('--bad'),'stroke-width':2.5},s);
+  for(let i=0;i<=4;i++){el('text',{x:l-6,y:Y(tmax*i/4)+4,'text-anchor':'end',class:'tick'},s,IE.int(tmax*i/4));el('text',{x:W-r+6,y:Y2(ymax*i/4)+4,class:'tick',fill:css('--bad')},s,(ymax*i/4).toFixed(0)+' ms');}
+  el('text',{x:l+(W-l-r)/2,y:H-8,'text-anchor':'middle',class:'tick'},s,'engine steps → (tokens per step, left axis; step time, right axis)');
+  const pre=steps.slice(3,n-3);const ttft=pre.reduce((a,_,i)=>a+times[3+i],0);const worst=Math.max(...times);
+  $('chStats').innerHTML=[['Steps to finish the prefill',pre.length],['New prompt TTFT (prefill steps only)',ttft.toFixed(0)+' ms'],['Worst ITL for streaming users',worst.toFixed(1)+' ms'],['Normal ITL',times[0].toFixed(1)+' ms']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['chD','chP','chB'].forEach(id=>$(id).addEventListener('input',ch));IE.onTheme(ch);
+let LQ=null;
+function lq(){const rho=+$('lqL').value;$('lqLv').textContent=rho.toFixed(2);if(!LQ)return lqDraw([]);
+}
+function lqRun(){const rho=+$('lqL').value,cap=10;const lam=rho*cap;let t=0,q=0,series=[],waits=[],queue=[];let nextA=-Math.log(Math.random())/lam,nextS=Infinity;
+  const T=600;while(t<T){if(nextA<nextS){t=nextA;queue.push(t);if(queue.length===1)nextS=t+1/cap;nextA=t-Math.log(Math.random())/lam;}else{t=nextS;const a=queue.shift();waits.push(t-a);nextS=queue.length?t+1/cap:Infinity;}series.push([t,queue.length]);}
+  LQ={series,waits};lqDraw(series);}
+function lqDraw(series){const s=$('lqSvg');s.innerHTML='';const W=680,H=220,l=50,r=10,t=14,bt=30;const ymax=Math.max(10,...series.map(z=>z[1]))*1.1;
+  const X=v=>l+v/600*(W-l-r),Y=v=>H-bt-v/ymax*(H-t-bt);
+  for(let i=0;i<=4;i++){el('line',{x1:l,x2:W-r,y1:Y(ymax*i/4),y2:Y(ymax*i/4),class:'axis'},s);el('text',{x:l-6,y:Y(ymax*i/4)+4,'text-anchor':'end',class:'tick'},s,Math.round(ymax*i/4));}
+  [0,2,4,6,8,10].forEach(m=>el('text',{x:X(m*60),y:H-10,'text-anchor':'middle',class:'tick'},s,m+' min'));
+  if(series.length){const step=Math.max(1,Math.floor(series.length/600));let d='';for(let i=0;i<series.length;i+=step)d+=(i?'L':'M')+X(series[i][0]).toFixed(1)+' '+Y(series[i][1]).toFixed(1);el('path',{d,fill:'none',stroke:css('--dec'),'stroke-width':1.5},s);
+    const w=LQ.waits.slice().sort((a,b)=>a-b);const p=f=>w.length?w[Math.min(w.length-1,Math.floor(f*w.length))]:0;
+    $('lqStats').innerHTML=[['Requests served',w.length],['Median wait',p(0.5).toFixed(2)+' s'],['p99 wait',p(0.99).toFixed(1)+' s'],['Queue at the end',series[series.length-1][1]]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+  else $('lqStats').innerHTML='<div class="stat"><div class="k">Press Run</div><div class="v">…</div></div>';
+  el('text',{x:l+4,y:t+10,class:'tick'},s,'requests waiting (capacity: 10 requests/s)');}
+$('lqL').addEventListener('input',()=>{$('lqLv').textContent=(+$('lqL').value).toFixed(2);});$('lqRun').onclick=lqRun;$('lqLv').textContent='0.80';IE.onTheme(()=>lqDraw(LQ?LQ.series:[]));
+})();
+</script>
+
+</body>
+</html>

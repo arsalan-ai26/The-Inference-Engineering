@@ -102,7 +102,7 @@ window.IE_CHAPTERS = [
 "title": "Batching and scheduling",
 "slug": "3-2-batching-scheduling",
 "part": 3,
-"ready": false
+"ready": true
 },
 {
 "n": "3.3",
