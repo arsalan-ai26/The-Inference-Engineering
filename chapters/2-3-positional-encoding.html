@@ -81,6 +81,7 @@
 <tr><td>Qwen3-8B</td><td class="n">1,000,000</td><td class="n">40,960</td><td>none (YaRN optional)</td></tr>
 <tr><td>DeepSeek-V3</td><td class="n">10,000</td><td class="n">4,096 → 163,840</td><td>YaRN, factor 40</td></tr>
 </table></div>
+<p class="note">The scale factor does not have to equal the length ratio. Llama 3.1 combines factor-8 frequency scaling of its 8,192 base with continued training on long documents to reach 131,072 tokens.</p>
 
 <h3>Where RoPE sits in the code</h3>
 <pre>q = q_proj(h).view(B, T, H, d).transpose(1, 2)      # [B, H, T, d]

@@ -67,7 +67,7 @@ window.IE_CHAPTERS = [
 "title": "Autoregressive generation and the KV cache",
 "slug": "2-4-kv-cache",
 "part": 2,
-"ready": false
+"ready": true
 },
 {
 "n": "2.5",

@@ -3,153 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>2.4 The KV Cache</title>
-</head>
-<body>
-<meta name="claude:viewport-fit-sides" content="cover">
-<link rel="preconnect" href="https://fonts.googleapis.com">
+<title>2.4 Autoregressive generation and the KV cache</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
-<style>
-:root{
-  --bg:#f3f5f8; --panel:#ffffff; --panel2:#e9edf3; --ink:#14213d; --ink2:#46546e; --line:#cfd6e2;
-  --pre:#4f46e5; --pre-s:#e3e1fc; --dec:#c26a06; --dec-s:#fbe9cf; --kv:#0d8a7e; --kv-s:#d2f1ec;
-  --bad:#b4262e; --bad-s:#f8dcdd; --good:#1f7a3a; --good-s:#d9f0df; --mute:#8a95a8;
-  --code-bg:#0f1a2e; --code-fg:#e6ecf5;
-  --f-disp:"Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
-  --f-body:"Source Serif 4", Georgia, "Times New Roman", serif;
-  --f-mono:"JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
-}
-@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
-  --bg:#0d1424; --panel:#141d31; --panel2:#1b2640; --ink:#e4e9f2; --ink2:#a9b4c8; --line:#2c3a57;
-  --pre:#8f8afc; --pre-s:#262560; --dec:#f0a23b; --dec-s:#47300f; --kv:#3cc7b6; --kv-s:#0f3b38;
-  --bad:#f07a80; --bad-s:#4a1b20; --good:#6ad08a; --good-s:#173a24; --mute:#6f7b92;
-  --code-bg:#070c18; --code-fg:#e6ecf5; color-scheme:dark }}
-:root[data-theme="dark"]{
-  --bg:#0d1424; --panel:#141d31; --panel2:#1b2640; --ink:#e4e9f2; --ink2:#a9b4c8; --line:#2c3a57;
-  --pre:#8f8afc; --pre-s:#262560; --dec:#f0a23b; --dec-s:#47300f; --kv:#3cc7b6; --kv-s:#0f3b38;
-  --bad:#f07a80; --bad-s:#4a1b20; --good:#6ad08a; --good-s:#173a24; --mute:#6f7b92;
-  --code-bg:#070c18; --code-fg:#e6ecf5; color-scheme:dark }
-*{box-sizing:border-box}
-body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:18px;line-height:1.62;
-  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
-.shell{display:grid;grid-template-columns:250px minmax(0,1fr);gap:48px;max-width:1180px;margin:0 auto;padding-block:32px 96px}
-nav.toc{position:sticky;top:calc(env(safe-area-inset-top,0px) + 20px);align-self:start;max-height:calc(100vh - 40px);overflow:auto;font-family:var(--f-disp);font-size:14px}
-nav.toc .book{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink2)}
-nav.toc ol{list-style:none;padding:0;margin:12px 0 0;display:flex;flex-direction:column;gap:2px}
-nav.toc a{display:block;padding:5px 10px;border-radius:6px;color:var(--ink2);text-decoration:none;border-left:3px solid transparent}
-nav.toc a:hover{background:var(--panel2);color:var(--ink)}
-nav.toc a.on{border-left-color:var(--kv);color:var(--ink);background:var(--panel)}
-main{min-width:0}
-article{max-width:70ch}
-.wide{max-width:none}
-h1,h2,h3,h4{font-family:var(--f-disp);line-height:1.2;text-wrap:balance;margin:0}
-h1{font-size:clamp(34px,5vw,50px);font-weight:700;letter-spacing:-.01em}
-h2{font-size:28px;font-weight:700;margin-top:64px;padding-top:12px;border-top:1px solid var(--line)}
-h3{font-size:21px;font-weight:700;margin-top:36px}
-h4{font-size:17px;font-weight:700;margin-top:20px}
-p,ul,ol{margin:14px 0}
-li{margin:4px 0}
-a{color:var(--pre)}
-code,.mono{font-family:var(--f-mono);font-size:.86em}
-:not(pre)>code{background:var(--panel2);padding:1px 5px;border-radius:4px}
-.kicker{font-family:var(--f-disp);font-size:13px;letter-spacing:.1em;text-transform:uppercase;color:var(--kv);font-weight:700}
-.lede{font-size:21px;color:var(--ink2);margin-top:16px}
-.meta{display:flex;flex-wrap:wrap;gap:10px;margin-top:22px;font-family:var(--f-disp);font-size:14px}
-.chip{background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:4px 12px}
-.t-pre{color:var(--pre);font-weight:600}.t-dec{color:var(--dec);font-weight:600}.t-kv{color:var(--kv);font-weight:600}
-.box{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:16px 20px;margin:22px 0}
-.box>h4:first-child,.box>p:first-child{margin-top:0}
-.box .lbl{font-family:var(--f-disp);font-size:12px;letter-spacing:.09em;text-transform:uppercase;font-weight:700;display:block;margin-bottom:6px}
-.box.def{border-left:4px solid var(--pre)} .box.def .lbl{color:var(--pre)}
-.box.fix{border-left:4px solid var(--bad);background:var(--bad-s)} .box.fix .lbl{color:var(--bad)}
-.box.expert{border-left:4px solid var(--dec)} .box.expert .lbl{color:var(--dec)}
-.box.real{border-left:4px solid var(--kv)} .box.real .lbl{color:var(--kv)}
-.box.skip{border-left:4px solid var(--good);background:var(--good-s)} .box.skip .lbl{color:var(--good)}
-.formula{font-family:var(--f-mono);font-size:17px;background:var(--panel2);border-radius:8px;padding:14px 18px;overflow-x:auto;white-space:nowrap}
-.formula b{color:var(--kv)}
-pre{background:var(--code-bg);color:var(--code-fg);font-family:var(--f-mono);font-size:13.5px;line-height:1.55;padding:16px 18px;border-radius:10px;overflow-x:auto;margin:16px 0}
-pre .c{color:#8fa3c2} pre .k{color:#f5b971} pre .s{color:#9fe0b0}
-details{border:1px solid var(--line);border-radius:10px;background:var(--panel);padding:10px 16px;margin:14px 0}
-details summary{cursor:pointer;font-family:var(--f-disp);font-weight:700}
-table{border-collapse:collapse;width:100%;font-size:15px}
-.tbl{overflow-x:auto;margin:18px 0;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
-th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:top}
-th{font-family:var(--f-disp);font-size:13px;letter-spacing:.04em;color:var(--ink2);background:var(--panel2)}
-td.n,th.n{text-align:right;font-family:var(--f-mono);font-size:13.5px;white-space:nowrap}
-tr:last-child td{border-bottom:0}
-/* widgets */
-.widget{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;margin:28px 0;min-width:0}
-.widget .wt{font-family:var(--f-disp);font-weight:700;font-size:18px}
-.widget .ws{color:var(--ink2);font-size:15px;margin:4px 0 14px}
-.ctrls{display:flex;flex-wrap:wrap;gap:12px 18px;align-items:end;font-family:var(--f-disp);font-size:14px}
-.ctrls label{display:flex;flex-direction:column;gap:4px;color:var(--ink2);min-width:0}
-select,input[type=number]{font:inherit;font-family:var(--f-mono);font-size:14px;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;max-width:100%}
-input[type=range]{width:200px;max-width:100%;accent-color:var(--kv)}
-button{font-family:var(--f-disp);font-size:14px;font-weight:700;border:1px solid var(--line);background:var(--panel2);color:var(--ink);border-radius:8px;padding:7px 14px;cursor:pointer}
-button:hover{border-color:var(--ink2)}
-button.pri{background:var(--kv);border-color:var(--kv);color:#fff}
-.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
-.seg button{border:0;border-radius:0;background:transparent}
-.seg button.on{background:var(--ink);color:var(--bg)}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:16px}
-.stat{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-width:0}
-.stat .k{font-family:var(--f-disp);font-size:12px;color:var(--ink2);letter-spacing:.03em}
-.stat .v{font-family:var(--f-mono);font-size:19px;font-weight:600;margin-top:2px;overflow-wrap:anywhere}
-.stat .v small{font-size:12px;color:var(--ink2);font-weight:400}
-.stat.ok{border-color:var(--good)} .stat.no{border-color:var(--bad)}
-.svgwrap{overflow-x:auto;margin-top:12px}
-svg text{font-family:var(--f-mono)}
-.legend{display:flex;flex-wrap:wrap;gap:14px;font-family:var(--f-disp);font-size:13px;color:var(--ink2);margin-top:10px}
-.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;vertical-align:-1px}
-.note{font-size:14px;color:var(--ink2)}
-.quiz .q{border-top:1px solid var(--line);padding-top:14px;margin-top:14px}
-.quiz .q:first-of-type{border-top:0;margin-top:0;padding-top:0}
-.quiz .opts{display:flex;flex-direction:column;gap:6px;margin-top:8px}
-.quiz .opts button{text-align:left;font-family:var(--f-body);font-weight:400;font-size:16px;background:var(--bg)}
-.quiz .opts button.right{background:var(--good-s);border-color:var(--good)}
-.quiz .opts button.wrong{background:var(--bad-s);border-color:var(--bad)}
-.quiz .fb{font-size:15px;margin-top:8px;color:var(--ink2)}
-.navfoot{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:64px;font-family:var(--f-disp)}
-.navfoot a{padding:12px 16px;border:1px solid var(--line);border-radius:10px;background:var(--panel);text-decoration:none;color:var(--ink)}
-.themebtn{position:fixed;right:max(16px,env(safe-area-inset-right,0px));bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:5}
-.tick{fill:var(--ink2);font-size:11px}
-.axis{stroke:var(--line)}
-@media (max-width:900px){
-  .shell{grid-template-columns:minmax(0,1fr);gap:0}
-  nav.toc{position:static;max-height:none;border:1px solid var(--line);border-radius:10px;padding:12px;background:var(--panel);margin-bottom:24px}
-  nav.toc ol{flex-direction:row;flex-wrap:wrap}
-  body{font-size:17px}
-}
-</style>
-
-<button class="themebtn" id="themeBtn" aria-label="Toggle colour theme">Theme</button>
-
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="2.4">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 2 · Chapter 2.4</span></div>
 <div class="shell">
-<nav class="toc" aria-label="Chapter contents">
-  <div class="book"><a href="../index.html" style="color:inherit">Inference Engineering</a> · Part 2</div>
-  <ol id="tocList">
-    <li><a href="#problem">1. The problem</a></li>
-    <li><a href="#stepper">2. Prefill and decode, step by step</a></li>
-    <li><a href="#stored">3. What the cache stores</a></li>
-    <li><a href="#lossless">4. Why the cache is exact</a></li>
-    <li><a href="#formula">5. The memory formula</a></li>
-    <li><a href="#calc">6. Memory calculator</a></li>
-    <li><a href="#waste">7. Logical vs allocated memory</a></li>
-    <li><a href="#cost">8. What decode costs</a></li>
-    <li><a href="#latency">9. TTFT, TPOT and E2E</a></li>
-    <li><a href="#worked">10. Worked examples</a></li>
-    <li><a href="#corrections">11. Source corrections</a></li>
-    <li><a href="#expert">12. Expert layer</a></li>
-    <li><a href="#mistakes">13. Common mistakes</a></li>
-    <li><a href="#lab">14. Lab</a></li>
-    <li><a href="#realworld">15. In the real world</a></li>
-    <li><a href="#quiz">16. Check yourself</a></li>
-    <li><a href="#refs">17. References</a></li>
-  </ol>
-</nav>
-
-<main>
-<article>
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
 <div class="kicker">Part 2 · Transformers and LLM inference mechanics · Chapter 2.4</div>
 <h1>Autoregressive generation and the KV cache</h1>
 <p class="lede">A model writes one token at a time. Each new token needs information about every earlier token. The KV cache keeps that information in GPU memory so the model does not compute it again. This one idea sets the memory limit, the context limit and the concurrency limit of almost every LLM server.</p>
@@ -195,7 +58,6 @@ svg text{font-family:var(--f-mono)}
   <li><strong class="t-dec">Decode:</strong> the model processes one new token per step. It computes K and V for that one token, appends them to the cache, and attends over the full cache. Very little math happens per byte that the GPU reads.</li>
 </ul>
 <p>Decode is one token at a time because token t+1 depends on token t. You cannot compute token 10 before you know token 9. There is no way to run decode steps of one sequence in parallel in plain generation. (Chapter 4.3 covers speculative decoding, which guesses several tokens and checks them in one pass.)</p>
-</article>
 
 <div class="widget wide" id="stepperW">
   <div class="wt">Interactive: watch the cache fill</div>
@@ -225,14 +87,12 @@ svg text{font-family:var(--f-mono)}
   <p class="note" id="stMsg">Press "Next step" to run prefill.</p>
 </div>
 
-<article>
 <p>The counts in the stepper are per layer. A real model repeats them in every layer, so Llama 3.1 8B does the work 32 times per pass. At 4,000 output tokens, the no-cache loop computes K and V for about 8 million positions per layer. The cached loop computes 4,000.</p>
 
 <h2 id="stored">3. What the cache stores</h2>
 <p>The cache holds one key tensor and one value tensor per layer. For one sequence, each has the shape:</p>
 <div class="formula">[ KV heads , tokens so far , head size ]</div>
 <p>With a batch, there is one more dimension in front for the sequence. The exact layout in memory differs by engine. The amount of data does not.</p>
-</article>
 
 <div class="widget wide">
   <div class="wt">Diagram: one layer's cache with grouped-query attention</div>
@@ -248,7 +108,6 @@ svg text{font-family:var(--f-mono)}
   </svg></div>
 </div>
 
-<article>
 <p>Three attention types decide how many KV heads there are:</p>
 <div class="tbl"><table>
 <tr><th>Type</th><th>KV heads</th><th>Effect on cache</th><th>Example</th></tr>
@@ -285,7 +144,6 @@ svg text{font-family:var(--f-mono)}
 <tr><td>DeepSeek-V3 (MLA, see expert layer)</td><td class="n">61</td><td class="n">n/a</td><td class="n">512 + 64</td><td class="n">70,272</td></tr>
 </table></div>
 <p class="note">Look at Qwen3-30B-A3B. It has almost 4 times the parameters of Llama 3.1 8B but a smaller cache per token. Cache size depends on layers and KV heads, not on total parameters. Mixture-of-experts (2.6) adds parameters in the MLP blocks, which store nothing in the cache.</p>
-</article>
 
 <h2 id="calc" style="max-width:70ch">6. Memory calculator</h2>
 <div class="widget wide" id="calcW">
@@ -317,7 +175,6 @@ svg text{font-family:var(--f-mono)}
   <p class="note" id="cNote"></p>
 </div>
 
-<article>
 <p>How to read the calculator:</p>
 <ul>
   <li><strong>Memory fraction</strong> is the share of GPU memory the engine may use. In vLLM this is <code>--gpu-memory-utilization</code>. The current vLLM docs (v0.33) say the default is 1.0 when the extensible KV cache is on and 0.92 otherwise. In TensorRT-LLM the similar setting is <code>free_gpu_memory_fraction</code>, which is a share of the memory left after weights load.</li>
@@ -347,7 +204,6 @@ svg text{font-family:var(--f-mono)}
 <div class="formula">step time ≥ ( weight bytes + Σ KV bytes of the batch ) ÷ memory bandwidth</div>
 <p>Chapter 2.5 turns this into the roofline model and defines MBU, the share of the bandwidth limit you actually reach. Here, use it as a lower bound. Real engines reach roughly 50% to 80% of it.</p>
 <p>Two results follow. First, batching is cheap at first: going from 1 to 4 sequences adds KV reads but no extra weight reads. Second, long contexts are expensive: the KV term grows with context, and at long context it becomes larger than the weights.</p>
-</article>
 
 <div class="widget wide" id="costW">
   <div class="wt">Interactive: decode step time vs context</div>
@@ -360,7 +216,6 @@ svg text{font-family:var(--f-mono)}
   <div class="stats" id="dStats"></div>
 </div>
 
-<article>
 <h2 id="latency">9. TTFT, TPOT and E2E</h2>
 <p>The two phases map to the two latency numbers users feel.</p>
 <div class="box def">
@@ -399,23 +254,23 @@ svg text{font-family:var(--f-mono)}
 </ul>
 <p>Example C is the central trade of LLM serving. A bigger batch raises total throughput and lowers the speed each user sees. The KV cache is what makes the step cost grow with batch and context.</p>
 
-<h2 id="corrections">11. Source corrections</h2>
-<p>Several popular sources contain errors or simplifications that will mislead you. Each was checked against model configs and first principles.</p>
+<h2 id="corrections">11. Errors you will meet in popular material</h2>
+<p>Several widely read explanations contain errors or simplifications that will mislead you. Each one below was checked against model configs and first principles. The References section says where each appears.</p>
 <div class="box fix">
-  <span class="lbl">Correction · 100 Days of Inference, day 05</span>
-  <p>The notebook estimates the KV cache of a 70B model at 32K context as about 160 GB. Two problems. The MHA formula with 64 heads gives 2 × 80 × 64 × 128 × 2 × 32,768 = 85.9 GB, not 160. And Llama 70B uses GQA with 8 KV heads, so the real number is 10.7 GB. Always read the KV head count from <code>num_key_value_heads</code> in the model config.</p>
+  <span class="lbl">Watch out: a widely shared 70B estimate</span>
+  <p>A popular tutorial notebook estimates the KV cache of a 70B model at 32K context as about 160 GB. Two problems. The MHA formula with 64 heads gives 2 × 80 × 64 × 128 × 2 × 32,768 = 85.9 GB, not 160. And Llama 70B uses GQA with 8 KV heads, so the real number is 10.7 GB. Always read the KV head count from <code>num_key_value_heads</code> in the model config.</p>
 </div>
 <div class="box fix">
-  <span class="lbl">Correction · kipply, Transformer Inference Arithmetic</span>
-  <p>The post's KV formula (2 × 2 × layers × model dimension per token) assumes MHA, where KV heads × head size equals the model dimension. For any GQA model, replace the model dimension with KV heads × head size. The post also has a typo in one bandwidth-time example ("52e12"); compute it yourself rather than copying it. The post is still one of the best references on the topic.</p>
+  <span class="lbl">Watch out: the MHA-only formula</span>
+  <p>A well-known KV formula (2 × 2 × layers × model dimension per token) assumes MHA, where KV heads × head size equals the model dimension. For any GQA model, replace the model dimension with KV heads × head size. Always compute bandwidth examples yourself rather than copying them; typos in exponents are common.</p>
 </div>
 <div class="box fix">
-  <span class="lbl">Correction · Arpit Bhayani, How LLM inference works</span>
-  <p>The post says the cache of a 13B model can become "comparable to model size". That is true only for large batch × context products. For Llama 2 13B (MHA, 40 layers, 5,120 model dimension), one 4K-token sequence uses 3.4 GB against 26 GB of weights. You need about 8 such sequences before the cache equals the weights.</p>
+  <span class="lbl">Watch out: "the cache is as big as the model"</span>
+  <p>You may read that the cache of a 13B model can become "comparable to model size". That is true only for large batch × context products. For Llama 2 13B (MHA, 40 layers, 5,120 model dimension), one 4K-token sequence uses 3.4 GB against 26 GB of weights. You need about 8 such sequences before the cache equals the weights.</p>
 </div>
 <div class="box fix">
-  <span class="lbl">Correction · Inference Engineering (Kiely), section 2.4 and table 5-10</span>
-  <p>The book's attention example gives about 62 FLOPs per byte. That figure is for computing full attention over a sequence in one pass, without a fused kernel. It does not describe decode. In decode, each query head does about 4 × head size FLOPs per cached token (one dot product with K, one weighted sum of V), and reads 4 × head size bytes of BF16 K and V per KV head. So the intensity is about 1 FLOP per byte for MHA, and about the group size for GQA because several query heads share one read. Separately, AI Atlas notes that table 5-10 lists 0.5 for decode attention where about 1.0 is correct.</p>
+  <span class="lbl">Watch out: decode attention intensity</span>
+  <p>A popular attention example gives about 62 FLOPs per byte. That figure is for computing full attention over a sequence in one pass, without a fused kernel. It does not describe decode. In decode, each query head does about 4 × head size FLOPs per cached token (one dot product with K, one weighted sum of V), and reads 4 × head size bytes of BF16 K and V per KV head. So the intensity is about 1 FLOP per byte for MHA, and about the group size for GQA because several query heads share one read. Some summary tables list 0.5 for decode attention; about 1.0 is correct for MHA.</p>
 </div>
 
 <h2 id="expert">12. Expert layer</h2>
@@ -571,7 +426,7 @@ print(per_tok, 2 * qc.num_hidden_layers * qc.num_key_value_heads * head_dim * 2)
 <h3>Part C: from the 100 Days repo</h3>
 <ul>
   <li><strong>Day 01</strong> (first generation loop): run it and name which lines are prefill and which are decode.</li>
-  <li><strong>Day 05</strong> (KV cache): run it, then fix the 70B estimate using the <a href="#corrections">correction</a> above.</li>
+  <li><strong>Day 05</strong> (KV cache): run it, then fix its 70B estimate using the <a href="#corrections">watch-out box</a> in section 11.</li>
   <li><strong>Day 06</strong> (inference arithmetic): read only the parts on bytes per step now; the rest belongs to 2.5.</li>
 </ul>
 
@@ -602,12 +457,21 @@ print(per_tok, 2 * qc.num_hidden_layers * qc.num_key_value_heads * head_dim * 2)
 </div>
 
 <h2 id="quiz">16. Check yourself</h2>
-</article>
 
 <div class="widget wide quiz" id="quizW"></div>
 
-<article>
-<h2 id="refs">17. References</h2>
+<h2 id="summary">17. Summary</h2>
+<ul>
+  <li>Generation is a loop: one forward pass per new token. Prefill processes the prompt in one parallel pass; decode adds one token per step.</li>
+  <li>Keys and values of earlier tokens never change (causal mask), so the engine stores them: the KV cache. The query is not stored.</li>
+  <li>KV bytes per token = 2 × layers × KV heads × head size × bytes per value. GQA, MQA and MLA shrink it; FP8 halves it.</li>
+  <li>KV memory = bytes per token × tokens × sequences. It sets the maximum context and the number of concurrent users.</li>
+  <li>Engines allocate more than the logical size unless they page the cache (chapter 3.3).</li>
+  <li>Each decode step reads all weights plus every sequence's cache, so step time grows with batch and context. Bigger batches raise total throughput and lower per-user speed.</li>
+  <li>TTFT is set mostly by prefill; TPOT by decode step time; E2E ≈ TTFT + (n − 1) × TPOT.</li>
+</ul>
+
+<h2 id="refs">18. References</h2>
 <h3>Core: read or keep open</h3>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds beyond this chapter</th></tr>
@@ -616,6 +480,8 @@ print(per_tok, 2 * qc.num_hidden_layers * qc.num_key_value_heads * head_dim * 2)
 <tr><td><a href="https://arpitbhayani.me/blogs/how-llm-inference-works">Arpit Bhayani: How LLM inference works</a></td><td>A good end-to-end narrative of the generation loop for a first read.</td></tr>
 <tr><td><a href="https://kipp.ly/transformer-inference-arithmetic/">kipply: Transformer Inference Arithmetic</a></td><td>The classic source for the byte and FLOP counts. Bridges to 2.5. Apply the GQA correction.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2309.06180">Kwon et al., Efficient Memory Management for LLM Serving with PagedAttention</a></td><td>The measurements on allocation waste in section 7. Full treatment in chapter 3.3.</td></tr>
+<tr><td>Chi Wang and Peiheng Hu, <em>Hands-On LLM Serving and Optimization</em>, chapters 2 and 4</td><td>Prefill and decode with code, and the serving metrics (TTFT, TPOT, throughput) as measured in practice.</td></tr>
+<tr><td>Fuheng Wu, <em>Distributed AI Systems</em>, chapter 6</td><td>Inference fundamentals and KV memory from the view of a vLLM deployment.</td></tr>
 <tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, days 01, 05, 06</td><td>Runnable notebooks for the lab.</td></tr>
 </table></div>
 <h3>Extended: for depth</h3>
@@ -635,24 +501,25 @@ print(per_tok, 2 * qc.num_hidden_layers * qc.num_key_value_heads * head_dim * 2)
 <tr><td><a href="https://pub.towardsai.net/kv-cache-in-llm-inference-7b904a2a6982">Towards AI: KV Cache in LLM Inference</a></td><td>Covers the same ground as the Hugging Face post with less precision. Optional third read only.</td></tr>
 <tr><td>100 Days, day 05 memory estimate</td><td>Keep the notebook for code; do not trust its 70B number (see corrections).</td></tr>
 </table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The 70B-at-32K estimate of about 160 GB appears in day 05 of <em>100 Days of Inference</em>.</li>
+  <li>The MHA-only KV formula, and a bandwidth example with an exponent typo ("52e12"), are in kipply's <em>Transformer Inference Arithmetic</em>, which is otherwise an excellent reference.</li>
+  <li>The "comparable to model size" claim for 13B is in Arpit Bhayani's <em>How LLM inference works</em>.</li>
+  <li>The 62 FLOPs-per-byte attention example is in Kiely's <em>Inference Engineering</em>, section 2.4. The table 5-10 decode value of 0.5 was flagged by AI Atlas.</li>
+</ul>
 <p class="note">Facts checked on 6 November 2026. vLLM defaults from the v0.33 docs. GPU specs from NVIDIA data sheets: T4 16 GB, 320 GB/s; L4 24 GB, 300 GB/s; A100 80 GB, 2,039 GB/s; H100 SXM 80 GB, 3.35 TB/s; B200 180 GB, 8 TB/s.</p>
 
-<div class="navfoot">
-  <a href="../index.html#part-2">← 2.3 Positional information</a>
-  <a href="../index.html#part-2">2.5 Inference arithmetic →</a>
+
+<div class="navfoot"></div>
+</article></main>
 </div>
-</article>
-</main>
-</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
 
 <script>
 (function(){
-/* theme toggle */
 const root=document.documentElement;
-document.getElementById('themeBtn').onclick=()=>{
-  const cur=root.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
-  root.setAttribute('data-theme',cur==='dark'?'light':'dark');
-};
 const css=n=>getComputedStyle(root).getPropertyValue(n).trim();
 const NS='http://www.w3.org/2000/svg';
 function el(tag,attrs,parent,text){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);if(text!=null)e.textContent=text;if(parent)parent.appendChild(e);return e;}
@@ -873,10 +740,6 @@ qw.querySelectorAll('.q').forEach(div=>{
   });
 });
 
-/* ---------- toc highlight ---------- */
-const links=[...document.querySelectorAll('#tocList a')];
-const obs=new IntersectionObserver(es=>{es.forEach(e=>{if(e.isIntersecting){links.forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+e.target.id));}})},{rootMargin:'-10% 0px -80% 0px'});
-links.forEach(a=>{const t=document.querySelector(a.getAttribute('href'));if(t)obs.observe(t);});
 
 /* redraw on theme change so SVG colours follow */
 new MutationObserver(()=>{stDraw();calc();redrawGQA();}).observe(root,{attributes:true,attributeFilter:['data-theme']});
