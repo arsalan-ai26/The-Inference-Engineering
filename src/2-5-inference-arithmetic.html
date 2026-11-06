@@ -1,0 +1,327 @@
+<div class="kicker">Part 2 · Transformers and LLM inference mechanics · Chapter 2.5</div>
+<h1>Inference arithmetic</h1>
+<p class="lede">With five numbers (model size, bytes per weight, context, batch, and two GPU specs) you can predict how fast a model will run, before you rent a GPU or write any code. This chapter teaches that estimate: FLOPs, bytes, arithmetic intensity, the roofline, and the two efficiency scores (MFU and MBU) that tell you how close a real system comes to the limit.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 4 to 5 hours with the lab</span>
+  <span class="chip">Needs: 1.1, 1.3, 2.2, 2.4</span>
+  <span class="chip">Compute: Colab T4</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What is the ops:byte ratio of an H100 SXM in BF16, and what does it mean?</li>
+    <li>At what batch size does the weight matmul of decode stop being memory-bound on that GPU, roughly?</li>
+    <li>A 7B BF16 model has a TPOT of 14 ms on a GPU with 2 TB/s. What is its MBU?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>About 989 TFLOP/s ÷ 3.35 TB/s ≈ 295 FLOPs per byte. An operation must do at least that much math per byte it reads to keep the math units busy.</li>
+    <li>Around a batch of 295 tokens per step, because each BF16 weight (2 bytes) gives 2 FLOPs per token: about 1 FLOP per byte per token. Reading the KV cache pushes the real crossover even higher.</li>
+    <li>14 GB read in 14 ms is 1 TB/s, so MBU ≈ 50%.</li>
+  </ol></details>
+</div>
+
+<h2 id="two">1. Two limits on every GPU</h2>
+<p>A GPU has two resources that matter for inference:</p>
+<ul>
+  <li><strong>Compute:</strong> how many floating-point operations it can do per second (FLOP/s).</li>
+  <li><strong>Memory bandwidth:</strong> how many bytes per second it can move between its main memory (HBM) and its compute units.</li>
+</ul>
+<p>Every operation needs both: it reads data, then computes on it. Whichever takes longer sets the time. If reading takes longer, the operation is <strong>memory-bound</strong>: the math units wait. If computing takes longer, it is <strong>compute-bound</strong>: the memory system waits.</p>
+<div class="tbl"><table>
+<tr><th>GPU</th><th class="n">Memory</th><th class="n">Bandwidth</th><th class="n">Dense BF16/FP16 math</th><th class="n">Ops:byte</th></tr>
+<tr><td>T4</td><td class="n">16 GB</td><td class="n">320 GB/s</td><td class="n">65 TFLOP/s (FP16)</td><td class="n">203</td></tr>
+<tr><td>L4</td><td class="n">24 GB</td><td class="n">300 GB/s</td><td class="n">121 TFLOP/s</td><td class="n">403</td></tr>
+<tr><td>A100 SXM 80 GB</td><td class="n">80 GB</td><td class="n">2,039 GB/s</td><td class="n">312 TFLOP/s</td><td class="n">153</td></tr>
+<tr><td>H100 SXM</td><td class="n">80 GB</td><td class="n">3,350 GB/s</td><td class="n">989 TFLOP/s</td><td class="n">295</td></tr>
+<tr><td>H200</td><td class="n">141 GB</td><td class="n">4,800 GB/s</td><td class="n">989 TFLOP/s</td><td class="n">206</td></tr>
+<tr><td>B200 (per GPU in a DGX B200)</td><td class="n">180 GB</td><td class="n">8,000 GB/s</td><td class="n">about 2,250 TFLOP/s</td><td class="n">about 281</td></tr>
+</table></div>
+<p class="note">From NVIDIA data sheets. Vendors often quote math "with sparsity", which is twice the dense figure; the table uses dense values. B200's BF16 figure is derived as half of its dense FP8 figure.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Ops:byte ratio</strong> (of hardware): peak FLOP/s ÷ peak bytes/s. How many FLOPs the GPU can do in the time it reads one byte.</p>
+  <p><strong>Arithmetic intensity</strong> (of an operation): its FLOPs ÷ the bytes it must read and write.</p>
+  <p><strong>The rule:</strong> if intensity &lt; ops:byte, the operation is memory-bound. If intensity &gt; ops:byte, it is compute-bound.</p>
+</div>
+<p>The ops:byte numbers are in the hundreds. That means the math units are enormously faster than memory. Most of inference engineering is about feeding them.</p>
+
+<h2 id="roofline">2. The roofline</h2>
+<p>Plot achievable speed (FLOP/s) against arithmetic intensity. The limit has two parts:</p>
+<div class="formula">achievable FLOP/s = min( peak FLOP/s ,  bandwidth × intensity )</div>
+<p>On a log-log chart, the bandwidth part is a rising diagonal and the peak is a flat roof. The corner where they meet is at intensity = ops:byte. Operations to the left of the corner are memory-bound and can only go faster with more bandwidth or fewer bytes. Operations to the right are compute-bound and can only go faster with more FLOP/s or fewer FLOPs.</p>
+
+<div class="widget" id="rfW">
+  <div class="wt">Interactive: the roofline of an LLM</div>
+  <div class="ws">Each dot is one kind of operation in Llama 3.1 8B at the batch or prompt length you choose. Move the sliders and watch the dots cross the corner.</div>
+  <div class="ctrls">
+    <label>GPU <select id="rfG"></select></label>
+    <label>Decode batch: <span class="mono" id="rfBv"></span><input type="range" id="rfB" min="0" max="10" value="0"></label>
+    <label>Prefill tokens: <span class="mono" id="rfTv"></span><input type="range" id="rfT" min="0" max="8" value="5"></label>
+    <label>Weight type <select id="rfW8"><option value="2">BF16</option><option value="1">FP8</option><option value="0.5">INT4 (weight-only)</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="rfSvg" viewBox="0 0 680 340" width="680" style="max-width:100%;height:auto" role="img" aria-label="Roofline chart with LLM operations"></svg></div>
+  <div class="legend"><span><i style="background:var(--dec)"></i>Decode weight matmuls</span><span><i style="background:var(--bad)"></i>Decode attention (GQA, group 4)</span><span><i style="background:var(--pre)"></i>Prefill weight matmuls</span></div>
+  <p class="note" id="rfMsg"></p>
+</div>
+
+<h2 id="decode">3. Decode, counted</h2>
+<p>In one decode step, each sequence in the batch adds one token. The two big costs:</p>
+<h3>Weight matmuls</h3>
+<p>Every weight is read once per step and used once per sequence. With P parameters, b bytes per weight and a batch of B sequences:</p>
+<div class="formula">FLOPs = 2 × P × B        bytes ≈ P × b        intensity ≈ 2B ÷ b</div>
+<p>In BF16 (b = 2), the intensity is about B FLOPs per byte. At batch 1 it is about 1. An H100 needs about 295. So <strong>at small batch, decode uses well under 1% of the GPU's math</strong>, and its speed is set only by how fast the weights can be read. The batch size where the weight matmuls reach the corner is the <strong>critical batch size</strong>:</p>
+<div class="formula">B_crit ≈ ops:byte × b ÷ 2        (≈ 295 for BF16 weights on an H100)</div>
+<h3>Attention over the cache</h3>
+<p>Each sequence also reads its own KV cache (chapter 2.4). For one query head, attention over a context of n tokens does about 4 × n × d FLOPs and reads the 4 × n × d bytes of BF16 keys and values of its KV head. So its intensity is about 1 for MHA, and about the group size g for grouped-query attention, because g query heads share one read. Crucially, <strong>this does not grow with batch</strong>: every sequence reads its own cache. Attention in decode stays memory-bound at any batch size.</p>
+<div class="box ex">
+  <span class="lbl">Worked example: Llama 3.1 8B on one H100, BF16</span>
+  <ul>
+    <li><strong>Batch 1, short context.</strong> Bytes per step ≈ 16.06 GB. Time ≥ 16.06 ÷ 3,350 GB/s = 4.8 ms. Ceiling ≈ 209 tokens/s. FLOPs per step ≈ 16 GFLOP, which takes the math units only 0.016 ms: they are idle 99.7% of the time.</li>
+    <li><strong>Batch 64, 2K context.</strong> KV per sequence = 131,072 × 2,048 = 0.27 GB; × 64 = 17.2 GB. Bytes per step ≈ 33.2 GB → 9.9 ms. FLOPs ≈ 64 × 16 GFLOP = 1.03 TFLOP → 1.0 ms at peak. Still memory-bound. Ceiling ≈ 6,450 tokens/s in total, about 101 per user.</li>
+    <li><strong>Lesson:</strong> going from batch 1 to 64 multiplied total throughput by about 31 while each user slowed by only about 2 times. This is why every server batches.</li>
+  </ul>
+</div>
+
+<h2 id="prefill">4. Prefill, counted</h2>
+<p>Prefill runs T prompt tokens through the model in one pass. The weights are read once and used T times:</p>
+<div class="formula">FLOPs ≈ 2 × P × T  (+ attention, chapter 2.2)        intensity ≈ 2T ÷ b</div>
+<p>For prompts longer than a few hundred tokens, prefill is compute-bound. Its time is FLOPs ÷ (peak × efficiency). For a 2,048-token prompt into Llama 3.1 8B: 2 × 8.03 × 10⁹ × 2,048 ≈ 32.9 TFLOP. At 50% of an H100's 989 TFLOP/s, about 66 ms. Long prompts make time to first token (TTFT) grow linearly from the matmuls and, beyond tens of thousands of tokens, quadratically from attention.</p>
+<div class="box watch">
+  <span class="lbl">Watch out: "attention is the most expensive operation"</span>
+  <p>You will read that attention is the most expensive part of both prefill and decode. At short and medium context it is not: the weight matmuls dominate the FLOPs and the bytes. Attention takes over in prefill only beyond tens of thousands of tokens (chapter 2.2 widget), and in decode once the total KV cache read exceeds the weight read (chapter 2.4, lab Part D).</p>
+</div>
+<div class="box watch">
+  <span class="lbl">Watch out: decode attention intensity</span>
+  <p>A well-known worked example computes attention with Q, K and V all of shape [4096, 128], and gets about 62 FLOPs per byte, then calls it decode. With a full [4096, 128] query block that is prefill attention, done without a fused kernel. In decode the query is one row, and the intensity is about 1 (MHA) or g (GQA), whatever the context length. Another popular tutorial gives "about 31 FLOPs per byte at 4,096 tokens" for decode attention; that is also too high for MHA.</p>
+</div>
+
+<h2 id="mfu">5. MFU and MBU: how close to the limit?</h2>
+<p>Real systems do not reach peak. Two scores measure how close they get:</p>
+<div class="formula"><b>MFU</b> (model FLOPs utilization) = achieved FLOP/s ÷ peak FLOP/s</div>
+<div class="formula"><b>MBU</b> (model bandwidth utilization) = achieved bytes/s ÷ peak bytes/s</div>
+<p>Achieved FLOP/s counts the model's useful FLOPs (2 × P per token, plus attention), not extra work the system did. Achieved bytes/s counts the weights plus the KV cache that one step must read, divided by the step time.</p>
+<ul>
+  <li>Use <strong>MBU</strong> for memory-bound work: decode at small and medium batch.</li>
+  <li>Use <strong>MFU</strong> for compute-bound work: prefill, and decode at very large batch.</li>
+</ul>
+<div class="box ex">
+  <span class="lbl">Worked examples</span>
+  <p><strong>MBU.</strong> A 7B model in BF16 (14 GB) has a TPOT of 14 ms at batch 1. Achieved bandwidth = 14 GB ÷ 0.014 s = 1 TB/s. On a 2 TB/s GPU, MBU = 50%.</p>
+  <p><strong>MFU.</strong> The same model processes a 4,000-token prompt in 400 ms. FLOPs ≈ 2 × 7 × 10⁹ × 4,000 = 56 TFLOP. Achieved = 140 TFLOP/s. On a 312 TFLOP/s GPU, MFU ≈ 45%.</p>
+  <p>Good production engines reach roughly 50% to 80% MBU in decode and 40% to 70% MFU in prefill. Very low values point to overheads: Python, kernel launches, small inefficient kernels or communication.</p>
+</div>
+
+<div class="widget" id="tpW">
+  <div class="wt">Interactive: throughput vs batch</div>
+  <div class="ws">A decode step takes the longer of its compute time and its memory time. The chart shows tokens per second for the whole server (teal) and per user (amber) as the batch grows. The efficiencies are your assumptions about how close the engine gets to the limits.</div>
+  <div class="ctrls">
+    <label>Model <select id="tpM"><option value="8.03,131072">Llama 3.1 8B</option><option value="70.6,327680">Llama 3.1 70B</option><option value="0.494,12288">Qwen2.5-0.5B</option></select></label>
+    <label>GPU <select id="tpG"></select></label>
+    <label>GPUs <select id="tpN"><option>1</option><option>2</option><option>4</option><option>8</option></select></label>
+    <label>Context per sequence <select id="tpC"><option value="512">512</option><option value="2048" selected>2,048</option><option value="8192">8,192</option><option value="32768">32,768</option></select></label>
+    <label>MBU <select id="tpMb"><option value="1">100%</option><option value="0.7" selected>70%</option><option value="0.5">50%</option></select></label>
+    <label>MFU <select id="tpMf"><option value="1">100%</option><option value="0.6" selected>60%</option><option value="0.4">40%</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="tpSvg" viewBox="0 0 680 300" width="680" style="max-width:100%;height:auto" role="img" aria-label="Tokens per second against batch size"></svg></div>
+  <div class="stats" id="tpStats"></div>
+  <p class="note">Model: BF16 weights and KV cache, weights and KV split evenly across GPUs, no communication cost. Memory capacity is not checked here; use the calculator in chapter 2.4 for that.</p>
+</div>
+
+<h2 id="estimate">6. A five-minute estimate, step by step</h2>
+<ol>
+  <li><strong>Weight bytes</strong> = parameters × bytes per weight (chapter 1.3).</li>
+  <li><strong>KV bytes per token</strong> = 2 × layers × KV heads × head size × bytes (chapter 2.4).</li>
+  <li><strong>Decode step memory time</strong> = (weight bytes + batch × context × KV bytes per token) ÷ (bandwidth × MBU).</li>
+  <li><strong>Decode step compute time</strong> = 2 × parameters × batch ÷ (peak FLOP/s × MFU).</li>
+  <li><strong>TPOT</strong> ≈ the larger of the two, plus a fixed overhead per step.</li>
+  <li><strong>TTFT</strong> ≈ queue time + 2 × parameters × prompt tokens ÷ (peak × MFU).</li>
+  <li><strong>Throughput</strong> = batch ÷ TPOT tokens per second.</li>
+</ol>
+<p>This estimate is usually within a factor of 2 of a well-tuned engine. When your measurement is much worse, the gap tells you where to look.</p>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">The third regime: overhead-bound</span>
+  <p>For small models or tiny batches, neither compute nor memory is the limit. The GPU waits for the CPU to launch the next kernel. Each launch costs microseconds, and a model step can launch hundreds of kernels. Symptoms: MBU far below 50% and GPU-Util that looks busy. CUDA graphs and compilation (chapter 5.7) remove most of this. Lab Part C shows it on a T4.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Lower precision moves the corner</span>
+  <p>Quantized weights cut b. With weight-only INT4 and BF16 math, decode bytes fall 4 times while FLOPs stay the same, so a memory-bound decode can run up to 4 times faster, and B_crit falls to about a quarter. With FP8 weights and FP8 math, both bytes and peak FLOP/s change by 2, so B_crit stays about the same. Chapter 4.1 uses this to decide which quantization fits which workload.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Multi-GPU arithmetic</span>
+  <p>Splitting a model over N GPUs with tensor parallelism divides the weight and KV bytes per GPU by N, so memory-bound decode can approach N times faster. Each layer then needs communication between GPUs, which adds time that grows with batch and shrinks with faster links such as NVLink. Chapter 4.5 adds that term to the estimate.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Speculative decoding raises intensity</span>
+  <p>Checking k guessed tokens in one pass turns one-token decode into a small k-token prefill: the weights are read once for k tokens, so intensity rises about k times. When decode is memory-bound, this can give several accepted tokens for close to the cost of one step (chapter 4.3).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Energy follows bytes</span>
+  <p>Moving a byte from HBM costs far more energy than doing one multiply-add on it. Memory-bound decode therefore spends most of its energy on data movement. This is part of why performance per watt improves so much with batching and lower precision.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Using sparse FLOP/s figures from marketing as the dense peak.</li>
+  <li>Forgetting the KV cache bytes in decode estimates at large batch or long context.</li>
+  <li>Calling decode compute-bound at batch 64 on an H100. For BF16 weights the crossover is near 300, and the KV cache pushes it higher.</li>
+  <li>Computing MFU from total GPU work including padding or recomputation. Count the model's useful FLOPs only.</li>
+  <li>Comparing MBU of systems at different batch sizes without saying so; MBU naturally falls as batch grows.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p><strong>Goal:</strong> estimate first, then measure, then explain the gap.</p>
+<h3>Part A: the 100 Days notebook</h3>
+<p>Run day 06 (ops:byte ratio and the roofline) of <em>100 Days of Inference</em>. Then check two of its claims against this chapter: the decode attention intensity at 4,096 tokens, and the batch size at which decode becomes compute-bound on an H100.</p>
+<details><summary>What you should find</summary><p>Decode attention intensity is about 1 FLOP per byte for MHA (about g for GQA), independent of context length. The weight matmuls of decode in BF16 reach the H100's corner near a batch of about 295, not 64. With KV reads included, decode as a whole stays memory-bound even beyond that.</p></details>
+<h3>Part B: estimate on paper (or in the widgets)</h3>
+<ol>
+  <li>Llama 3.1 8B, H100, BF16, 1K context. TPOT ceiling at batch 1 and at batch 64.</li>
+  <li>Same model and GPU. TTFT for a 8,000-token prompt at 50% MFU.</li>
+  <li>Qwen2.5-0.5B in FP16 on a T4 at batch 1. TPOT ceiling.</li>
+</ol>
+<details><summary>Answers</summary><ol>
+  <li>Batch 1: (16.06 + 0.13) GB ÷ 3,350 GB/s ≈ 4.8 ms, about 207 tokens/s. Batch 64: KV = 64 × 1,024 × 131,072 B = 8.6 GB; (16.06 + 8.6) ÷ 3,350 ≈ 7.4 ms per step, about 8,700 tokens/s in total and 136 per user.</li>
+  <li>2 × 8.03 × 10⁹ × 8,000 ≈ 128 TFLOP from matmuls, plus about 4 × 8,000² × 4,096 × 32 ÷ 2 ≈ 16.8 TFLOP of attention. Total ≈ 145 TFLOP ÷ 494 TFLOP/s ≈ 0.29 s.</li>
+  <li>0.99 GB ÷ 320 GB/s ≈ 3.1 ms, about 320 tokens/s.</li>
+</ol></details>
+<h3>Part C: measure decode on a T4 and compute MBU</h3>
+<pre>import torch, time
+from transformers import AutoModelForCausalLM, AutoTokenizer
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(name); tok.padding_side = "left"
+m = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16).cuda().eval()
+W = sum(p.numel() * p.element_size() for p in m.parameters())          # weight bytes
+kv_per_tok = 2 * m.config.num_hidden_layers * m.config.num_key_value_heads * (m.config.hidden_size // m.config.num_attention_heads) * 2
+BW, PEAK = 320e9, 65e12                                                  # T4 data sheet
+
+@torch.inference_mode()
+def decode_rate(B, new=128):
+    ids = tok(["Tell me a long story about a robot."] * B, return_tensors="pt", padding=True).to("cuda")
+    m.generate(**ids, max_new_tokens=8, do_sample=False)                 # warm-up
+    torch.cuda.synchronize(); t = time.perf_counter()
+    out = m.generate(**ids, max_new_tokens=new, min_new_tokens=new, do_sample=False)
+    torch.cuda.synchronize(); dt = time.perf_counter() - t
+    step = dt / new
+    ctx = ids.input_ids.shape[1] + new / 2                                # average context
+    mbu = (W + B * ctx * kv_per_tok) / step / BW
+    mfu = 2 * (W / 2) * B / step / PEAK
+    return B * new / dt, step * 1e3, mbu, mfu
+
+for B in [1, 4, 16, 64]:
+    tps, ms, mbu, mfu = decode_rate(B)
+    print(f"B={B:3d}  {tps:8.0f} tok/s  step {ms:6.2f} ms  MBU {mbu:5.1%}  MFU {mfu:5.2%}")</pre>
+<p>Predict first: the ceiling from Part B is about 3 ms per step. How close will Hugging Face <code>generate</code> get at batch 1?</p>
+<details><summary>What to expect and why</summary><p>The measured step will likely be many times slower than 3 ms, so MBU will be low (often below 20%). The model is small, so each step is dominated by Python and kernel-launch overhead: the overhead-bound regime from the expert layer. As the batch grows, step time barely changes, so tokens per second rise almost linearly: the same shape as the widget, but with a fixed overhead floor. Part D of chapter 3.1 repeats this with vLLM, which removes most of the overhead.</p></details>
+<h3>Part D: a measured roofline</h3>
+<pre>def matmul_point(m_, k=4096, n=4096):
+    A = torch.randn(m_, k, device="cuda", dtype=torch.float16); B = torch.randn(k, n, device="cuda", dtype=torch.float16)
+    for _ in range(3): A @ B
+    torch.cuda.synchronize(); t = time.perf_counter()
+    for _ in range(20): A @ B
+    torch.cuda.synchronize(); dt = (time.perf_counter() - t) / 20
+    flops = 2 * m_ * k * n; byts = 2 * (m_ * k + k * n + m_ * n)
+    return flops / byts, flops / dt
+pts = [matmul_point(m_) for m_ in [1, 4, 16, 64, 256, 1024, 4096]]
+import matplotlib.pyplot as plt
+x = [p[0] for p in pts]; y = [p[1] / 1e12 for p in pts]
+xs = [0.5, 2000]
+plt.loglog(xs, [min(PEAK, BW * v) / 1e12 for v in xs], "k--", label="T4 roofline")
+plt.loglog(x, y, "o-", label="measured matmul"); plt.xlabel("FLOPs per byte"); plt.ylabel("TFLOP/s"); plt.legend(); plt.show()</pre>
+<p>Your points should follow the diagonal at low intensity and bend under the roof at high intensity. The gap to the roof is the kernel's inefficiency at that shape.</p>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">How teams use this arithmetic</span>
+  <ul>
+    <li><strong>Hardware choice:</strong> for chat-style decode, memory bandwidth per dollar matters more than FLOP/s per dollar. For long-prompt, short-answer work (summarization, classification), FLOP/s matters more.</li>
+    <li><strong>Benchmark sanity checks:</strong> a vendor claim of more tokens per second at batch 1 than bandwidth ÷ weight bytes allows is a red flag (unless it uses speculative decoding or quantization).</li>
+    <li><strong>Engine tuning:</strong> MBU and MFU tell an engineer whether to work on kernels and overhead (low efficiency) or on batching and quantization (high efficiency but slow anyway).</li>
+    <li><strong>Pricing:</strong> providers set prices per million tokens from the throughput they can reach at their batch sizes, which this arithmetic estimates.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz25"></div>
+<script type="application/json" id="qz25">[
+{"q":"An operation does 50 FLOPs per byte on a GPU with ops:byte 300. It is:","o":["Compute-bound","Memory-bound","Balanced","Overhead-bound by definition"],"a":1,"e":"Intensity below the hardware ratio means memory is the limit."},
+{"q":"Decode of a BF16 model at batch B has weight-matmul intensity of about:","o":["1 regardless of B","B FLOPs per byte","295","B²"],"a":1,"e":"2 FLOPs per weight per token, 2 bytes per weight: about B."},
+{"q":"Why does decode attention stay memory-bound even at large batch?","o":["Attention has no FLOPs","Each sequence reads its own KV cache, so the reads grow with batch too","Softmax is slow","The weights are re-read for attention"],"a":1,"e":"Weight reads are shared across the batch; KV reads are not."},
+{"q":"A 70 GB model has TPOT 35 ms on a GPU with 3.35 TB/s at batch 1. MBU is about:","o":["30%","60%","90%","100%"],"a":1,"e":"70 GB ÷ 0.035 s = 2 TB/s; 2 ÷ 3.35 ≈ 60%."},
+{"q":"Switching from BF16 to weight-only INT4 for memory-bound decode can make it up to:","o":["2 times faster","4 times faster","No faster","16 times faster"],"a":1,"e":"Weight bytes fall 4 times; at small batch, time follows bytes."},
+{"q":"Prefill of 4,000 tokens through a 7B model needs about:","o":["28 GFLOP","56 TFLOP","7 TFLOP","4 PFLOP"],"a":1,"e":"2 × 7 × 10⁹ × 4,000 = 5.6 × 10¹³ FLOPs."},
+{"q":"A small model shows 10% MBU at batch 1 in Hugging Face generate. The most likely bottleneck:","o":["Memory bandwidth","Compute","CPU-side kernel launch and Python overhead","The tokenizer"],"a":2,"e":"Small models run many tiny kernels per step; launch overhead dominates."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Ops:byte = peak FLOP/s ÷ bandwidth (≈ 295 for H100 BF16). Arithmetic intensity = FLOPs ÷ bytes of an operation. Below the ratio: memory-bound.</li>
+  <li>Roofline: achievable = min(peak, bandwidth × intensity).</li>
+  <li>Decode weight matmuls have intensity ≈ 2B/b; B_crit ≈ ops:byte × b/2. Decode attention has intensity ≈ g and never improves with batch.</li>
+  <li>Prefill has intensity ≈ 2T/b and is compute-bound for prompts longer than a few hundred tokens.</li>
+  <li>TPOT ≈ max(compute time, memory time) + overhead; TTFT ≈ 2 × P × T ÷ (peak × MFU).</li>
+  <li>MBU scores memory-bound work; MFU scores compute-bound work. Low values mean overhead.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 2.4</td><td>Ops:byte, arithmetic intensity, the roofline and the prefill/decode bottleneck split.</td></tr>
+<tr><td><a href="https://kipp.ly/transformer-inference-arithmetic/">kipply: Transformer Inference Arithmetic</a></td><td>The classic derivation of FLOPs, bytes, latency and batch trade-offs for transformer inference.</td></tr>
+<tr><td><a href="https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices">Databricks: LLM Inference Performance Engineering</a></td><td>MBU and MFU defined with measured values on A100 and H100 at several batch sizes and tensor-parallel degrees.</td></tr>
+<tr><td><a href="https://jax-ml.github.io/scaling-book/inference/">How to Scale Your Model: inference</a> and <a href="https://jax-ml.github.io/scaling-book/roofline/">rooflines</a> (Google DeepMind)</td><td>The critical batch size derivation and a rigorous treatment of decode, prefill and KV cost.</td></tr>
+<tr><td><a href="https://bounded-regret.ghost.io/how-fast-can-we-perform-a-forward-pass/">Bounded Regret: How fast can we perform a forward pass?</a></td><td>A first-principles look at the latency floor of a forward pass. The author notes some constants may be off; use it for reasoning, not numbers.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, chapters 1, 2 and 9</td><td>Goodput, roofline use in practice, and the precision levers on Hopper and Blackwell.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 06</td><td>A roofline notebook for several GPUs, with matmul benchmarks.</td></tr>
+<tr><td>NVIDIA data sheets: <a href="https://www.nvidia.com/en-us/data-center/tesla-t4/">T4</a>, <a href="https://www.nvidia.com/en-us/data-center/l4/">L4</a>, <a href="https://www.nvidia.com/en-us/data-center/a100/">A100</a>, <a href="https://www.nvidia.com/en-us/data-center/h100/">H100</a>, <a href="https://www.nvidia.com/en-us/data-center/dgx-b200/">DGX B200</a></td><td>The hardware numbers in section 1.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The 62 FLOPs-per-byte example labelled as decode, and the statement that attention is the most expensive operation in both phases, are in Kiely's <em>Inference Engineering</em>, section 2.4.2.</li>
+  <li>The "about 31 ops/byte at 4,096 tokens" decode-attention figure and the "compute-bound by batch 64" statement are in the day 06 README of <em>100 Days of Inference</em>.</li>
+</ul>
+<p class="note">Facts checked on 6 November 2026.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+const G=[['T4',65,320],['L4',121,300],['A100 SXM',312,2039],['H100 SXM',989,3350],['H200',989,4800],['B200',2250,8000]];
+G.forEach((g,i)=>{$('rfG').add(new Option(g[0],i));$('tpG').add(new Option(g[0],i));});$('rfG').value=3;$('tpG').value=3;
+const BS=[1,2,4,8,16,32,64,128,256,512,1024],TS=[16,64,128,256,512,1024,2048,4096,8192];
+function rf(){const g=G[+$('rfG').value];const B=BS[+$('rfB').value],T=TS[+$('rfT').value],b=+$('rfW8').value;$('rfBv').textContent=B;$('rfTv').textContent=IE.tok(T);
+  const peak=g[1]*1e12,bw=g[2]*1e9,ob=peak/bw;const s=$('rfSvg');s.innerHTML='';const W=680,H=340,l=60,r=20,t=16,bt=40;
+  const xl=-1,xh=4,yl=11,yh=Math.log10(2.6e15);const X=v=>l+(Math.log10(v)-xl)/(xh-xl)*(W-l-r),Y=v=>H-bt-(Math.log10(v)-yl)/(yh-yl)*(H-t-bt);
+  for(let e=xl;e<=xh;e++){el('line',{x1:X(10**e),x2:X(10**e),y1:t,y2:H-bt,class:'axis'},s);el('text',{x:X(10**e),y:H-bt+16,'text-anchor':'middle',class:'tick'},s,10**e>=1?String(10**e):'0.1');}
+  for(let e=11;e<=15;e++){el('line',{x1:l,x2:W-r,y1:Y(10**e),y2:Y(10**e),class:'axis'},s);el('text',{x:l-6,y:Y(10**e)+4,'text-anchor':'end',class:'tick'},s,(10**e/1e12)>=1?(10**e/1e12)+' T':(10**e/1e9)+' G');}
+  el('text',{x:l+(W-l-r)/2,y:H-6,'text-anchor':'middle',class:'tick'},s,'arithmetic intensity (FLOPs per byte, log)');
+  el('text',{x:14,y:t+(H-t-bt)/2,'text-anchor':'middle',class:'tick',transform:`rotate(-90 14 ${t+(H-t-bt)/2})`},s,'achievable FLOP/s (log)');
+  const x0=0.1,x1=10**xh;el('path',{d:`M${X(x0)} ${Y(bw*x0)} L${X(ob)} ${Y(peak)} L${X(x1)} ${Y(peak)}`,fill:'none',stroke:css('--ink'),'stroke-width':2.5},s);
+  el('line',{x1:X(ob),x2:X(ob),y1:Y(peak),y2:H-bt,stroke:css('--ink2'),'stroke-dasharray':'4 4'},s);el('text',{x:X(ob)+5,y:H-bt-6,class:'tick'},s,`corner ${ob.toFixed(0)}`);
+  const P=8.03e9,ctx=2048,kvt=131072;
+  const dW=2*P*B/(P*b);const dA=4;/* GQA g=4 */const pW=2*P*T/(P*b+2*T*4096*2);
+  [[dW,'--dec',`decode matmuls, batch ${B}`],[dA,'--bad','decode attention (any batch)'],[pW,'--pre',`prefill matmuls, ${IE.tok(T)} tokens`]].forEach(([v,c,lab],i)=>{const y=Math.min(peak,bw*v);el('circle',{cx:X(v),cy:Y(y),r:7,fill:css(c),stroke:css('--panel'),'stroke-width':2},s);el('text',{x:X(v)+10,y:Y(y)+(i===1?16:-8),'font-size':11,fill:css(c)},s,lab);});
+  const pct=v=>(Math.min(peak,bw*v)/peak*100);
+  $('rfMsg').textContent=`On ${g[0]}: decode matmuls reach ${pct(dW).toFixed(1)}% of peak math at batch ${B}; prefill of ${IE.tok(T)} tokens reaches ${pct(pW).toFixed(0)}%. Decode attention stays at ${pct(dA).toFixed(1)}% whatever the batch. Critical batch for these weights ≈ ${(ob*b/2).toFixed(0)}.`;}
+['rfG','rfB','rfT','rfW8'].forEach(id=>$(id).addEventListener('input',rf));IE.onTheme(rf);
+function tp(){const [P,kvt]=$('tpM').value.split(',').map(Number);const g=G[+$('tpG').value];const N=+$('tpN').value,C=+$('tpC').value,mb=+$('tpMb').value,mf=+$('tpMf').value;
+  const peak=g[1]*1e12*N*mf,bw=g[2]*1e9*N*mb,Wb=P*1e9*2;
+  const step=B=>Math.max(2*P*1e9*B/peak,(Wb+B*C*kvt)/bw);
+  const Bs=[];for(let e=0;e<=10;e+=0.125)Bs.push(2**e);
+  const s=$('tpSvg');s.innerHTML='';const W=680,H=300,l=64,r=60,t=16,bt=40;
+  const tot=Bs.map(B=>B/step(B)),per=Bs.map(B=>1/step(B));const ymax=Math.max(...tot)*1.08,pmax=Math.max(...per)*1.08;
+  const X=B=>l+Math.log2(B)/10*(W-l-r),Y=v=>H-bt-v/ymax*(H-t-bt),Y2=v=>H-bt-v/pmax*(H-t-bt);
+  for(let i=0;i<=4;i++){el('line',{x1:l,x2:W-r,y1:Y(ymax*i/4),y2:Y(ymax*i/4),class:'axis'},s);el('text',{x:l-6,y:Y(ymax*i/4)+4,'text-anchor':'end',class:'tick',fill:css('--kv')},s,IE.int(ymax*i/4));el('text',{x:W-r+6,y:Y2(pmax*i/4)+4,class:'tick',fill:css('--dec')},s,IE.int(pmax*i/4));}
+  [1,4,16,64,256,1024].forEach(B=>el('text',{x:X(B),y:H-bt+16,'text-anchor':'middle',class:'tick'},s,B));
+  el('text',{x:l+(W-l-r)/2,y:H-6,'text-anchor':'middle',class:'tick'},s,'batch (sequences per step, log)');
+  el('path',{d:Bs.map((B,i)=>(i?'L':'M')+X(B)+' '+Y(tot[i])).join(' '),fill:'none',stroke:css('--kv'),'stroke-width':2.5},s);
+  el('path',{d:Bs.map((B,i)=>(i?'L':'M')+X(B)+' '+Y2(per[i])).join(' '),fill:'none',stroke:css('--dec'),'stroke-width':2.5},s);
+  let knee=Bs.find(B=>2*P*1e9*B/peak>=(Wb+B*C*kvt)/bw);
+  if(knee){el('line',{x1:X(knee),x2:X(knee),y1:t,y2:H-bt,stroke:css('--ink2'),'stroke-dasharray':'4 4'},s);el('text',{x:X(knee)+4,y:t+12,class:'tick'},s,`compute-bound from ≈${Math.round(knee)}`);}
+  const st=[1,64].map(B=>step(B));
+  $('tpStats').innerHTML=[['TPOT at batch 1',(st[0]*1e3).toFixed(2)+' ms'],['Tokens/s at batch 1',IE.int(1/st[0])],['TPOT at batch 64',(st[1]*1e3).toFixed(2)+' ms'],['Total tokens/s at batch 64',IE.int(64/st[1])],['Compute-bound from batch',knee?'≈ '+Math.round(knee):'never (KV reads dominate)']].map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');}
+['tpM','tpG','tpN','tpC','tpMb','tpMf'].forEach(id=>$(id).addEventListener('input',tp));IE.onTheme(tp);
+})();
+</script>

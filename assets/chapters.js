@@ -74,7 +74,7 @@ window.IE_CHAPTERS = [
 "title": "Inference arithmetic",
 "slug": "2-5-inference-arithmetic",
 "part": 2,
-"ready": false
+"ready": true
 },
 {
 "n": "2.6",
