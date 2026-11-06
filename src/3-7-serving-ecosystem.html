@@ -1,0 +1,239 @@
+<div class="kicker">Part 3 · Inference engines and serving · Chapter 3.7 · Expert depth</div>
+<h1>The serving ecosystem: multimodal, diffusion and staying current</h1>
+<p class="lede">Serving is no longer only text in, text out. Vision-language models turn images into hundreds of tokens, omni models chain encoders, language models and diffusion decoders in one request, and image and video generators run a large transformer dozens of times per output. Meanwhile engines ship new versions every few weeks and each major model arrives with its own serving recipe. This chapter covers what changes for each modality, and a method for keeping up.</p>
+<div class="meta">
+  <span class="chip">Level: expert</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 2.5, 3.1 to 3.6</span>
+  <span class="chip">Compute: Colab T4</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: what you should already know</span>
+  <p>This chapter assumes the prefill and decode cost model (chapter 2.5), prefix caching with multimodal hashes (chapter 3.5) and the engine landscape (chapter 3.6). Each section ends with what it means for capacity and latency.</p>
+</div>
+
+<h2 id="vlm">1. Vision-language models: images become tokens</h2>
+<p>A vision-language model (VLM) adds a <strong>vision encoder</strong> in front of the language model. The encoder cuts the image into small patches, turns them into vectors, and a small projector maps those vectors into the language model's embedding space. To the language model they are just more tokens in the sequence.</p>
+<div class="svgwrap"><svg viewBox="0 0 700 150" width="700" style="max-width:100%;height:auto" role="img" aria-label="VLM request: image to vision encoder to image tokens, joined with text tokens into the language model">
+  <defs><marker id="ar37" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--ink2)"/></marker></defs>
+  <g font-size="12">
+    <rect x="10" y="20" width="100" height="50" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="60" y="49" text-anchor="middle" fill="var(--ink)">1. image</text>
+    <rect x="140" y="20" width="130" height="50" rx="8" fill="var(--pre-s)" stroke="var(--pre)"/><text x="205" y="41" text-anchor="middle" fill="var(--ink)">2. vision encoder</text><text x="205" y="57" text-anchor="middle" fill="var(--ink2)">patches → vectors</text>
+    <rect x="300" y="20" width="130" height="50" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="365" y="41" text-anchor="middle" fill="var(--ink)">3. image tokens</text><text x="365" y="57" text-anchor="middle" fill="var(--ink2)">hundreds to thousands</text>
+    <rect x="300" y="90" width="130" height="40" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="365" y="115" text-anchor="middle" fill="var(--ink)">text tokens</text>
+    <rect x="470" y="45" width="140" height="60" rx="8" fill="var(--kv-s)" stroke="var(--kv)"/><text x="540" y="70" text-anchor="middle" fill="var(--ink)">4. language model</text><text x="540" y="86" text-anchor="middle" fill="var(--ink2)">prefill + decode, KV</text>
+    <rect x="630" y="55" width="60" height="40" rx="8" fill="var(--dec-s)" stroke="var(--dec)"/><text x="660" y="80" text-anchor="middle" fill="var(--ink)">5. text</text>
+    <path d="M110 45H138M270 45H298M430 50L468 68M430 108L468 88M610 75H628" stroke="var(--ink2)" fill="none" marker-end="url(#ar37)"/>
+  </g>
+</svg></div>
+<p>The number of image tokens grows with resolution. Qwen2.5-VL, for example, gives roughly one token per 28 × 28 pixel tile after merging, so a 1,024 × 1,024 image becomes about 1,300 tokens, more than many text prompts. That changes serving costs in three ways:</p>
+<ul>
+  <li><strong>Encoder compute</strong> runs once per image, before prefill, and adds to time to first token.</li>
+  <li><strong>Prefill and KV memory</strong> grow with image tokens, exactly like long text (chapters 2.4 and 2.5).</li>
+  <li><strong>Caching needs media hashes.</strong> Image placeholder tokens are identical for every image, so prefix caches include a hash of the image itself (chapter 3.5). Engines also cache encoder outputs: vLLM reports <code>mm_cache_queries</code> and <code>mm_cache_hits</code>.</li>
+</ul>
+<p>Engines let you cap image resolution or the number of images per prompt, the main levers for VLM capacity. Some systems go further and run encoders on separate GPUs from the language model, the same idea as prefill-decode disaggregation (chapter 4.6), because encoders and language models have different compute and memory profiles.</p>
+
+<h2 id="omni">2. Omni-modality pipelines</h2>
+<p>"Omni" models take and produce several modalities: text, images, audio and video. One request can pass through several different models: an audio or vision encoder, an autoregressive language model that reasons, and a diffusion or audio decoder that produces the output. Each stage has a different shape of work:</p>
+<div class="tbl"><table>
+<tr><th>Stage</th><th>Typical shape</th><th>Bottleneck</th></tr>
+<tr><td>Encoders (vision, audio)</td><td>One parallel pass per input</td><td>Compute</td></tr>
+<tr><td>Autoregressive language model</td><td>Prefill, then token-by-token decode</td><td>Compute in prefill, memory bandwidth in decode</td></tr>
+<tr><td>Diffusion decoders (images, video)</td><td>Many full passes over a fixed-size latent</td><td>Compute</td></tr>
+<tr><td>Audio decoders (speech)</td><td>Streaming chunks under tight latency</td><td>Latency per chunk</td></tr>
+</table></div>
+<p>vLLM-Omni, released in late 2025, extends vLLM to these pipelines: it orchestrates heterogeneous stages within one request and applies vLLM's memory management to diffusion transformers as well as autoregressive models. Systems such as Cornserve take a similar view of multimodal serving as a graph of components that can be placed and scaled separately.</p>
+<div class="box def">
+  <span class="lbl">Capacity impact</span>
+  <p>Plan each stage separately. A pipeline is as fast as its slowest stage, and stages may want different GPUs and different batch sizes.</p>
+</div>
+
+<h2 id="diffusion">3. Diffusion model serving</h2>
+<p>Image and video generators work very differently from LLMs. A text-to-image pipeline such as FLUX.1-dev has four models: two text encoders (T5 and CLIP), a 12-billion-parameter transformer <strong>denoiser</strong>, and a VAE that decodes the final latent into pixels. Generation starts from random noise in a compressed latent space and runs the denoiser repeatedly, each step removing a little noise.</p>
+<ul>
+  <li><strong>The denoiser dominates.</strong> It runs once per step (28 steps by default for FLUX.1-dev), over every latent token each time. One published walkthrough measured about 15.8 s per 1,024 × 1,024 image on an A100 and 6.9 s on an H100 before optimization, almost all in the denoiser.</li>
+  <li><strong>It is compute-bound.</strong> Each step processes thousands of latent tokens at once (a 1,024 × 1,024 image is 128 × 128 in latent space, which FLUX packs into 2 × 2 patches: 4,096 image tokens plus the text tokens). Arithmetic intensity is high, like a large prefill (chapter 2.5).</li>
+  <li><strong>There is no KV cache</strong> across steps in the LLM sense, and batching helps much less than for decode, because one image already fills the GPU.</li>
+</ul>
+
+<div class="widget" id="dfW">
+  <div class="wt">Interactive: what an image costs</div>
+  <div class="ws">FLOPs per denoiser pass ≈ 2 × parameters × tokens, plus attention (chapter 2.2). Time ≈ steps × passes per step × FLOPs ÷ (GPU FLOP/s × efficiency). Defaults approximate FLUX.1-dev (12 B, 57 blocks, hidden size 3,072); change them to explore.</div>
+  <div class="ctrls">
+    <label>Resolution <select id="dfR"><option value="512">512 × 512</option><option value="1024" selected>1,024 × 1,024</option><option value="2048">2,048 × 2,048</option></select></label>
+    <label>Steps <select id="dfS"><option>4</option><option>8</option><option>20</option><option selected>28</option><option>50</option></select></label>
+    <label>Passes per step <select id="dfC"><option value="1" selected>1 (guidance-distilled)</option><option value="2">2 (classifier-free guidance)</option></select></label>
+    <label>GPU <select id="dfG"><option value="312">A100 (312 TFLOP/s BF16)</option><option value="989" selected>H100 (989)</option><option value="2250">B200 (about 2,250)</option></select></label>
+    <label>Efficiency (MFU) <select id="dfE"><option value="0.3">30%</option><option value="0.5" selected>50%</option><option value="0.7">70%</option></select></label>
+    <label>GPUs in parallel <select id="dfN"><option>1</option><option>2</option><option>4</option></select></label>
+  </div>
+  <div class="stats" id="dfStats"></div>
+  <p class="note">Ignores text encoders, VAE and communication. Parallel GPUs are assumed to split one image's work perfectly (an upper bound for sequence and guidance parallelism).</p>
+</div>
+<p>How serving systems make diffusion faster:</p>
+<div class="tbl"><table>
+<tr><th>Technique</th><th>What it does</th><th>Cost</th></tr>
+<tr><td>Fewer steps</td><td>Better samplers and step-distilled models (1 to 8 steps)</td><td>Quality depends on the model; needs a distilled variant</td></tr>
+<tr><td>Caching between steps</td><td>Reuse block outputs that change little from one step to the next</td><td>Small quality changes; tuning per model</td></tr>
+<tr><td>Guidance parallelism</td><td>Run the two passes of classifier-free guidance on two GPUs at once</td><td>Twice the GPUs for up to 2 times lower latency</td></tr>
+<tr><td>Sequence parallelism</td><td>Split the latent tokens across GPUs (Ulysses, ring attention), vital for video with tens of thousands of tokens</td><td>Communication per layer</td></tr>
+<tr><td>Compilation, FP8, fused attention</td><td>The same kernel-level levers as LLMs (chapters 3.1 and 4.1)</td><td>Engineering and validation time</td></tr>
+</table></div>
+<p>SGLang Diffusion (late 2025) brought SGLang's runtime to image and video models such as Wan, Hunyuan, Qwen-Image and Flux, with guidance parallelism and unified sequence parallelism, and reported 1.2 to 5.9 times speed-ups across workloads. vLLM-Omni offers diffusion acceleration in the vLLM ecosystem.</p>
+
+<h2 id="recipes">4. Model-specific serving recipes</h2>
+<p>New flagship models often need specific engine flags on day one. Engines publish <strong>recipes</strong>: tested commands and settings per model. Three examples from vLLM's recipes and blog show what they contain:</p>
+<div class="tbl"><table>
+<tr><th>Model</th><th>What is special</th><th>What the recipe tells you</th></tr>
+<tr><td>DeepSeek-V3.2</td><td>DeepSeek Sparse Attention for long context; a much changed chat template</td><td>A dedicated tokenizer mode (<code>--tokenizer-mode deepseek_v32</code>), its own tool-call parser, 8-way parallelism, extra kernel packages</td></tr>
+<tr><td>Xiaomi MiMo-V2-Flash</td><td>MoE with 309 B total and 15 B active, hybrid attention, multi-token prediction</td><td>Suggested <code>--max-model-len</code> (65,536 usually, 128K maximum) and <code>--max-num-batched-tokens</code> (32,768 for prompt-heavy work, lower for latency); notes that some features were not yet enabled</td></tr>
+<tr><td>NVIDIA Nemotron 3 Nano</td><td>Hybrid Mamba-Transformer MoE with 1M-token context; later an NVFP4 version trained with quantization-aware distillation</td><td>Supported precisions (BF16, FP8, NVFP4), and the reasoning and tool settings for agent use</td></tr>
+</table></div>
+<p>The pattern: before serving a new model, read its recipe for the tokenizer and template mode, tool and reasoning parsers, parallelism, maximum lengths, quantized variants, and the list of features that do not work yet.</p>
+
+<h2 id="addons">5. Around the engine: proxies and checks</h2>
+<ul>
+  <li><strong>Optimizing proxies.</strong> Projects such as optillm sit between the client and an OpenAI-compatible server and apply inference-time techniques (several samples and selection, iterative refinement and similar) without changing the engine. They trade more tokens per request for better answers on some tasks (chapter 2.7, test-time compute).</li>
+  <li><strong>Guardrails in the request path.</strong> vLLM's semantic router project describes HaluGate, a token-level check that flags claims not supported by tool or retrieval results, using small classifiers rather than a second LLM as judge, so it adds little latency.</li>
+  <li><strong>Local sparsity tricks.</strong> PowerInfer exploits the fact that a small set of "hot" neurons is active for most tokens: it keeps them on the GPU and computes the rarely active "cold" neurons on the CPU, to run large models on consumer hardware.</li>
+</ul>
+
+<h2 id="current">6. Staying current: a method</h2>
+<p>Engine releases arrive every few weeks, and defaults change (you have seen several in this Part). A sustainable method:</p>
+<ol>
+  <li><strong>Pin versions</strong> in production and in your notes (chapter 1.6). Never debug against "latest".</li>
+  <li><strong>Read release notes</strong> of the engines you run, for: changed defaults, new flags, deprecated flags, and new metrics names.</li>
+  <li><strong>Follow summaries.</strong> vLLM Daily publishes automated summaries of the day's merged changes; community newsletters (for example InferenceOps) cover vLLM, llm-d, KServe and the Kubernetes Gateway API Inference Extension together.</li>
+  <li><strong>Check hardware plugins</strong> if you run non-NVIDIA hardware: vLLM uses a plugin architecture for platforms such as Intel Gaudi, and each plugin has its own feature list and version lag.</li>
+  <li><strong>Re-benchmark after upgrades</strong> on your own workload (chapter 6.1). Performance can move in either direction.</li>
+</ol>
+<p>The commercial side moves too. Companies now offer managed deployments built on the open engines, some founded by engine maintainers (for example Inferact around vLLM). Knowing who maintains what helps when you need support for a new model or a bug fix.</p>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Unified autoregressive and diffusion models</span>
+  <p>Some models use one transformer for both text generation and image generation (for example Transfusion-style and Bagel-style designs), and some adapt autoregressive language models for parallel, diffusion-like decoding (block diffusion, chapter 2.7). Serving them needs schedulers that handle both kinds of step in one engine, which is part of why vLLM-Omni and SGLang Diffusion share code with their LLM engines.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Video is a long-context problem</span>
+  <p>A few seconds of video at moderate resolution becomes tens of thousands of latent tokens per denoiser pass. Attention cost (quadratic in tokens) dominates, so video serving leans on sequence parallelism, sparse or windowed attention and step caching, much as long-context LLM serving does.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Speech: latency per chunk</span>
+  <p>Real-time voice systems chain speech recognition, an LLM and speech synthesis, and users notice delays above a few hundred milliseconds. Each stage must stream: start producing output before the input is complete. That turns TTFT into the dominant metric for every stage.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Sizing a VLM deployment from text prompt lengths and ignoring image tokens.</li>
+  <li>Expecting LLM-style batching gains from diffusion models, which are already compute-bound per image.</li>
+  <li>Serving a new model with generic flags instead of its recipe, then reporting bad quality or broken tool calls.</li>
+  <li>Upgrading an engine and assuming last month's tuning still holds.</li>
+  <li>Treating every stage of a multimodal pipeline as one unit for scaling.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p><strong>Goal:</strong> measure what images cost a VLM, and what steps cost a diffusion model. Predict before each run.</p>
+<h3>Part A: image tokens in a VLM (T4)</h3>
+<pre># Terminal or background process:
+# vllm serve Qwen/Qwen2.5-VL-3B-Instruct --dtype half --max-model-len 8192 --limit-mm-per-prompt '{"image": 1}'
+import base64, io, time, requests
+from PIL import Image
+def ask(size):
+    img = Image.new("RGB", (size, size), (120, 160, 200))
+    buf = io.BytesIO(); img.save(buf, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    body = {"model": "Qwen/Qwen2.5-VL-3B-Instruct", "max_tokens": 1,
+            "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}},
+                                                      {"type": "text", "text": "Describe the image."}]}]}
+    t = time.perf_counter(); r = requests.post("http://localhost:8000/v1/chat/completions", json=body).json()
+    return r["usage"]["prompt_tokens"], time.perf_counter() - t
+for s in [224, 448, 896, 1344]:
+    n, dt = ask(s)
+    print(f"{s}x{s}: {n} prompt tokens, {dt*1000:.0f} ms to first token (1 output token)")</pre>
+<p>Predict first: if one token covers about 28 × 28 pixels, how many tokens should a 896 × 896 image add? How should TTFT grow with resolution? Compare your numbers with the prediction. (If the model's processor resizes images to a limit, the largest sizes will stop growing; find that limit.)</p>
+<h3>Part B: diffusion steps (T4)</h3>
+<pre>import torch, time
+from diffusers import AutoPipelineForText2Image
+pipe = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", torch_dtype=torch.float16, variant="fp16").to("cuda")
+prompt = "a small robot reading a book in a library, watercolor"
+pipe(prompt, num_inference_steps=1, guidance_scale=0.0)          # warm-up
+for steps in [1, 2, 4]:
+    torch.cuda.synchronize(); t = time.perf_counter()
+    image = pipe(prompt, num_inference_steps=steps, guidance_scale=0.0).images[0]
+    torch.cuda.synchronize(); print(f"{steps} steps: {time.perf_counter() - t:.2f} s")
+    image.save(f"robot_{steps}.png")</pre>
+<p>SD-Turbo is a step-distilled model designed for 1 to 4 steps, without classifier-free guidance (hence <code>guidance_scale=0.0</code>). Predict: does time grow linearly with steps? What part of the time does not depend on steps? Look at the images: does quality improve with more steps for this model?</p>
+<h3>Part C: read a recipe</h3>
+<p>Pick a model released in the last three months. Find its serving recipe in the vLLM or SGLang documentation. List: the flags it needs beyond the defaults, the parsers it uses, the recommended maximum length, the parallelism it assumes, and any features marked as not yet supported. Estimate its memory footprint with chapters 1.3 and 2.4 and check it against the recipe's GPU count.</p>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">How the ecosystem is used</span>
+  <ul>
+    <li><strong>Document and screenshot understanding</strong> runs on VLMs, and image tokens are often the largest part of the prompt.</li>
+    <li><strong>Image and video products</strong> serve diffusion models with step-distilled variants, caching and multi-GPU parallelism to reach acceptable latency.</li>
+    <li><strong>Model launches</strong> ship with engine recipes on day one; platform teams adopt them and then tune.</li>
+    <li><strong>Platform teams</strong> track engine releases and community newsletters as part of normal operations.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz37"></div>
+<script type="application/json" id="qz37">[
+{"q":"Why do high-resolution images raise a VLM's TTFT?","o":["They slow tokenization","They become many more image tokens to encode and prefill","They change the sampler","They disable the KV cache"],"a":1,"e":"Token count grows with resolution, and prefill cost grows with tokens."},
+{"q":"Why must prefix caches hash images, not just tokens?","o":["Images are large","Image placeholder tokens are identical for every image, so the token IDs alone cannot tell images apart","Hashing is faster","They need it for sampling"],"a":1,"e":"Media hashes are part of the cache key."},
+{"q":"A diffusion denoiser step is usually:","o":["Memory-bound like decode","Compute-bound, like a large prefill","Free","Bound by tokenization"],"a":1,"e":"Each step processes thousands of latent tokens in one pass."},
+{"q":"Halving the number of denoising steps roughly:","o":["Doubles latency","Halves denoiser time","Has no effect","Halves memory"],"a":1,"e":"Denoiser time is proportional to steps."},
+{"q":"Classifier-free guidance doubles work per step because:","o":["It uses FP32","It runs the denoiser twice per step, with and without the prompt condition","It doubles resolution","It adds a VAE pass"],"a":1,"e":"Guidance-distilled models avoid the second pass."},
+{"q":"Before serving a brand-new flagship model, the first thing to read is:","o":["The tokenizer source code","The engine's serving recipe for that model","Last year's benchmarks","The GPU data sheet"],"a":1,"e":"Recipes list the flags, parsers and limits the model needs."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>VLMs turn images into many tokens through a vision encoder; resolution sets prefill cost and KV memory; caches need media hashes.</li>
+  <li>Omni pipelines chain encoders, language models and diffusion or audio decoders; plan and scale each stage.</li>
+  <li>Diffusion serving is dominated by repeated, compute-bound denoiser passes; reduce steps, cache between steps, and parallelize guidance and sequence.</li>
+  <li>New models need their recipes: tokenizer modes, parsers, limits and parallelism.</li>
+  <li>Proxies and guardrails extend serving without changing the engine.</li>
+  <li>Pin versions, read release notes and summaries, and re-benchmark after upgrades.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://blog.vllm.ai/2025/11/30/vllm-omni.html">vLLM blog: Announcing vLLM-Omni</a> and <a href="https://github.com/vllm-project/vllm-omni">vLLM-Omni</a></td><td>Kept from triage: omni-modality pipelines and diffusion transformers in vLLM.</td></tr>
+<tr><td><a href="https://lmsys.org/blog/2025-11-07-sglang-diffusion/">LMSYS: SGLang Diffusion</a></td><td>Kept from triage: image and video serving with guidance and sequence parallelism, and reported speed-ups.</td></tr>
+<tr><td><a href="https://a-r-r-o-w.github.io/blog/3_blossom/00001_productionizing_diffusion-1/">Productionizing diffusion models, part 1</a></td><td>Kept from triage: the FLUX.1-dev pipeline, its baseline latency and where time goes.</td></tr>
+<tr><td><a href="https://github.com/cornserve-ai/cornserve">Cornserve</a></td><td>Kept from triage: multimodal serving as a graph of separately scaled components.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/projects/recipes/en/latest/DeepSeek/DeepSeek-V3_2.html">vLLM recipe: DeepSeek-V3.2</a> and <a href="https://docs.vllm.ai/projects/recipes/en/latest/MiMo/MiMo-V2-Flash.html">MiMo-V2-Flash</a></td><td>Kept from triage: what model-specific recipes contain.</td></tr>
+<tr><td><a href="https://blog.vllm.ai/2025/12/15/run-nvidia-nemotron-3-nano.html">vLLM blog: Nemotron 3 Nano on vLLM</a></td><td>Kept from triage: a hybrid Mamba-Transformer MoE with 1M context and NVFP4.</td></tr>
+<tr><td><a href="https://blog.vllm.ai/2025/12/14/halugate.html">vLLM blog: HaluGate</a></td><td>Kept from triage: token-level hallucination detection in the request path.</td></tr>
+<tr><td><a href="https://github.com/algorithmicsuperintelligence/optillm">optillm</a> and <a href="https://github.com/SJTU-IPADS/PowerInfer">PowerInfer</a></td><td>Kept from triage: an inference-time optimizing proxy, and hot/cold neuron offloading for local serving.</td></tr>
+<tr><td><a href="https://github.com/vllm-project/vllm-daily">vLLM Daily</a> and <a href="https://inferenceops.substack.com/p/state-of-the-model-serving-communities-ea6">InferenceOps: State of the model serving communities</a></td><td>Kept from triage: ways to follow engine and community changes.</td></tr>
+<tr><td><a href="http://vllm-gaudi.readthedocs.io/">vLLM Hardware Plugin for Intel Gaudi</a></td><td>Kept from triage: how non-NVIDIA hardware plugs into vLLM.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, chapter 6</td><td>Inference for other modalities: VLMs, speech and image and video generation.</td></tr>
+<tr><td>Chi Wang and Peiheng Hu, <em>Hands-On LLM Serving and Optimization</em>, chapter 10</td><td>Emerging directions: multimodal serving, multi-LoRA at scale and edge deployment.</td></tr>
+</table></div>
+<h3>Triaged out</h3>
+<div class="tbl"><table>
+<tr><th>Source</th><th>Reason</th></tr>
+<tr><td>vLLM v0.12.0 and vLLM-Omni v0.12.0rc1 release pages</td><td>Superseded by later releases; read the current release notes instead (section 6).</td></tr>
+<tr><td>vLLM-Omni diffusion acceleration page</td><td>The page had moved (not found) when checked.</td></tr>
+<tr><td>SGLang block diffusion (dLLM) RFC</td><td>A design proposal; block diffusion is covered in chapter 2.7.</td></tr>
+<tr><td>Inferact</td><td>A company page; mentioned in section 6 for context only.</td></tr>
+</table></div>
+<p class="note">Facts checked on 6 November 2026. Model recipes and engine features change quickly; check the current pages.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$}=IE;
+function df(){const R=+$('dfR').value,S=+$('dfS').value,C=+$('dfC').value,G=+$('dfG').value*1e12,E=+$('dfE').value,N=+$('dfN').value;
+  const P=12e9,L=57,D=3072,text=512;const lat=R/8;const img=(lat/2)*(lat/2);const T=img+text;
+  const lin=2*P*T,att=4*T*T*D*L;const pass=lin+att;const total=pass*S*C;const t=total/(G*E*N);
+  $('dfStats').innerHTML=[['Latent image tokens',IE.int(img)],['FLOPs per pass',(pass/1e12).toFixed(0)+' T'],['Attention share',(att/pass*100).toFixed(0)+'%'],['Total FLOPs per image',(total/1e15).toFixed(2)+' P'],['Estimated denoiser time',t.toFixed(2)+' s'],['Images per GPU-hour',IE.int(3600/(t*N))]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['dfR','dfS','dfC','dfG','dfE','dfN'].forEach(id=>$(id).addEventListener('input',df));df();
+})();
+</script>

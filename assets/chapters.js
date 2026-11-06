@@ -137,7 +137,7 @@ window.IE_CHAPTERS = [
 "title": "Expert depth: the serving ecosystem, multimodal and diffusion serving",
 "slug": "3-7-serving-ecosystem",
 "part": 3,
-"ready": false
+"ready": true
 },
 {
 "n": "4.1",
