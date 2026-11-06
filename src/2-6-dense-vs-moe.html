@@ -1,0 +1,326 @@
+<div class="kicker">Part 2 · Transformers and LLM inference mechanics · Chapter 2.6</div>
+<h1>Dense vs mixture-of-experts models</h1>
+<p class="lede">Most of the largest open models today are mixture-of-experts (MoE) models. They hold hundreds of billions of parameters but use only a small share of them for each token. That split, total parameters for memory and active parameters for compute, changes every estimate from chapter 2.5. This chapter shows how MoE layers work and what they cost to serve.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 1.5, 2.2, 2.4, 2.5</span>
+  <span class="chip">Compute: Colab CPU or T4</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>DeepSeek-V3 has 671B parameters and 37B active. How much memory do its weights need in FP8, and how many FLOPs per token?</li>
+    <li>Why does an MoE model read almost all of its weights each decode step on a busy server, even though each token uses only a few experts?</li>
+    <li>Does MoE make the KV cache smaller?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>About 671 GB of weights (1 byte each) and about 2 × 37 × 10⁹ = 74 GFLOPs per token.</li>
+    <li>Different tokens in the batch pick different experts. With enough tokens, nearly every expert is picked by at least one token, so every expert's weights must be read.</li>
+    <li>No. Experts replace the MLP. The KV cache depends only on attention: layers, KV heads, head size and type.</li>
+  </ol></details>
+</div>
+
+<h2 id="problem">1. The problem: more knowledge costs more compute</h2>
+<p>Bigger models know more and reason better. But in a dense model (every model so far in this book), every parameter takes part in every token, so FLOPs per token = 2 × parameters (chapter 1.1). Doubling the parameters doubles the cost of every token.</p>
+<p>The MLP blocks hold most of the parameters (about two thirds in Llama 3.1 8B). They work on each token separately (chapter 2.2). So here is the idea: replace one big MLP with many smaller MLPs, called <strong>experts</strong>, and send each token to only a few of them. The model keeps the knowledge of all experts, but each token pays for only the ones it uses.</p>
+
+<h2 id="layer">2. How an MoE layer works</h2>
+<p>An MoE layer replaces the MLP inside a transformer block. Attention is unchanged.</p>
+<ol>
+  <li><strong>Route.</strong> A small linear layer, the <strong>router</strong> (or gate), maps each token's vector (size D) to one score per expert (E scores).</li>
+  <li><strong>Select.</strong> Keep the top k scores. Common values: E = 8 to 256 experts, k = 1 to 8.</li>
+  <li><strong>Weight.</strong> Turn the selected scores into weights with a softmax (or a similar normalization).</li>
+  <li><strong>Compute.</strong> Run the token through only its k chosen experts. Each expert is a normal gated MLP, usually much narrower than a dense model's MLP.</li>
+  <li><strong>Combine.</strong> The layer output is the weighted sum of the k expert outputs.</li>
+</ol>
+<div class="formula">MoE(x) = Σ over chosen experts i of  w_i(x) × Expert_i(x)</div>
+<p>Many recent designs add one or more <strong>shared experts</strong> that every token always uses, plus the routed ones. Some keep the first few layers dense. DeepSeek-V3, for example, has 1 shared and 256 routed experts per MoE layer, picks 8 routed experts per token, and keeps its first 3 layers dense.</p>
+
+<div class="widget" id="rtW">
+  <div class="wt">Interactive: routing a batch of tokens</div>
+  <div class="ws">Each row is a token; each column is an expert in one MoE layer. Filled cells show the top-k experts the router picked (random scores here, for illustration). The bottom row counts how many tokens each expert got. Watch how many experts get at least one token as the batch grows.</div>
+  <div class="ctrls">
+    <label>Experts E <select id="rtE"><option>8</option><option>32</option><option selected>64</option><option>128</option></select></label>
+    <label>Top-k <select id="rtK"><option>1</option><option selected>2</option><option>4</option><option>8</option></select></label>
+    <label>Tokens in batch: <span class="mono" id="rtBv"></span><input type="range" id="rtB" min="1" max="48" value="8"></label>
+    <label>Router skew: <span class="mono" id="rtSv"></span><input type="range" id="rtS" min="0" max="3" step="0.25" value="0"></label>
+    <button id="rtNew">New scores</button>
+  </div>
+  <div class="svgwrap"><svg id="rtSvg" role="img" aria-label="Token to expert routing grid"></svg></div>
+  <div class="stats" id="rtStats"></div>
+</div>
+
+<h2 id="params">3. Total parameters and active parameters</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Total parameters:</strong> every weight in the model, including all experts. Sets <em>memory</em>.</p>
+  <p><strong>Active parameters:</strong> the weights one token actually uses: attention, embeddings and output head, shared experts, and k routed experts per layer. Sets <em>FLOPs per token</em>.</p>
+</div>
+<p>Model names often show both: Qwen3-30B-A3B has about 30.5 B total and 3.3 B active. You can recompute both from the config:</p>
+<div class="box ex">
+  <span class="lbl">Worked example: Qwen3-30B-A3B</span>
+  <p>Config: 48 layers, hidden size 2,048, 128 experts per layer, 8 active, expert MLP size 768, 32 query heads and 4 KV heads of size 128, vocabulary 151,936, untied embeddings.</p>
+  <ul>
+    <li>One expert (gate, up and down): 3 × 2,048 × 768 = 4.72 M. All experts: 128 × 4.72 M × 48 layers = 29.0 B.</li>
+    <li>Attention per layer: Q 2,048 × 4,096 + K and V 2 × 2,048 × 512 + O 4,096 × 2,048 = 18.9 M. × 48 = 0.91 B.</li>
+    <li>Embeddings and output head: 2 × 151,936 × 2,048 = 0.62 B. Routers: about 0.01 B.</li>
+    <li><strong>Total</strong> ≈ 29.0 + 0.91 + 0.62 + 0.01 ≈ 30.5 B.</li>
+    <li><strong>Active</strong> ≈ 8 experts × 4.72 M × 48 (1.81 B) + attention (0.91 B) + embeddings and head (0.62 B) ≈ 3.3 B.</li>
+  </ul>
+  <p>So the weights need about 61 GB in BF16, like a dense 30B model, but each token costs about 6.7 GFLOPs, like a dense 3B model.</p>
+</div>
+<div class="tbl"><table>
+<tr><th>Model</th><th class="n">Total</th><th class="n">Active</th><th class="n">Experts (routed, active)</th><th class="n">BF16 weights</th></tr>
+<tr><td>Llama 3.1 70B (dense)</td><td class="n">70.6 B</td><td class="n">70.6 B</td><td class="n">n/a</td><td class="n">141 GB</td></tr>
+<tr><td>Mixtral 8x7B</td><td class="n">46.7 B</td><td class="n">12.9 B</td><td class="n">8, 2</td><td class="n">93 GB</td></tr>
+<tr><td>Qwen3-30B-A3B</td><td class="n">30.5 B</td><td class="n">3.3 B</td><td class="n">128, 8</td><td class="n">61 GB</td></tr>
+<tr><td>Qwen3-235B-A22B</td><td class="n">235 B</td><td class="n">22 B</td><td class="n">128, 8</td><td class="n">470 GB</td></tr>
+<tr><td>DeepSeek-V3</td><td class="n">671 B</td><td class="n">37 B</td><td class="n">256 (+1 shared), 8</td><td class="n">1,342 GB (ships in FP8: 671 GB)</td></tr>
+<tr><td>Granite 3.0 1B-A400M</td><td class="n">1.33 B</td><td class="n">about 0.4 B</td><td class="n">32, 8</td><td class="n">2.7 GB</td></tr>
+</table></div>
+<p class="note">Totals and active counts from the model cards and configs.</p>
+
+<h2 id="memory">4. Memory follows total parameters</h2>
+<p>Every expert must be in GPU memory (or reachable quickly), because any token may pick any expert. So the memory estimate of chapter 1.3 uses <em>total</em> parameters. A 235B MoE needs as much memory for weights as a 235B dense model.</p>
+<p>The KV cache is unchanged by experts: it depends on attention only (chapter 2.4). MoE models often have small attention blocks for their size, so their cache per token can be modest. Qwen3-30B-A3B stores 98,304 bytes per token in BF16, less than Llama 3.1 8B's 131,072.</p>
+
+<h2 id="compute">5. Compute follows active parameters</h2>
+<p>FLOPs per token = 2 × active parameters. In prefill, which is compute-bound (chapter 2.5), an MoE runs at roughly the speed of a dense model of its active size, if the experts are evenly loaded and the kernels are efficient. Qwen3-30B-A3B prefill needs about 2 × 3.3 B × T FLOPs: about 9 times fewer than a dense 30B.</p>
+
+<h2 id="decode">6. Decode: the subtle part</h2>
+<p>Decode is memory-bound, so its time follows <em>bytes read</em>, not FLOPs. Which expert weights must be read in one step depends on the batch:</p>
+<ul>
+  <li><strong>Batch 1:</strong> one token picks k experts per layer. Only those are read, plus attention and the head. Bytes ≈ active parameters × b. Fast, like a dense model of the active size.</li>
+  <li><strong>Large batch:</strong> each token picks its own k experts. The union quickly covers almost every expert. Bytes ≈ total parameters × b. Each step now reads as much as a dense model of the total size, but does far fewer FLOPs.</li>
+</ul>
+<p>If each of B tokens picks k of E experts at random, the expected number of distinct experts read per layer is:</p>
+<div class="formula">experts read ≈ E × ( 1 − (1 − k/E)^B )</div>
+<p>For Qwen3-30B-A3B (E = 128, k = 8): about 8 at batch 1, 82 at batch 16, and 126 (almost all) at batch 64. Real routers are not uniform, which changes the curve somewhat, but the shape holds.</p>
+<p>There is a second effect. Each expert sees only about B × k / E of the batch's tokens. Its matmul therefore has a small "batch", so its arithmetic intensity is low. To make expert matmuls compute-bound, the whole batch must be about E / k times larger than for a dense model: 16 times for Qwen3-30B-A3B. MoE models need large batches to use a GPU efficiently.</p>
+
+<div class="widget" id="mdW">
+  <div class="wt">Interactive: decode step for dense vs MoE</div>
+  <div class="ws">Bytes read per decode step and the memory-bound step time, comparing an MoE with a dense model of the same total size and a dense model of the same active size. BF16 weights, uniform routing, weight bytes only (add the KV cache with chapter 2.4).</div>
+  <div class="ctrls">
+    <label>MoE <select id="mdM">
+      <option value="30.5,3.3,128,8,0.049">Qwen3-30B-A3B</option>
+      <option value="235,22,128,8,0.034">Qwen3-235B-A22B</option>
+      <option value="46.7,12.9,8,2,0.034">Mixtral 8x7B</option>
+      <option value="671,37,256,8,0.026">DeepSeek-V3 (BF16 view)</option>
+    </select></label>
+    <label>GPU bandwidth (TB/s, total) <select id="mdBW"><option value="3.35">3.35 (1 × H100)</option><option value="13.4">13.4 (4 × H100)</option><option value="26.8" selected>26.8 (8 × H100)</option><option value="64">64 (8 × B200)</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="mdSvg" viewBox="0 0 680 280" width="680" style="max-width:100%;height:auto" role="img" aria-label="Weight bytes read per decode step against batch size"></svg></div>
+  <div class="legend"><span><i style="background:var(--kv)"></i>MoE</span><span><i style="background:var(--bad)"></i>Dense, same total</span><span><i style="background:var(--pre)"></i>Dense, same active</span></div>
+  <div class="stats" id="mdStats"></div>
+  <p class="note">The last number in each option is the share of the model that is not routed experts (attention, embeddings, shared experts). It is read every step.</p>
+</div>
+
+<h2 id="rule">7. A rule of thumb</h2>
+<p>Putting it together:</p>
+<ul>
+  <li>An MoE is <strong>cheaper</strong> to serve than a dense model with the same <em>total</em> parameters: far fewer FLOPs, often a smaller attention block, and fewer layers for its size.</li>
+  <li>An MoE is <strong>more expensive</strong> to serve than a dense model with the same <em>active</em> parameters: much more memory, and at real batch sizes much more weight traffic.</li>
+</ul>
+<p>One published analysis puts it this way: for short-context decoding, an 8-way sparse model (8 times more total than active parameters) has roughly the economics of a dense model of about half its total size. Treat this as an order-of-magnitude guide, not a law.</p>
+<p>Where MoE shines:</p>
+<ul>
+  <li><strong>Prefill-heavy and high-throughput work</strong> at large batch, where compute matters and the GPUs are kept full.</li>
+  <li><strong>Single-user local inference</strong> with enough memory: batch 1 reads only the active weights, so a 30B-A3B model can generate quickly on a laptop with enough RAM.</li>
+  <li><strong>Large multi-GPU deployments</strong> with expert parallelism (next section).</li>
+</ul>
+
+<h2 id="serving">8. Serving MoE models</h2>
+<ul>
+  <li><strong>Fused MoE kernels.</strong> Engines group tokens by expert and run all experts in one "grouped GEMM" kernel instead of a loop over experts.</li>
+  <li><strong>Expert parallelism (EP).</strong> Instead of splitting every expert across GPUs, place whole experts on different GPUs. Each token's vector is sent to the GPUs holding its chosen experts and back again: an all-to-all exchange in every MoE layer. Chapter 4.5 covers this.</li>
+  <li><strong>Load imbalance.</strong> If many tokens pick the same expert, that GPU becomes the bottleneck. Training adds balancing losses; serving systems can replicate popular experts on extra GPUs.</li>
+  <li><strong>Memory first.</strong> Choose the deployment by total memory: 8 × 80 GB for many 200B to 700B models, or fewer GPUs with FP8 or 4-bit weights.</li>
+</ul>
+
+<h2 id="expert">9. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Fine-grained and shared experts</span>
+  <p>Early MoEs used a few large experts (Mixtral: 8 experts, 2 active). Newer ones use many small experts (128 to 256, 8 active) plus shared experts. Many small experts give the router more combinations to choose from, and the shared expert captures knowledge every token needs, so routed experts can specialize.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Load balancing without an auxiliary loss</span>
+  <p>DeepSeek-V3 balances expert load by adding a per-expert bias to the routing scores, adjusted during training, instead of the usual extra balancing loss. At serving time, DeepSeek also published an expert-parallel load balancer (EPLB) that replicates heavily used experts and places them across GPUs.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Expert offloading for local inference</span>
+  <p>Because a single user touches only k experts per layer per token, local runtimes can keep attention and shared weights on a small GPU and stream or compute expert weights from CPU memory. This makes large MoEs usable on consumer hardware at modest speed, and is a common use of llama.cpp (chapter 3.6).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Routing and determinism</span>
+  <p>Routing is a discrete choice. Tiny numeric differences (chapter 1.2, determinism) can flip which expert a token goes to, which changes later tokens more than a small numeric error in a dense layer would. Reinforcement-learning pipelines that need the training and serving engines to agree sometimes record the routing decisions made during generation and replay them.</p>
+</div>
+
+<h2 id="mistakes">10. Common mistakes</h2>
+<ul>
+  <li>Sizing GPU memory from active parameters. Memory follows total parameters.</li>
+  <li>Expecting batch-1 decode speed at large batch. The union of experts grows with batch.</li>
+  <li>Saying "22B parameters are active per request". They are active per <em>token</em>; a single request touches many different experts across its tokens.</li>
+  <li>Assuming MoE shrinks the KV cache. Experts live in the MLP; the cache depends on attention.</li>
+  <li>Comparing an MoE with a dense model by active parameters alone when judging serving cost.</li>
+</ul>
+
+<h2 id="lab">11. Lab</h2>
+<p><strong>Goal:</strong> count total and active parameters from configs, build an MoE layer, and watch a real router.</p>
+<h3>Part A: count from configs (no download of weights)</h3>
+<pre>from transformers import AutoConfig
+def moe_counts(name):
+    c = AutoConfig.from_pretrained(name)
+    D, L, V = c.hidden_size, c.num_hidden_layers, c.vocab_size
+    hd = getattr(c, "head_dim", None) or D // c.num_attention_heads
+    attn = D * c.num_attention_heads * hd * 2 + 2 * D * c.num_key_value_heads * hd       # q, o, k, v
+    E = getattr(c, "num_experts", None) or getattr(c, "num_local_experts", None)
+    k, F = c.num_experts_per_tok, getattr(c, "moe_intermediate_size", None) or c.intermediate_size
+    expert = 3 * D * F
+    emb = V * D * (1 if c.tie_word_embeddings else 2)
+    total = L * (attn + E * expert + D * E) + emb
+    active = L * (attn + k * expert) + emb
+    print(f"{name}: E={E} k={k}  total={total/1e9:.2f} B  active={active/1e9:.2f} B  ratio={total/active:.1f}x")
+
+moe_counts("Qwen/Qwen3-30B-A3B")                       # expect about 30.5 B and 3.3 B
+moe_counts("ibm-granite/granite-3.0-1b-a400m-instruct")  # expect about 1.33 B and 0.43 B</pre>
+<p>Compare your numbers with the model cards. Where does the small remaining gap come from?</p>
+<h3>Part B: an MoE layer from scratch</h3>
+<pre>import torch, torch.nn as nn, torch.nn.functional as F
+torch.manual_seed(0)
+class Expert(nn.Module):
+    def __init__(s, D, Fd):
+        super().__init__(); s.g, s.u, s.d = nn.Linear(D, Fd, bias=False), nn.Linear(D, Fd, bias=False), nn.Linear(Fd, D, bias=False)
+    def forward(s, x): return s.d(F.silu(s.g(x)) * s.u(x))
+
+class MoE(nn.Module):
+    def __init__(s, D=64, Fd=128, E=8, k=2):
+        super().__init__(); s.k = k
+        s.router = nn.Linear(D, E, bias=False)
+        s.experts = nn.ModuleList(Expert(D, Fd) for _ in range(E))
+    def forward(s, x):                                   # x: [N, D] (tokens flattened)
+        logits = s.router(x)                             # [N, E]
+        w, idx = logits.topk(s.k, dim=-1)                # [N, k] scores and expert ids
+        w = F.softmax(w, dim=-1)
+        out = torch.zeros_like(x)
+        for e, expert in enumerate(s.experts):           # loop over experts, not tokens
+            tok, slot = (idx == e).nonzero(as_tuple=True)
+            if tok.numel():
+                # TODO: run expert on x[tok], scale by w[tok, slot], and add into out[tok]
+                ...
+        return out, idx
+
+moe = MoE()
+x = torch.randn(16, 64)
+y, idx = moe(x)
+print(y.shape, torch.bincount(idx.flatten(), minlength=8))   # tokens per expert</pre>
+<details><summary>Solution</summary><pre>                out.index_add_(0, tok, expert(x[tok]) * w[tok, slot, None])</pre>
+<p>Looping over experts and gathering their tokens is the idea behind fused MoE kernels: each expert does one matmul on its own group of tokens.</p></details>
+<p>Then check: run each token one at a time through only its two experts with a plain loop, and confirm you get the same <code>y</code>.</p>
+<h3>Part C: watch a real router</h3>
+<pre>from transformers import AutoModelForCausalLM, AutoTokenizer
+name = "ibm-granite/granite-3.0-1b-a400m-instruct"      # 1.3 B total: runs on a CPU
+tok = AutoTokenizer.from_pretrained(name)
+m = AutoModelForCausalLM.from_pretrained(name).eval()
+texts = {"english": "The history of the Roman Empire spans many centuries.",
+         "code": "def fibonacci(n):\n    return n if n < 2 else fibonacci(n-1) + fibonacci(n-2)",
+         "math": "Solve 3x + 7 = 22 for x. Subtract 7, then divide by 3."}
+k = m.config.num_experts_per_tok
+for label, t in texts.items():
+    ids = tok(t, return_tensors="pt")
+    with torch.inference_mode():
+        rl = m(**ids, output_router_logits=True).router_logits    # one [tokens, experts] per layer
+    layer = 12
+    chosen = rl[layer].topk(k, dim=-1).indices.flatten()
+    counts = torch.bincount(chosen, minlength=m.config.num_local_experts)
+    print(f"{label:8s} layer {layer}: experts used {int((counts > 0).sum())}/{len(counts)}  busiest {counts.topk(3).indices.tolist()}")</pre>
+<p>Questions: do code and English favour different experts in this layer? How many distinct experts does one short sentence touch? Relate your answer to the formula in section 6.</p>
+<h3>Part D: the curriculum comparison</h3>
+<p>Use the widgets and Part A to fill this table for Llama 3.1 70B (dense) and Qwen3-235B-A22B (MoE), which have broadly comparable quality on many benchmarks: weight memory in BF16, FLOPs per token, weight bytes read per decode step at batch 1 and at batch 64, and KV bytes per token (Qwen3-235B-A22B: 94 layers, 4 KV heads, head size 128). Which would you choose for a chat service on 8 × H100, and why?</p>
+
+<h2 id="realworld">12. In the real world</h2>
+<div class="box real">
+  <span class="lbl">MoE in production</span>
+  <ul>
+    <li><strong>Frontier open models</strong> released in 2025 and 2026 are mostly MoE (DeepSeek, Qwen3 MoE, gpt-oss, Kimi, GLM and others).</li>
+    <li><strong>Serving engines</strong> (vLLM, SGLang, TensorRT-LLM) ship fused MoE kernels and expert-parallel modes. Large deployments combine expert parallelism with data parallelism for attention.</li>
+    <li><strong>Pricing:</strong> API prices for MoE models usually track active parameters for compute and total parameters for the hardware footprint, so large sparse models can be priced close to much smaller dense ones.</li>
+    <li><strong>Local use:</strong> small-active MoEs are popular on laptops and workstations, because batch-1 decode reads only active weights.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">13. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz26"></div>
+<script type="application/json" id="qz26">[
+{"q":"What does the router in an MoE layer output for each token?","o":["The next token","One score per expert","A KV cache entry","A new embedding"],"a":1,"e":"The router maps the token vector to E scores; the top k pick the experts."},
+{"q":"A 120B-total, 5B-active MoE in BF16 needs about how much weight memory?","o":["10 GB","240 GB","120 GB","5 GB"],"a":1,"e":"Memory follows total parameters: 120 × 10⁹ × 2 bytes."},
+{"q":"Its FLOPs per token are about:","o":["240 GFLOP","10 GFLOP","120 GFLOP","5 TFLOP"],"a":1,"e":"2 × active parameters = 2 × 5 B."},
+{"q":"With E = 64 experts, k = 4 and a batch of 64 tokens, about how many experts per layer are read in one decode step (uniform routing)?","o":["4","About 64 × (1 − (60/64)^64) ≈ 63","256","16"],"a":1,"e":"(1 − 1/16)^64 ≈ 0.016, so almost all experts are touched."},
+{"q":"Compared with a dense model of the same active size, an MoE at large batch is usually:","o":["Cheaper","More expensive: more memory and more weight traffic","Identical","Unable to batch"],"a":1,"e":"It reads close to all its weights per step and needs far more memory."},
+{"q":"MoE experts replace which part of the transformer block?","o":["Attention","The MLP (feed-forward) block","The embedding table","RMSNorm"],"a":1,"e":"Attention, and so the KV cache, is unchanged."},
+{"q":"Why do MoE models need larger batches to be compute-bound?","o":["The router is slow","Each expert sees only about B × k / E of the tokens, so each expert matmul has a small batch","They have more layers","Their KV cache is larger"],"a":1,"e":"Expert matmuls reach high intensity only when each expert gets enough tokens."}
+]</script>
+
+<h2 id="summary">14. Summary</h2>
+<ul>
+  <li>An MoE layer replaces the MLP with E experts; a router sends each token to its top k, and their outputs are combined by weight.</li>
+  <li>Total parameters set memory; active parameters set FLOPs per token.</li>
+  <li>Decode at batch 1 reads only active weights; at real batch sizes nearly all experts are read: distinct experts ≈ E(1 − (1 − k/E)^B).</li>
+  <li>Expert matmuls need about E/k times larger batches to become compute-bound.</li>
+  <li>The KV cache is unaffected by experts.</li>
+  <li>MoE is cheaper than dense of the same total size, and dearer than dense of the same active size.</li>
+</ul>
+
+<h2 id="refs">15. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://epoch.ai/gradient-updates/moe-vs-dense-models-inference">Epoch AI: MoE vs dense models in inference</a></td><td>The economics: active parameters, depth, communication and attention size, and the "half its size" rule of thumb.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 2.2.4</td><td>MoE basics, routing per layer and per token, and why batched serving activates almost all experts.</td></tr>
+<tr><td><a href="https://jax-ml.github.io/scaling-book/inference/">How to Scale Your Model: inference</a> (Google DeepMind)</td><td>Critical batch size for MoE and expert-parallel serving costs.</td></tr>
+<tr><td>Fuheng Wu, <em>Distributed AI Systems</em>, chapter 11</td><td>MoE trends and their effect on distributed serving.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, chapters 14 to 16</td><td>Expert parallelism, MoE communication and serving MoE models at scale.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI, DeepSeek-V3 Technical Report</a></td><td>Fine-grained and shared experts, auxiliary-loss-free balancing, and the 671B / 37B design.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2401.04088">Jiang et al., Mixtral of Experts</a></td><td>The 8-expert, top-2 design that popularized open MoE models.</td></tr>
+<tr><td>Model configs on Hugging Face (Qwen3-30B-A3B, DeepSeek-V3, Granite 3.0 1B-A400M)</td><td>The numbers in the worked example and lab.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The book's example says "22 billion parameters out of 235 billion are activated per request". As section 10 notes, the count is per token; a request touches many different experts over its tokens.</li>
+</ul>
+<p class="note">Facts checked on 6 November 2026.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+let seed=1;const rnd=()=>{seed=(seed*16807)%2147483647;return (seed-1)/2147483646;};
+let S=[];
+function newScores(){seed=Math.floor(Math.random()*1e9)+1;S=[...Array(48)].map(()=>[...Array(128)].map(()=>{const u=rnd(),v=rnd();return Math.sqrt(-2*Math.log(u+1e-9))*Math.cos(2*Math.PI*v);}));}
+newScores();
+function rt(){const E=+$('rtE').value,k=+$('rtK').value,B=+$('rtB').value,sk=+$('rtS').value;$('rtBv').textContent=B;$('rtSv').textContent=sk.toFixed(2);
+  const cnt=new Array(E).fill(0);const sel=[];for(let i=0;i<B;i++){const sc=S[i].slice(0,E).map((v,j)=>v+sk*(j<E/8?1:0));const o=sc.map((v,j)=>[v,j]).sort((a,b)=>b[0]-a[0]).slice(0,k).map(x=>x[1]);sel.push(o);o.forEach(j=>cnt[j]++);}
+  const c=Math.max(6,Math.min(14,640/E)),rh=Math.max(5,Math.min(12,300/B)),ox=50,oy=20;const s=$('rtSvg');const W=ox+E*c+20,H=oy+B*rh+40;s.setAttribute('viewBox',`0 0 ${W} ${H}`);s.setAttribute('width',W);s.style.maxWidth='100%';s.style.height='auto';s.innerHTML='';
+  el('text',{x:ox,y:12,class:'tick'},s,`experts 0 to ${E-1} →`);
+  sel.forEach((o,i)=>{el('text',{x:ox-6,y:oy+i*rh+rh-1,'text-anchor':'end','font-size':Math.min(10,rh),fill:css('--ink2')},s,i%Math.ceil(B/12)===0?'t'+i:'');o.forEach(j=>el('rect',{x:ox+j*c,y:oy+i*rh,width:c-1,height:rh-1,fill:css('--dec')},s));});
+  el('rect',{x:ox,y:oy,width:E*c,height:B*rh,fill:'none',stroke:css('--line')},s);
+  const mx=Math.max(...cnt,1);cnt.forEach((v,j)=>el('rect',{x:ox+j*c,y:oy+B*rh+6+(1-v/mx)*24,width:c-1,height:v/mx*24,fill:v?css('--kv'):css('--panel2')},s));
+  const used=cnt.filter(v=>v>0).length,exp=E*(1-Math.pow(1-k/E,B));const busiest=Math.max(...cnt),avg=B*k/E;
+  $('rtStats').innerHTML=[['Experts used',`${used} / ${E}`],['Formula (uniform)',exp.toFixed(1)],['Average tokens per used expert',(B*k/Math.max(used,1)).toFixed(1)],['Busiest expert load vs average',(busiest/avg).toFixed(1)+'×']].map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');}
+['rtE','rtK','rtB','rtS'].forEach(id=>$(id).addEventListener('input',rt));$('rtNew').onclick=()=>{newScores();rt();};IE.onTheme(rt);
+function md(){const [T,A,E,k,fix]=$('mdM').value.split(',').map(Number);const bw=+$('mdBW').value*1e12;
+  const routedTotal=T*(1-fix),perExpert=routedTotal/E,fixed=T*fix;
+  const moeB=B=>(fixed+perExpert*E*(1-Math.pow(1-k/E,B)))*1e9*2;const dT=T*1e9*2,dA=A*1e9*2;
+  const Bs=[];for(let e=0;e<=9;e+=0.125)Bs.push(2**e);
+  const s=$('mdSvg');s.innerHTML='';const W=680,H=280,l=70,r=20,t=16,bt=40;const ymax=dT*1.08;
+  const X=B=>l+Math.log2(B)/9*(W-l-r),Y=v=>H-bt-v/ymax*(H-t-bt);
+  for(let i=0;i<=4;i++){el('line',{x1:l,x2:W-r,y1:Y(ymax*i/4),y2:Y(ymax*i/4),class:'axis'},s);el('text',{x:l-6,y:Y(ymax*i/4)+4,'text-anchor':'end',class:'tick'},s,IE.gb(ymax*i/4)+' GB');}
+  [1,4,16,64,256].forEach(B=>el('text',{x:X(B),y:H-bt+16,'text-anchor':'middle',class:'tick'},s,B));
+  el('text',{x:l+(W-l-r)/2,y:H-6,'text-anchor':'middle',class:'tick'},s,'batch (tokens per step, log)');
+  el('line',{x1:l,x2:W-r,y1:Y(dT),y2:Y(dT),stroke:css('--bad'),'stroke-width':2.5},s);el('line',{x1:l,x2:W-r,y1:Y(dA),y2:Y(dA),stroke:css('--pre'),'stroke-width':2.5},s);
+  el('path',{d:Bs.map((B,i)=>(i?'L':'M')+X(B)+' '+Y(moeB(B))).join(' '),fill:'none',stroke:css('--kv'),'stroke-width':3},s);
+  const ms=v=>(v/bw*1e3).toFixed(2)+' ms';
+  $('mdStats').innerHTML=[['MoE step, batch 1',ms(moeB(1))],['MoE step, batch 64',ms(moeB(64))],['Dense same total',ms(dT)],['Dense same active',ms(dA)],['MoE weight memory (BF16)',IE.gb(dT)+' GB']].map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');}
+['mdM','mdBW'].forEach(id=>$(id).addEventListener('input',md));IE.onTheme(md);
+})();
+</script>

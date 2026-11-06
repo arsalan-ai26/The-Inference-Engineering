@@ -81,7 +81,7 @@ window.IE_CHAPTERS = [
 "title": "Dense vs mixture-of-experts models",
 "slug": "2-6-dense-vs-moe",
 "part": 2,
-"ready": false
+"ready": true
 },
 {
 "n": "2.7",
