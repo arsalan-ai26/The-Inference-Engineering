@@ -1,0 +1,409 @@
+<div class="kicker">Part 1 · Foundations · Chapter 1.3</div>
+<h1>Number formats</h1>
+<p class="lede">Every weight and every activation in a model is stored in some number format. The format sets how much memory the model needs, how fast the GPU can do the math, and how much accuracy you lose. Choosing it well is one of the biggest levers in inference. This chapter shows what the bits mean and how to calculate model memory in any format.</p>
+<div class="meta">
+  <span class="chip">Level: beginner</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 1.1</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>How many GB does an 8B-parameter model need in BF16? In 4-bit?</li>
+    <li>Why does 70,000 overflow in FP16 but not in BF16?</li>
+    <li>What does E4M3 mean?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>About 16 GB in BF16 (2 bytes each) and about 4 to 4.5 GB in 4-bit (0.5 bytes each, plus scale factors).</li>
+    <li>FP16 has 5 exponent bits, so its largest value is 65,504. BF16 has 8 exponent bits, like FP32, so it reaches about 3.4 × 10³⁸.</li>
+    <li>An 8-bit float with 1 sign bit, 4 exponent bits and 3 mantissa bits.</li>
+  </ol></details>
+</div>
+
+<h2 id="why">1. Why the format matters so much</h2>
+<p>An 8B-parameter model stores 8 billion numbers. In FP32, each takes 4 bytes: 32 GB. In BF16, 2 bytes: 16 GB. In a 4-bit format, half a byte: about 4 GB. The same model can need an 80 GB GPU or fit on a laptop.</p>
+<p>The format also sets speed, in two ways:</p>
+<ul>
+  <li><strong>Memory traffic.</strong> Generating a token reads all the weights from memory (chapter 1.1, section 5). Half the bytes means about half the read time.</li>
+  <li><strong>Math throughput.</strong> GPU math units do more operations per second on smaller formats. On an H100, dense FP8 math runs about twice as fast as BF16.</li>
+</ul>
+<p>The cost is accuracy. Fewer bits means fewer distinct values, so each stored number is a rougher approximation. Quantization (chapter 4.1) is the craft of using fewer bits with little loss. This chapter gives you the foundation for it.</p>
+
+<h2 id="integers">2. Integers: evenly spaced values</h2>
+<p>An integer format with n bits can store 2ⁿ distinct values. Signed formats use about half for negative numbers.</p>
+<div class="tbl"><table>
+<tr><th>Format</th><th class="n">Bits</th><th class="n">Distinct values</th><th class="n">Range</th></tr>
+<tr><td>INT8</td><td class="n">8</td><td class="n">256</td><td class="n">−128 to 127</td></tr>
+<tr><td>INT4</td><td class="n">4</td><td class="n">16</td><td class="n">−8 to 7</td></tr>
+</table></div>
+<p>Integers are evenly spaced. The gap between neighbours is always 1. To store a weight such as 0.0137 as an integer, you divide it by a <strong>scale factor</strong> first, round, and multiply back later:</p>
+<div class="formula">stored = round(w ÷ scale)        restored = stored × scale</div>
+<p>The scale is chosen so the largest weight maps to the largest integer. The problem: one large outlier forces a large scale, and then all the small weights round to 0 or 1. Model weights and activations do have outliers, so pure integer formats need careful handling.</p>
+
+<h2 id="float">3. Floating point: a number in scientific notation</h2>
+<p>A floating-point number is stored like scientific notation in base 2:</p>
+<div class="formula">value = (−1)^sign × (1.mantissa) × 2^(exponent − bias)</div>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Sign bit:</strong> 0 for positive, 1 for negative.</p>
+  <p><strong>Exponent bits:</strong> set the power of 2, so they set the <em>range</em>: how big and how small a number can be.</p>
+  <p><strong>Mantissa bits</strong> (also called fraction or significand): set the digits after the binary point, so they set the <em>precision</em>: how finely you can tell two nearby numbers apart.</p>
+  <p><strong>Bias:</strong> a fixed number subtracted from the stored exponent so that negative powers are possible. For an exponent with E bits, the bias is 2^(E−1) − 1.</p>
+</div>
+<p>The key idea: <strong>exponent bits buy range, mantissa bits buy precision.</strong> With a fixed bit budget you must trade one for the other.</p>
+<p>A good picture: a ruler whose tick marks are close together near zero and spread out for large numbers. Between 1 and 2, the ticks are evenly spaced. Between 2 and 4, there are the same number of ticks, so they are twice as far apart. Each power of 2 is a new "window" with the same number of ticks. Floats keep a constant <em>relative</em> error, not a constant absolute error.</p>
+<div class="box ex">
+  <span class="lbl">Worked example: what precision means</span>
+  <p>FP16 has 10 mantissa bits, so each window has 2¹⁰ = 1,024 ticks. Between 1 and 2 the gap is 1/1,024 ≈ 0.001. So FP16 can store 1.001 only as 1.0009766.</p>
+  <p>BF16 has 7 mantissa bits: 128 ticks per window, a gap of 1/128 ≈ 0.0078. So 1.001 becomes exactly 1.0 in BF16. The small change is lost.</p>
+  <p>Between 65,536 and 131,072 the BF16 gap is 65,536/128 = 512. So 70,000 is stored as 70,144.</p>
+</div>
+
+<div class="widget" id="fpW">
+  <div class="wt">Interactive: see the bits of any number</div>
+  <div class="ws">Type a number and pick a format. The widget rounds it to the nearest value the format can store, shows the bits, and shows the error.</div>
+  <div class="ctrls">
+    <label>Number <input type="number" id="fpX" value="3.14159" step="any" style="width:140px"></label>
+    <label>Format <select id="fpF">
+      <option value="8,23,ieee">FP32 (E8M23)</option>
+      <option value="5,10,ieee" selected>FP16 (E5M10)</option>
+      <option value="8,7,ieee">BF16 (E8M7)</option>
+      <option value="4,3,fn">FP8 E4M3</option>
+      <option value="5,2,ieee">FP8 E5M2</option>
+      <option value="2,1,fn">FP4 E2M1</option>
+    </select></label>
+    <span class="seg" role="group" aria-label="Examples">
+      <button data-x="70000">70,000</button><button data-x="1.001">1.001</button><button data-x="0.0001">0.0001</button><button data-x="0.00000001">1e-8</button><button data-x="300">300</button>
+    </span>
+  </div>
+  <div class="svgwrap"><svg id="fpSvg" viewBox="0 0 700 90" width="700" style="max-width:100%;height:auto" role="img" aria-label="Bit layout of the number"></svg></div>
+  <div class="stats" id="fpStats"></div>
+  <p class="note" id="fpNote"></p>
+</div>
+
+<h2 id="formats">4. The formats you will meet</h2>
+<div class="tbl"><table>
+<tr><th>Format</th><th class="n">Bits</th><th class="n">Sign / exp / mantissa</th><th class="n">Largest value</th><th class="n">Gap after 1.0</th><th>Main use today</th></tr>
+<tr><td>FP32</td><td class="n">32</td><td class="n">1 / 8 / 23</td><td class="n">3.4 × 10³⁸</td><td class="n">1.2 × 10⁻⁷</td><td>Training master weights, sensitive sums</td></tr>
+<tr><td>TF32</td><td class="n">19 used</td><td class="n">1 / 8 / 10</td><td class="n">3.4 × 10³⁸</td><td class="n">9.8 × 10⁻⁴</td><td>Fast "FP32" matmuls on NVIDIA tensor cores</td></tr>
+<tr><td>FP16</td><td class="n">16</td><td class="n">1 / 5 / 10</td><td class="n">65,504</td><td class="n">9.8 × 10⁻⁴</td><td>Older GPUs (T4, V100) that lack BF16</td></tr>
+<tr><td>BF16</td><td class="n">16</td><td class="n">1 / 8 / 7</td><td class="n">3.4 × 10³⁸</td><td class="n">7.8 × 10⁻³</td><td>The default for training and serving since A100</td></tr>
+<tr><td>FP8 E4M3</td><td class="n">8</td><td class="n">1 / 4 / 3</td><td class="n">448</td><td class="n">0.125</td><td>Weights and activations in FP8 inference</td></tr>
+<tr><td>FP8 E5M2</td><td class="n">8</td><td class="n">1 / 5 / 2</td><td class="n">57,344</td><td class="n">0.25</td><td>Gradients in FP8 training; some KV caches</td></tr>
+<tr><td>FP4 E2M1</td><td class="n">4</td><td class="n">1 / 2 / 1</td><td class="n">6</td><td class="n">0.5</td><td>Weights in MXFP4 and NVFP4 (with block scales)</td></tr>
+<tr><td>INT8</td><td class="n">8</td><td class="n">integer</td><td class="n">127</td><td class="n">1</td><td>Weight and activation quantization (W8A8)</td></tr>
+<tr><td>INT4</td><td class="n">4</td><td class="n">integer</td><td class="n">7</td><td class="n">1</td><td>Weight-only quantization (GPTQ, AWQ, GGUF)</td></tr>
+</table></div>
+<p>FP4 E2M1 can store only 16 values: 0, 0.5, 1, 1.5, 2, 3, 4, 6 and their negatives (two of the 16 are +0 and −0). That is barely a number system. It works only because each small block of weights gets its own scale factor (section 6).</p>
+
+<h2 id="bf16">5. Why BF16 replaced FP16</h2>
+<p>FP16 and BF16 both use 16 bits. FP16 spends more on precision (10 mantissa bits). BF16 spends more on range (8 exponent bits, the same as FP32).</p>
+<p>Training produces some very large and some very small numbers. In FP16, large activations overflow to infinity above 65,504, and tiny gradients underflow to zero below about 6 × 10⁻⁸. Engineers worked around this with "loss scaling": multiplying the loss by a big number so gradients stay in range. BF16 has FP32's range, so it rarely needs loss scaling. Its lower precision turned out to matter less than its range. Since the A100 (2020), BF16 is the standard format for training and for serving model weights.</p>
+<p>For inference, this has two practical effects:</p>
+<ul>
+  <li>Most open models ship in BF16. Running a BF16 model in FP16 usually works, but some models produce infinities or NaNs (Not a Number) because a few activations exceed 65,504.</li>
+  <li>The free Colab T4 GPU has no fast BF16 math. On a T4, use FP16, and if you see NaNs, suspect overflow.</li>
+</ul>
+
+<div class="widget" id="nlW">
+  <div class="wt">Interactive: where the values sit</div>
+  <div class="ws">Each tick is a value the format can store, after scaling the format so its largest value matches the largest weight. The grey curve is a typical bell-shaped weight distribution. Floats put more ticks near zero, where most weights are.</div>
+  <div class="ctrls">
+    <div class="seg" role="group" aria-label="Format"><button data-f="int4" class="on">INT4</button><button data-f="fp4">FP4 E2M1</button><button data-f="int8">INT8</button><button data-f="fp8">FP8 E4M3</button></div>
+    <label>Outlier size (× typical max): <span class="mono" id="nlOv"></span><input type="range" id="nlO" min="1" max="10" step="0.5" value="1"></label>
+  </div>
+  <div class="svgwrap"><svg id="nlSvg" viewBox="0 0 700 170" width="700" style="max-width:100%;height:auto" role="img" aria-label="Number line of representable values over a weight distribution"></svg></div>
+  <div class="stats" id="nlStats"></div>
+  <p class="note">Move the outlier slider. With one scale for the whole tensor, a large outlier stretches the grid, and most weights fall between very few ticks. That is the reason for block scaling.</p>
+</div>
+
+<h2 id="scaling">6. Scale factors and granularity</h2>
+<p>Low-bit formats store a few values well. To cover real weights, every format below 16 bits is used with scale factors. The question is how many numbers share one scale. This is called <strong>granularity</strong>.</p>
+<div class="tbl"><table>
+<tr><th>Granularity</th><th>One scale per</th><th>Trade-off</th></tr>
+<tr><td>Per tensor</td><td>Whole weight matrix</td><td>Almost no overhead; one outlier hurts the whole tensor</td></tr>
+<tr><td>Per channel</td><td>Each row or column</td><td>Small overhead; outliers stay in their row</td></tr>
+<tr><td>Per group or block</td><td>Each run of 16 to 128 numbers</td><td>Best accuracy; scales take memory and work to apply</td></tr>
+</table></div>
+<p>The newest formats build block scaling into the hardware:</p>
+<ul>
+  <li><strong>MXFP8 and MXFP4</strong> ("microscaling", an Open Compute Project standard): blocks of 32 values share one 8-bit power-of-two scale.</li>
+  <li><strong>NVFP4</strong> (NVIDIA): blocks of 16 FP4 values share one FP8 E4M3 scale, plus one FP32 scale for the whole tensor.</li>
+</ul>
+<p>NVIDIA Blackwell GPUs (B200, B300) apply these scales inside the tensor cores, so the overhead is small. Older GPUs must apply them in software.</p>
+<div class="box watch">
+  <span class="lbl">Watch out: what "MX" means</span>
+  <p>"MX" in MXFP8 and MXFP4 stands for <em>microscaling</em>, not "mixed precision". Some texts expand it wrongly.</p>
+</div>
+<h3>Effective bits per weight</h3>
+<p>Scales add memory. To get the real size, add the scale bits spread over the block:</p>
+<div class="formula">effective bits = value bits + (scale bits ÷ block size)</div>
+<ul>
+  <li>MXFP4: 4 + 8/32 = 4.25 bits per weight.</li>
+  <li>NVFP4: 4 + 8/16 = 4.5 bits per weight (the one tensor-wide FP32 scale is negligible).</li>
+  <li>INT4 with a 16-bit scale per group of 128: 4 + 16/128 = 4.125 bits. Many INT4 methods also store a zero point per group, which adds a few more bits.</li>
+</ul>
+
+<h2 id="memory">7. Model memory in any format</h2>
+<div class="formula"><b>weight memory</b> ≈ parameters × bytes per parameter</div>
+<p>Use bits ÷ 8 for bytes. Weights are only part of what a GPU must hold. Chapter 2.4 adds the KV cache, and the engine needs some working memory too.</p>
+
+<div class="widget" id="memW">
+  <div class="wt">Interactive: model memory by format</div>
+  <div class="ws">Weights only. Lines show common GPU memory sizes. Note that a few layers are often kept in higher precision, so real files can be a little larger.</div>
+  <div class="ctrls">
+    <label>Model <select id="memM">
+      <option value="0.494">Qwen2.5-0.5B (0.49 B)</option>
+      <option value="8.03" selected>Llama 3.1 8B (8.03 B)</option>
+      <option value="32.5">Qwen2.5-32B (32.5 B)</option>
+      <option value="70.6">Llama 3.1 70B (70.6 B)</option>
+      <option value="405">Llama 3.1 405B (405 B)</option>
+      <option value="671">DeepSeek-V3 (671 B)</option>
+    </select></label>
+    <label>Or parameters (billions) <input type="number" id="memP" step="any" style="width:100px"></label>
+  </div>
+  <div class="svgwrap"><svg id="memSvg" viewBox="0 0 700 300" width="700" style="max-width:100%;height:auto" role="img" aria-label="Bar chart of model memory in each format"></svg></div>
+</div>
+
+<div class="box ex">
+  <span class="lbl">Worked example: Llama 3.1 70B</span>
+  <ul>
+    <li>BF16: 70.6 × 10⁹ × 2 bytes = 141 GB. Needs at least two 80 GB GPUs for weights alone.</li>
+    <li>FP8: 70.6 GB. Fits on one 80 GB GPU, with about 9 GB left for everything else. In practice that is too tight to serve many users.</li>
+    <li>4-bit at 4.5 effective bits: 70.6 × 10⁹ × 4.5 ÷ 8 ≈ 39.7 GB. Fits on one 48 GB card.</li>
+  </ul>
+</div>
+
+<h2 id="accum">8. Accumulation: why sums use more bits</h2>
+<p>A dot product adds many small products. If the running sum is stored in a low-precision format, small additions get lost once the sum is large (the gap between ticks becomes bigger than the number you add). So hardware multiplies in low precision but <strong>accumulates</strong> the sum in a wider format, usually FP32. A "BF16 matmul" on a GPU reads BF16, multiplies, and adds in FP32.</p>
+<p>The same rule applies to sensitive steps such as softmax and normalization. Frameworks often run them in FP32 even when the model is in BF16. You will see this in the lab: adding 0.0001 ten thousand times in FP16 does not reach 1.</p>
+
+<h2 id="expert">9. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Subnormal numbers</span>
+  <p>When the exponent field is all zeros, IEEE formats switch to "subnormal" numbers with no hidden leading 1. These fill the gap between 0 and the smallest normal number. In FP16 the smallest normal is about 6.1 × 10⁻⁵ and the smallest subnormal about 6 × 10⁻⁸. Some hardware paths flush subnormals to zero for speed.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">FP8 variants are not all the same</span>
+  <p>The common E4M3 used in AI has no infinity and only one NaN pattern. That frees bit patterns and raises its maximum to 448. In PyTorch this type is <code>float8_e4m3fn</code> ("fn" means finite, with NaN). AMD's MI300 used a different variant (<code>e4m3fnuz</code>) with another exponent bias. A model quantized for one variant needs conversion for another.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Format support by GPU generation</span>
+  <p>Tensor-core support arrived generation by generation: FP16 with Volta and Turing (Turing also has INT8 and INT4), BF16 and TF32 with Ampere (A100), FP8 with Hopper (H100) and Ada (L4, L40S), and FP4 with the MX and NVFP4 formats on Blackwell. On a GPU without native support, a low-bit model can still save memory, but the math runs after converting back to a higher format, so you do not get the math speed-up.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Outliers in activations</span>
+  <p>Large language models develop a few activation channels with values far larger than the rest. These outliers are the main obstacle to 8-bit and 4-bit activations. Methods such as SmoothQuant move the difficulty from activations into weights, and rotation methods spread outliers across channels. Chapter 4.1 covers them.</p>
+</div>
+
+<h2 id="mistakes">10. Common mistakes</h2>
+<ul>
+  <li>Calling 1 GB "2³⁰ bytes" in one place and "10⁹ bytes" in another. State which you use. This book uses 10⁹.</li>
+  <li>Forgetting scale factors when computing 4-bit model size.</li>
+  <li>Running a BF16 model in FP16 and not checking for infinities or NaNs.</li>
+  <li>Expecting a speed-up from FP8 on a GPU without FP8 tensor cores (for example the T4 or A100).</li>
+  <li>Thinking precision and range are the same. Exponent bits give range; mantissa bits give precision.</li>
+</ul>
+
+<h2 id="lab">11. Lab</h2>
+<p><strong>Goal:</strong> break FP16, compare it with BF16, and measure the cost of low precision on a real matmul and a real model.</p>
+<p><strong>Setup:</strong> a Colab CPU runtime is enough. PyTorch supports all these formats on the CPU for storage and conversion.</p>
+<h3>Part A: inspect the formats</h3>
+<pre>import torch
+for d in [torch.float32, torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]:
+    f = torch.finfo(d)
+    print(f"{str(d):22s} bits={f.bits:2d}  max={f.max:.4g}  eps={f.eps:.3g}  smallest normal={f.tiny:.3g}")</pre>
+<p>Check each row against the table in section 4. <code>eps</code> is the gap after 1.0.</p>
+<h3>Part B: overflow and lost precision</h3>
+<p>Predict first: what does each line print?</p>
+<pre>x = torch.tensor([70000.0, 1.001, 1e-8])
+print(x.to(torch.float16))     # ?
+print(x.to(torch.bfloat16))    # ?
+print(torch.tensor([300., 500.]).to(torch.float8_e4m3fn).float())</pre>
+<details><summary>Expected output</summary>
+<p>FP16: [inf, 1.0010, 0.0]. 70,000 overflows; 1e-8 underflows below the smallest subnormal.</p>
+<p>BF16: [70144, 1.0, about 1e-8]. No overflow, but 1.001 loses its small part, and 70,000 rounds to 70,144.</p>
+<p>FP8 E4M3: 300 becomes 288 (the gap between 256 and 512 is 32). 500 is above the maximum 448. In current PyTorch this cast clamps it to 448; other tools may return NaN. Real FP8 pipelines scale values into range first, so they never rely on this behaviour.</p>
+</details>
+<h3>Part C: accumulation error</h3>
+<pre>for d in [torch.float32, torch.float16, torch.bfloat16]:
+    s = torch.tensor(0.0, dtype=d)
+    step = torch.tensor(1e-4, dtype=d)
+    for _ in range(10_000):
+        s = s + step
+    print(d, s.item())          # the exact answer is 1.0</pre>
+<details><summary>What you should see</summary><p>FP32 is close to 1.0. FP16 stops at 0.25: once the sum reaches 0.25, the gap between FP16 values (about 0.00024) is more than twice the step, so each addition rounds away. BF16 stops at 0.03125, much earlier. This is why GPUs accumulate dot products in FP32.</p></details>
+<h3>Part D: matmul error by format</h3>
+<pre>torch.manual_seed(0)
+A = torch.randn(256, 1024); B = torch.randn(1024, 256)
+ref = A.double() @ B.double()
+for d in [torch.float32, torch.bfloat16, torch.float16]:
+    out = (A.to(d) @ B.to(d)).double()
+    rel = ((out - ref).norm() / ref.norm()).item()
+    print(f"{str(d):16s} relative error {rel:.2e}")
+# FP8: store in FP8, compute in FP32 (a common pattern on GPUs without FP8 math)
+A8 = A.to(torch.float8_e4m3fn).float(); B8 = B.to(torch.float8_e4m3fn).float()
+print("fp8 storage     relative error", f"{((A8 @ B8).double() - ref).norm() / ref.norm():.2e}")</pre>
+<p>Predict the order from smallest to largest error before you run it. Then explain the order with mantissa bits.</p>
+<h3>Part E: a real model's memory</h3>
+<pre>from transformers import AutoModelForCausalLM
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+for d in [torch.float32, torch.bfloat16]:
+    m = AutoModelForCausalLM.from_pretrained(name, torch_dtype=d)
+    n = sum(p.numel() for p in m.parameters())
+    print(d, f"{n/1e9:.3f} B params", f"{m.get_memory_footprint()/1e9:.2f} GB")
+    del m</pre>
+<p>Check: memory ÷ parameters should be 4 bytes for FP32 and 2 for BF16. Then use the calculator above for the same model in FP8 and 4-bit.</p>
+<h3>Part F: build a tiny block quantizer</h3>
+<p>This shows why block scales help. Write it with AI help if you like; focus on reading the result.</p>
+<pre>def quant_int4(w, block):
+    w = w.reshape(-1, block)
+    scale = w.abs().amax(dim=1, keepdim=True) / 7          # map the block max to 7
+    q = torch.clamp(torch.round(w / scale), -8, 7)
+    return (q * scale).reshape(-1)
+
+w = torch.randn(4096 * 64)
+w[123] = 40.0                                             # one outlier
+for block in [w.numel(), 4096, 128, 32]:
+    err = ((quant_int4(w, block) - w).norm() / w.norm()).item()
+    print(f"block={block:>8}  relative error {err:.3f}")</pre>
+<p>Predict: how does the error change as the block gets smaller? Why does the outlier matter less for small blocks?</p>
+
+<h2 id="realworld">12. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Formats in production today</span>
+  <ul>
+    <li><strong>Model releases</strong> come in BF16 by default. Many vendors also ship official FP8 versions. Some recent open models ship natively in low precision; for example, gpt-oss uses MXFP4 for its MoE weights.</li>
+    <li><strong>Serving engines</strong> (vLLM, SGLang, TensorRT-LLM) can load FP8 weights and run FP8 math on Hopper and newer GPUs, and can store the KV cache in FP8 (chapter 2.4).</li>
+    <li><strong>Local inference</strong> (llama.cpp, Ollama) uses the GGUF file format with block-quantized 2- to 8-bit weights so large models run on laptops (chapter 3.6).</li>
+    <li><strong>Hardware marketing</strong> quotes FLOP/s for the smallest format. Compare GPUs at the same format and note whether a number assumes sparsity.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">13. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz13"></div>
+<script type="application/json" id="qz13">[
+{"q":"Which bits control the range of a floating-point format?","o":["Sign bits","Exponent bits","Mantissa bits","Bias bits"],"a":1,"e":"The exponent sets the power of 2, so it sets how large and how small values can be."},
+{"q":"BF16 and FP16 both have 16 bits. BF16 has:","o":["More precision and less range","More range and less precision","The same range and precision","No sign bit"],"a":1,"e":"BF16 uses 8 exponent bits (FP32's range) and only 7 mantissa bits."},
+{"q":"A 32B-parameter model in FP8 needs about how much memory for weights?","o":["16 GB","32 GB","64 GB","128 GB"],"a":1,"e":"1 byte per parameter: about 32 GB."},
+{"q":"NVFP4 stores 4-bit values with an 8-bit scale per 16 values. Effective bits per weight?","o":["4.0","4.25","4.5","8"],"a":2,"e":"4 + 8/16 = 4.5 bits."},
+{"q":"Why do GPUs accumulate BF16 matmuls in FP32?","o":["FP32 multiplies are faster","Small additions get lost in a low-precision running sum","BF16 cannot represent negative numbers","To save memory"],"a":1,"e":"As the sum grows, the gap between representable values grows. A wider accumulator keeps small additions."},
+{"q":"You run a BF16 model in FP16 on a T4 and get NaN outputs. The most likely cause:","o":["The tokenizer","Activations above 65,504 overflowed","Too much precision","The KV cache is full"],"a":1,"e":"FP16's maximum is 65,504. Some activations in BF16-trained models exceed it."},
+{"q":"Why do smaller quantization blocks reduce error when a tensor has an outlier?","o":["They use more bits per value","The outlier stretches the scale only for its own block","They remove the outlier","They switch to floating point"],"a":1,"e":"Each block gets its own scale, so one outlier affects only its 16 to 128 neighbours."}
+]</script>
+
+<h2 id="summary">14. Summary</h2>
+<ul>
+  <li>Memory ≈ parameters × bytes per parameter. 8B in BF16 ≈ 16 GB; in FP8 ≈ 8 GB; in 4-bit ≈ 4 to 4.5 GB.</li>
+  <li>Floats are sign × 1.mantissa × 2^exponent. Exponent bits give range; mantissa bits give precision.</li>
+  <li>BF16 has FP32's range with less precision, which is why it replaced FP16 for training and serving.</li>
+  <li>FP8 E4M3 (max 448) and FP4 E2M1 (max 6) need scale factors. Smaller blocks give better accuracy at a small memory cost.</li>
+  <li>Low-precision math still accumulates in FP32.</li>
+  <li>Speed-ups need hardware support for the format: FP8 on Hopper and Ada, FP4 on Blackwell.</li>
+</ul>
+
+<h2 id="refs">15. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://fabiensanglard.net/floating_point_visually_explained/">Fabien Sanglard: Floating Point Visually Explained</a></td><td>The "window and offset" picture of floats that section 3 builds on.</td></tr>
+<tr><td><a href="https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-quantization">Maarten Grootendorst: A Visual Guide to Quantization</a> (number format part)</td><td>Visual comparison of FP32, FP16, BF16 and INT8 and the idea of scale factors.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 5.1.1</td><td>The table of formats by GPU generation, dynamic range, granularity and microscaling formats.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, chapter 9 (TF32, AMP and reduced precision)</td><td>TF32, mixed precision with FP32 accumulation, loss scaling, FP8 and NVFP4 throughput on Blackwell.</td></tr>
+<tr><td><a href="https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf">OCP Microscaling Formats (MX) Specification v1.0</a></td><td>The definition of MXFP8 and MXFP4: blocks of 32 with an 8-bit power-of-two scale.</td></tr>
+<tr><td><a href="https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/">NVIDIA: Introducing NVFP4</a></td><td>NVFP4's 16-value blocks with FP8 scales and a tensor-level FP32 scale.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2209.05433">Micikevicius et al., FP8 Formats for Deep Learning</a></td><td>The paper that defined E4M3 and E5M2 for AI, including the finite-only E4M3 with max 448.</td></tr>
+<tr><td><a href="https://docs.pytorch.org/docs/stable/tensor_attributes.html">PyTorch: dtypes and finfo</a></td><td>The data types used in the lab.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>One book table expands MXFP8 and MXFP4 as "mixed-precision". The OCP specification defines MX as microscaling (section 6 watch-out).</li>
+</ul>
+<p class="note">Facts checked on 6 November 2026. Lab outputs checked with PyTorch 2.15 on CPU.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+function rne(x){const f=Math.floor(x),d=x-f;if(d>0.5)return f+1;if(d<0.5)return f;return f%2===0?f:f+1;}
+function quant(x,E,M,kind){
+  const bias=2**(E-1)-1;
+  let maxv,hasInf=kind==='ieee';
+  if(kind==='ieee')maxv=(2-2**-M)*2**((2**E-2)-bias);
+  else if(E===4&&M===3)maxv=448; else maxv=(2-2**-M)*2**((2**E-1)-bias);
+  const s=x<0||Object.is(x,-0)?1:0,a=Math.abs(x);
+  const emin=1-bias;
+  if(a===0)return{v:0,s,e:0,m:0,sub:false};
+  let e=Math.floor(Math.log2(a));
+  if(e<emin){ // subnormal
+    const q=rne(a/2**emin*2**M); if(q===0)return{v:0,s,e:0,m:0,sub:true,under:true};
+    if(q>=2**M)return{v:(s?-1:1)*2**emin,s,e:1,m:0,sub:false};
+    return{v:(s?-1:1)*q/2**M*2**emin,s,e:0,m:q,sub:true};}
+  let q=rne(a/2**e*2**M); if(q>=2**(M+1)){q=2**M;e+=1;}
+  let v=q/2**M*2**e;
+  if(v>maxv){ if(hasInf&&a>=maxv+2**(Math.floor(Math.log2(maxv))-M-1))return{v:s?-Infinity:Infinity,s,e:2**E-1,m:0,over:true}; v=maxv; e=Math.floor(Math.log2(maxv)); q=Math.round(maxv/2**e*2**M); return{v:(s?-1:1)*v,s,e:e+bias,m:q-2**M,sat:true};}
+  return{v:(s?-1:1)*v,s,e:e+bias,m:q-2**M};
+}
+function fpDraw(){
+  const x=parseFloat($('fpX').value);const [E,M,kind]=$('fpF').value.split(',');const e=+E,m=+M;
+  const r=quant(isNaN(x)?0:x,e,m,kind);
+  const svg=$('fpSvg');svg.innerHTML='';const n=1+e+m,W=700,cw=Math.min(40,(W-20)/n);
+  const bits=[r.s].concat([...Array(e)].map((_,i)=>(r.e>>(e-1-i))&1)).concat([...Array(m)].map((_,i)=>(r.m>>(m-1-i))&1));
+  bits.forEach((b,i)=>{const kindc=i===0?'--bad':i<=e?'--pre':'--dec';
+    el('rect',{x:10+i*cw,y:20,width:cw-2,height:36,rx:4,fill:css(i===0?'--bad-s':i<=e?'--pre-s':'--dec-s'),stroke:css(kindc)},svg);
+    el('text',{x:10+i*cw+(cw-2)/2,y:43,'text-anchor':'middle','font-size':cw>24?14:10,fill:css('--ink')},svg,b);});
+  el('text',{x:10,y:14,'font-size':11,fill:css('--bad')},svg,'sign');
+  el('text',{x:10+cw,y:14,'font-size':11,fill:css('--pre')},svg,`exponent (${e})`);
+  el('text',{x:10+(1+e)*cw,y:14,'font-size':11,fill:css('--dec')},svg,`mantissa (${m})`);
+  el('text',{x:10,y:78,'font-size':11,fill:css('--ink2')},svg,`stored exponent ${r.e} − bias ${2**(e-1)-1}${r.sub?' (subnormal)':''}`);
+  const err=isFinite(r.v)&&x!==0?Math.abs(r.v-x)/Math.abs(x):NaN;
+  const show=v=>!isFinite(v)?String(v).replace('Infinity','inf'):Math.abs(v)>=1e6||(Math.abs(v)<1e-4&&v!==0)?v.toExponential(6):String(+v.toPrecision(10));
+  $('fpStats').innerHTML=[['You typed',show(x)],['Stored as',show(r.v)],['Relative error',isNaN(err)?'n/a':(err*100).toPrecision(3)+'%'],['Bits',n]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');
+  $('fpNote').textContent=r.over?'Overflow: the number is larger than this format can hold, so it becomes infinity.':r.sat?'Too large for this format. It has no infinity, so the value is clamped to the maximum here; libraries differ (some return NaN).':r.under?'Underflow: too small for this format, so it becomes 0.':r.sub?'Subnormal: below the smallest normal number, so precision is reduced.':'';
+}
+$('fpX').addEventListener('input',fpDraw);$('fpF').addEventListener('input',fpDraw);
+document.querySelectorAll('#fpW [data-x]').forEach(b=>b.onclick=()=>{$('fpX').value=b.dataset.x;fpDraw();});
+IE.onTheme(fpDraw);
+
+/* number line */
+let NF='int4';
+function grid(f){
+  if(f==='int4')return[...Array(16)].map((_,i)=>i-8);
+  if(f==='int8')return[...Array(256)].map((_,i)=>i-128);
+  if(f==='fp4'){const p=[0,0.5,1,1.5,2,3,4,6];return[...p.map(v=>-v),...p];}
+  const out=new Set([0]);for(let e=0;e<16;e++)for(let mm=0;mm<8;mm++){let v=e===0?mm/8*2**-6:(1+mm/8)*2**(e-7);if(v<=448){out.add(v);out.add(-v);}}return[...out];
+}
+function nlDraw(){
+  const O=+$('nlO').value;$('nlOv').textContent=O.toFixed(1);
+  const g=grid(NF),gmax=Math.max(...g);const wmax=3*O; // typical weights ~N(0,1), clip 3 sigma; outlier stretches
+  const sc=wmax/gmax;const vals=g.map(v=>v*sc).filter(v=>Math.abs(v)<=3.2);
+  const svg=$('nlSvg');svg.innerHTML='';const W=700,H=170,l=20,r=20,base=120;
+  const X=v=>l+(v+3.2)/6.4*(W-l-r);
+  let d='';for(let i=0;i<=200;i++){const v=-3.2+6.4*i/200;const y=Math.exp(-v*v/2);d+=(i?'L':'M')+X(v)+' '+(base-y*90);}
+  el('path',{d,fill:'none',stroke:css('--mute'),'stroke-width':2},svg);
+  el('line',{x1:l,x2:W-r,y1:base,y2:base,stroke:css('--ink2')},svg);
+  vals.forEach(v=>el('line',{x1:X(v),x2:X(v),y1:base-6,y2:base+6,stroke:css('--kv'),'stroke-width':NF==='int8'?1:2},svg));
+  [-3,-2,-1,0,1,2,3].forEach(v=>el('text',{x:X(v),y:base+24,'text-anchor':'middle',class:'tick'},svg,v+'σ'));
+  const inside=vals.filter(v=>Math.abs(v)<=1).length;
+  $('nlStats').innerHTML=[['Values the format has',g.length],['Ticks within ±1σ (68% of weights)',inside],['Scale',sc.toPrecision(3)]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');
+}
+document.querySelectorAll('#nlW [data-f]').forEach(b=>b.onclick=()=>{NF=b.dataset.f;document.querySelectorAll('#nlW [data-f]').forEach(x=>x.classList.toggle('on',x===b));nlDraw();});
+$('nlO').addEventListener('input',nlDraw);IE.onTheme(nlDraw);
+
+/* memory bars */
+const FM=[['FP32',32],['BF16 / FP16',16],['FP8 / INT8',8],['MXFP4 (4.25)',4.25],['NVFP4 (4.5)',4.5],['INT4 g128 (4.125)',4.125]];
+const GPUS=[[16,'T4 16'],[24,'L4 24'],[80,'H100 80'],[141,'H200 141'],[180,'B200 180']];
+function memDraw(){
+  const P=parseFloat($('memP').value)||parseFloat($('memM').value);
+  const svg=$('memSvg');svg.innerHTML='';const W=700,H=300,l=150,r=20,t=24,rowH=(H-t-30)/FM.length;
+  const vals=FM.map(f=>P*1e9*f[1]/8/1e9);const xmax=Math.max(vals[0],24)*1.12;
+  const X=v=>l+Math.min(v,xmax)/xmax*(W-l-r);
+  GPUS.forEach(([g,n])=>{if(g<xmax){el('line',{x1:X(g),x2:X(g),y1:t-6,y2:H-30,stroke:css('--line'),'stroke-dasharray':'3 3'},svg);el('text',{x:X(g),y:t-10,'text-anchor':'middle',class:'tick'},svg,n);}});
+  FM.forEach((f,i)=>{const y=t+i*rowH;el('text',{x:l-8,y:y+rowH/2+4,'text-anchor':'end','font-size':12,fill:css('--ink')},svg,f[0]);
+    el('rect',{x:l,y:y+4,width:X(vals[i])-l,height:rowH-10,rx:4,fill:css(i<2?'--pre':i<3?'--kv':'--dec')},svg);
+    el('text',{x:X(vals[i])+6,y:y+rowH/2+4,'font-size':12,fill:css('--ink')},svg,IE.num(vals[i],1)+' GB');});
+}
+$('memM').addEventListener('input',()=>{$('memP').value='';memDraw();});$('memP').addEventListener('input',memDraw);
+IE.onTheme(memDraw);
+})();
+</script>

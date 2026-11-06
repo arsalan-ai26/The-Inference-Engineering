@@ -18,7 +18,7 @@ window.IE_CHAPTERS = [
 "title": "Number formats",
 "slug": "1-3-number-formats",
 "part": 1,
-"ready": false
+"ready": true
 },
 {
 "n": "1.4",
