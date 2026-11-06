@@ -1,0 +1,392 @@
+<div class="kicker">Part 3 · Inference engines and serving · Chapter 3.3</div>
+<h1>PagedAttention and KV memory management</h1>
+<p class="lede">The KV cache is the largest and most changeable thing in GPU memory during serving. Chapter 2.4 showed that storing it in one contiguous block per request wastes most of the memory. PagedAttention borrows the operating system's answer to the same problem, virtual memory: cut the cache into small fixed-size blocks, hand them out on demand, and keep a table per request. This chapter builds that allocator step by step, with sharing, copy-on-write, preemption, and the newer caches for hybrid models.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 4 to 5 hours with the lab</span>
+  <span class="chip">Needs: 2.4, 3.2</span>
+  <span class="chip">Compute: Colab CPU; T4 for Part D</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>With 16-token blocks, what is the most memory a request can waste?</li>
+    <li>Four completions are sampled from one 1,000-token prompt (<code>n = 4</code>). How many copies of the prompt's KV cache does a paged engine store?</li>
+    <li>What is copy-on-write, and when does a paged allocator need it?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>15 token slots in its last block (block size minus 1), per layer group. Not the whole maximum length.</li>
+    <li>One. All four sequences point at the same physical blocks; their reference counts are 4.</li>
+    <li>When a block is shared by several sequences and one of them must write into it, the allocator first gives that sequence its own copy, so the others do not see the change. It happens when a shared, partly full last block receives a new token.</li>
+  </ol></details>
+</div>
+
+<h2 id="problem">1. The problem: contiguous caches fragment</h2>
+<p>A request's KV cache grows by one token per decode step, and the engine does not know in advance how long the output will be. The simple design gives each request one contiguous region sized for the maximum length. Three kinds of waste follow:</p>
+<ul>
+  <li><strong>Reservation waste.</strong> Space reserved for tokens that are not generated yet, and may never be. A request that ends after 200 tokens of an 8,192-token reservation wastes 97.6% of it (chapter 2.4).</li>
+  <li><strong>Internal fragmentation.</strong> Space inside a reservation that is never used, because the request ends early.</li>
+  <li><strong>External fragmentation.</strong> Free gaps between reservations that are too small for a new request, even though their total is large.</li>
+</ul>
+<p>The vLLM paper measured earlier serving systems and found that only 20.4% to 38.2% of their KV cache memory held real token states. The rest was waste. Since the KV cache decides how many requests fit at once (chapter 2.4), waste directly limits batch size and so throughput (chapter 3.2).</p>
+
+<h2 id="vm">2. The idea: virtual memory for the KV cache</h2>
+<p>Operating systems solved this problem decades ago. A program sees a continuous range of <em>virtual</em> addresses. Physical memory is cut into small fixed-size <strong>pages</strong>. A <strong>page table</strong> maps each virtual page to any free physical page. Pages are given out only when touched, and any free page can serve any program.</p>
+<div class="tbl"><table>
+<tr><th>Operating system</th><th>Paged KV cache</th></tr>
+<tr><td>Process</td><td>Request (sequence)</td></tr>
+<tr><td>Virtual page</td><td>Logical KV block: tokens 0 to B−1, B to 2B−1, ...</td></tr>
+<tr><td>Physical page frame</td><td>Physical KV block in GPU memory</td></tr>
+<tr><td>Page table</td><td>Block table</td></tr>
+<tr><td>Free frame list</td><td>Free block pool</td></tr>
+<tr><td>Shared pages, copy-on-write after fork</td><td>Shared prompt blocks for parallel sampling, beam search and prefix caching</td></tr>
+<tr><td>Swapping to disk</td><td>Preemption: swap blocks to CPU memory, or drop and recompute</td></tr>
+</table></div>
+
+<h2 id="blocks">3. Blocks and block tables</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Block:</strong> storage for the keys and values of B consecutive tokens (B is the block size, commonly 16 in vLLM), for the layers that share a block layout.</p>
+  <p><strong>Block table:</strong> one list per request. Entry i is the physical block that holds the request's tokens i × B to (i + 1) × B − 1.</p>
+  <p><strong>Free pool:</strong> the list of physical blocks not used by any request.</p>
+</div>
+<p>The life of a request in a paged allocator:</p>
+<ol>
+  <li><strong>Admit.</strong> The prompt has P tokens, so it needs ⌈P ÷ B⌉ blocks. Take them from the free pool and write their IDs into the request's block table.</li>
+  <li><strong>Grow.</strong> Each decode step adds one token. If the last block still has room, write into it. If it is full, take one more block from the pool.</li>
+  <li><strong>Finish or abort.</strong> Return every block in the table to the free pool.</li>
+</ol>
+<p>The blocks of one request can be anywhere in memory. Waste is at most B − 1 token slots per request, in its last block. Any free block can serve any request, so external fragmentation disappears.</p>
+
+<div class="widget" id="paW">
+  <div class="wt">Interactive: a paged KV allocator</div>
+  <div class="ws">A tiny GPU memory of 48 blocks, 4 tokens per block. Add requests, step them forward, fork one into parallel samples, or finish one. Click a request to see its block table. Switch to "contiguous" to see the old design reserve each request's maximum length.</div>
+  <div class="ctrls">
+    <div class="seg" role="group" aria-label="Mode"><button data-pm="paged" class="on">Paged</button><button data-pm="contig">Contiguous (reserve max 32 tokens)</button></div>
+    <button class="pri" id="paAdd">Add request</button>
+    <button id="paStep">Step (every request +1 token)</button>
+    <button id="paFork">Fork selected (n = 2)</button>
+    <button id="paFin">Finish selected</button>
+    <button id="paReset">Reset</button>
+  </div>
+  <div class="svgwrap"><svg id="paSvg" viewBox="0 0 680 230" width="680" style="max-width:100%;height:auto" role="img" aria-label="GPU memory blocks and their owners"></svg></div>
+  <div id="paTable" style="font-family:var(--f-mono);font-size:13px;margin-top:8px;overflow-x:auto"></div>
+  <div class="stats" id="paStats"></div>
+  <p class="note" id="paMsg"></p>
+</div>
+
+<h2 id="kernel">4. PagedAttention: attention through a block table</h2>
+<p>Standard attention kernels expect each sequence's keys and values in one contiguous array. With paging, they are scattered. <strong>PagedAttention</strong> is an attention kernel that takes the block table as an extra input. For each query, it walks the sequence's blocks in order, loads each block's keys and values from wherever it lives, and computes exactly the same result as ordinary attention.</p>
+<p>The extra cost is small: one table lookup per block and slightly less regular memory access. Blocks of 16 tokens are large enough that each load is efficient. All major engines and attention libraries (FlashAttention, FlashInfer, TensorRT-LLM kernels) now support paged KV layouts.</p>
+
+<h2 id="sizing">5. Sizing the block pool</h2>
+<p>At startup an engine computes how many blocks fit (chapter 2.4 for the memory pool):</p>
+<div class="formula">bytes per block = block size × KV bytes per token (all layers)        blocks = KV pool bytes ÷ bytes per block</div>
+<div class="box ex">
+  <span class="lbl">Worked example: Llama 3.1 8B on one H100</span>
+  <p>KV bytes per token: 131,072. Block size 16, so each block holds 2 MiB (2,097,152 bytes) across all 32 layers.</p>
+  <p>KV pool at 0.92 memory fraction with a 2 GB runtime reserve: about 55.5 GB. Blocks ≈ 55.5 × 10⁹ ÷ 2,097,152 ≈ 26,500. Tokens ≈ 26,500 × 16 ≈ 424,000.</p>
+  <p>vLLM prints both numbers when it starts: the KV cache size in tokens, and the maximum concurrency for requests of <code>max-model-len</code> tokens. Those log lines are this calculation for your exact setup.</p>
+</div>
+
+<div class="widget" id="ccW">
+  <div class="wt">Interactive: concurrency with and without paging</div>
+  <div class="ws">How many requests fit in the KV pool. Contiguous allocation reserves the maximum length for every request. Paged allocation uses the real length, rounded up to whole blocks.</div>
+  <div class="ctrls">
+    <label>KV pool (GB) <input type="number" id="ccP" value="55.5" step="0.5" style="width:90px"></label>
+    <label>KV bytes per token <select id="ccK"><option value="131072" selected>131,072 (Llama 3.1 8B)</option><option value="12288">12,288 (Qwen2.5-0.5B)</option><option value="327680">327,680 (Llama 3.1 70B)</option></select></label>
+    <label>Max model length <select id="ccM"><option>4096</option><option selected>8192</option><option>32768</option><option>131072</option></select></label>
+    <label>Average tokens per request (prompt + output) <input type="number" id="ccA" value="1200" step="100" style="width:100px"></label>
+    <label>Block size <select id="ccB"><option>8</option><option selected>16</option><option>32</option><option>128</option></select></label>
+  </div>
+  <div class="stats" id="ccStats"></div>
+</div>
+
+<h2 id="sharing">6. Sharing blocks: reference counts and copy-on-write</h2>
+<p>Because a block table is only a list of IDs, two requests can point at the same physical block. Each block keeps a <strong>reference count</strong>: how many block tables include it. A block returns to the free pool only when its count reaches 0.</p>
+<p>Sharing appears in three places:</p>
+<ul>
+  <li><strong>Parallel sampling</strong> (<code>n &gt; 1</code>): several completions of one prompt share all the prompt's blocks.</li>
+  <li><strong>Beam search</strong>: beams share the blocks of their common history and split when they diverge.</li>
+  <li><strong>Prefix caching</strong>: different requests with the same beginning (a system prompt, a document) reuse blocks that are already computed. Engines find them by hashing each full block's tokens together with everything before it. Chapter 3.5 covers this in depth.</li>
+</ul>
+<p>When a sequence must write into a block whose count is above 1, the allocator gives it a fresh block, copies the shared contents into it, and decrements the old block's count. This is <strong>copy-on-write</strong>. With paging it only ever copies one block, never a whole cache. In practice it is needed only when the shared block is the partly filled last block: full blocks never change again.</p>
+
+<h2 id="preempt">7. When the pool runs out</h2>
+<p>Requests grow, so a batch that fits now may not fit in 100 steps. When a running request needs a new block and the pool is empty, the scheduler must act:</p>
+<ol>
+  <li><strong>Stop admitting</strong> new requests until blocks free up. Some engines keep a small <em>watermark</em> of free blocks in reserve, so that running requests can keep growing.</li>
+  <li><strong>Preempt</strong> one or more running requests, usually the lowest priority or the most recently arrived, and free their blocks. Two ways to bring them back:
+    <ul>
+      <li><strong>Recompute:</strong> drop the blocks. When the request resumes, prefill its prompt plus the tokens generated so far again. Costs compute, needs no extra memory.</li>
+      <li><strong>Swap:</strong> copy the blocks to CPU memory and back later. Costs PCIe bandwidth and CPU memory.</li>
+    </ul>
+  </li>
+</ol>
+<p>Current vLLM uses recompute by default; prefill is fast on modern GPUs, and prefix caching often brings back much of the prompt for free. Frequent preemption (watch <code>vllm:num_preemptions</code>, chapter 3.1) wastes compute and means the batch limits are set higher than memory can support.</p>
+<p>Cancellation is the same path in reverse: when a client disconnects, the engine releases the request's blocks, their reference counts fall, and unshared blocks return to the pool at once (chapter 3.2).</p>
+
+<h2 id="hybrid">8. KV caches for sliding windows, hybrids and state-space layers</h2>
+<p>Not every layer keeps a cache that grows forever (chapters 2.4 and 2.7):</p>
+<ul>
+  <li><strong>Sliding-window layers</strong> need only the last W tokens. Blocks that fall wholly outside the window can be freed while the request continues.</li>
+  <li><strong>Hybrid models</strong> mix full-attention layers with window layers (for example Gemma 3 has 52 sliding-window layers and 10 full layers in its 27B model) or with linear-attention and Mamba layers.</li>
+  <li><strong>State-space and linear layers</strong> keep one fixed-size state per request instead of a per-token cache.</li>
+</ul>
+<p>vLLM handles all of these with a <strong>hybrid KV cache manager</strong>. It keeps one memory pool with a single page size, groups layers of the same type so that each group needs the same number of blocks per request, and gives each group its own block table. Mamba-style states, which are much larger per request than one token's KV, are fitted into the same page size. The design has some padding overhead for awkward layer ratios, which its documentation discusses openly.</p>
+
+<h2 id="expert">9. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Choosing the block size</span>
+  <p>Smaller blocks waste less (at most B − 1 slots per request) and share prefixes more finely. Larger blocks mean fewer table entries, fewer lookups and more efficient memory loads in the attention kernel. Some kernels and hardware prefer larger blocks (for example 64 or 128), and prefix caching can only share whole blocks. Engines pick a default per backend; changing it is rarely the first thing to tune.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Virtual memory without a block table</span>
+  <p>An alternative keeps the attention kernel unchanged: reserve a large contiguous <em>virtual</em> address range per request and let the GPU driver's virtual memory API map physical pages into it on demand (the vAttention approach). The kernel sees contiguous memory; the driver does the paging. It trades kernel simplicity for driver-level page management.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">KV beyond one GPU</span>
+  <p>Once the cache is cut into blocks, blocks can live in other tiers: CPU memory, local SSD or a remote store, and be moved back on demand. Block-level hashing makes those moves address the same "content" everywhere. Chapter 4.7 builds on this for very long contexts, and chapter 4.6 moves blocks between prefill and decode GPUs.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Correctness traps</span>
+  <p>A paged allocator must never hand one block to two writers, never free a block that is still referenced, and never leave a request pointing at a freed block. These bugs do not crash; they silently corrupt another request's output. Engine teams test allocators with randomized property tests, which is exactly Part C of the lab.</p>
+</div>
+
+<h2 id="mistakes">10. Common mistakes</h2>
+<ul>
+  <li>Estimating concurrency with the maximum length instead of the real average length on a paged engine.</li>
+  <li>Forgetting that sharing only works on whole blocks: a 1,000-token shared prefix with 16-token blocks shares 62 blocks, and the last 8 tokens are recomputed.</li>
+  <li>Tuning <code>max-num-seqs</code> up until preemptions appear, and reading the higher batch as a win.</li>
+  <li>Assuming every layer of a hybrid model uses the same cache layout.</li>
+  <li>Freeing blocks on finish but not on client abort.</li>
+</ul>
+
+<h2 id="lab">11. Lab</h2>
+<p><strong>Goal:</strong> size a block pool, build a paged allocator, and prove it correct with randomized tests.</p>
+<h3>Part A: the 100 Days notebook</h3>
+<p>Run day 09 (vLLM, PagedAttention and continuous batching) of <em>100 Days of Inference</em>. Its block manager simulation is a good warm-up. Check its quoted KV size for Llama 3 8B against chapter 2.4 (see the note in References).</p>
+<h3>Part B: concurrency with and without paging</h3>
+<p>For Llama 3.1 8B on one H100 with a 55.5 GB pool, <code>max-model-len</code> 8,192 and an average request of 1,200 tokens, compute by hand (or with the widget): how many requests fit with contiguous reservation, and how many with 16-token paging?</p>
+<details><summary>Answer</summary><p>Contiguous: each request reserves 8,192 × 131,072 bytes = 1.07 GB, so about 51 requests. Paged: ⌈1,200 ÷ 16⌉ = 75 blocks of 2 MiB = 157 MB per request, so about 352 requests. About 7 times more, from the same memory.</p></details>
+<h3>Part C: a paged allocator and its property tests</h3>
+<p>The AI may write the allocator. Here is a complete one. The <code>data</code> lists stand in for the real K and V values, so tests can check what each sequence would read. Read it until you can explain every line.</p>
+<pre>from collections import deque
+
+class OutOfBlocks(Exception):
+    pass
+
+class BlockAllocator:
+    &quot;&quot;&quot;A tiny paged KV allocator: fixed-size blocks, a free list, reference counts and copy-on-write.&quot;&quot;&quot;
+    def __init__(self, num_blocks, block_size):
+        self.block_size = block_size
+        self.free = deque(range(num_blocks))           # free list of physical block ids
+        self.ref = [0] * num_blocks                    # how many block tables point at each block
+        self.tables = {}                               # seq_id -&gt; list of physical block ids
+        self.ntok = {}                                 # seq_id -&gt; tokens stored
+        self.data = [[None] * block_size for _ in range(num_blocks)]   # stands in for the K/V values
+        self.copies = 0                                # copy-on-write events
+
+    def _take(self):
+        if not self.free:
+            raise OutOfBlocks
+        b = self.free.popleft(); self.ref[b] = 1
+        return b
+
+    def _drop(self, b):
+        self.ref[b] -= 1
+        if self.ref[b] == 0:
+            self.free.append(b)
+
+    def add(self, seq, tokens):                        # new sequence: allocate blocks and write its prompt
+        need = -(-len(tokens) // self.block_size)
+        if need &gt; len(self.free):
+            raise OutOfBlocks
+        self.tables[seq] = [self._take() for _ in range(need)]
+        for i, tok in enumerate(tokens):
+            self.data[self.tables[seq][i // self.block_size]][i % self.block_size] = tok
+        self.ntok[seq] = len(tokens)
+
+    def append(self, seq, tok):                        # write one new token for a running sequence
+        t, n = self.tables[seq], self.ntok[seq]
+        if n % self.block_size == 0:                   # last block is full: take a new block
+            t.append(self._take())
+        elif self.ref[t[-1]] &gt; 1:                      # last block is shared: copy on write
+            new = self._take(); self.copies += 1
+            self.data[new] = list(self.data[t[-1]])    # on a GPU: copy one block of K/V
+            self._drop(t[-1]); t[-1] = new
+        self.data[t[-1]][n % self.block_size] = tok
+        self.ntok[seq] = n + 1
+
+    def read(self, seq):                               # what attention would see for this sequence
+        bs = self.block_size
+        return [self.data[self.tables[seq][i // bs]][i % bs] for i in range(self.ntok[seq])]
+
+    def fork(self, parent, child):                     # parallel sampling or beam search: share all blocks
+        self.tables[child] = list(self.tables[parent])
+        self.ntok[child] = self.ntok[parent]
+        for b in self.tables[child]:
+            self.ref[b] += 1
+
+    def release(self, seq):                            # finished, aborted or preempted
+        for b in self.tables.pop(seq):
+            self._drop(b)
+        del self.ntok[seq]</pre>
+<p>Now write the tests yourself. A property test runs thousands of random operations and checks rules that must always hold. Write a <code>check(a, num_blocks, expected)</code> function that asserts these invariants after every operation:</p>
+<ol>
+  <li>Every sequence reads back exactly the tokens it wrote, and no others (no shared block was overwritten).</li>
+  <li>No block appears twice in the free list (no double free).</li>
+  <li>No block in the free list has a reference count above 0 (no double allocation).</li>
+  <li>Each block's reference count equals the number of block tables that contain it (no stale references).</li>
+  <li>Free blocks plus referenced blocks equal all blocks (no leaks), and every sequence has exactly enough blocks for its tokens.</li>
+</ol>
+<pre>import random
+def run(seed, steps=3000, num_blocks=64, bs=4):
+    rnd = random.Random(seed); a = BlockAllocator(num_blocks, bs); next_id = 0; expected = {}
+    for _ in range(steps):
+        op = rnd.random(); live = list(a.tables)
+        try:
+            if op &lt; 0.25 or not live:
+                toks = [rnd.randint(0, 999) for _ in range(rnd.randint(1, 20))]
+                a.add(next_id, toks); expected[next_id] = toks; next_id += 1
+            elif op &lt; 0.75:
+                s = rnd.choice(live); tok = rnd.randint(0, 999)
+                a.append(s, tok); expected[s] = expected[s] + [tok]
+            elif op &lt; 0.85:
+                p = rnd.choice(live); a.fork(p, next_id); expected[next_id] = list(expected[p]); next_id += 1
+            else:
+                a.release(rnd.choice(live))
+        except OutOfBlocks:
+            if live: a.release(rnd.choice(live))       # preempt someone, like a scheduler would
+        check(a, num_blocks, expected)              # TODO: write check()
+    for s in list(a.tables): a.release(s)
+    check(a, num_blocks, expected); assert len(a.free) == num_blocks
+    return a.copies
+
+print([run(s) for s in range(20)])</pre>
+<details><summary>Solution: check()</summary>
+<pre>def check(a, num_blocks, expected):
+    for seq in a.tables:
+        assert a.read(seq) == expected[seq], &quot;a sequence reads tokens it never wrote (shared block overwritten)&quot;
+    counted = [0] * num_blocks
+    for seq, t in a.tables.items():
+        for b in t: counted[b] += 1
+        assert len(t) * a.block_size &gt;= a.ntok[seq], &quot;sequence has fewer slots than tokens&quot;
+        assert len(t) == -(-a.ntok[seq] // a.block_size), &quot;sequence holds extra blocks&quot;
+    assert counted == a.ref, &quot;reference counts disagree with block tables (stale reference)&quot;
+    assert len(set(a.free)) == len(a.free), &quot;a block is in the free list twice (double free)&quot;
+    for b in a.free: assert a.ref[b] == 0, &quot;a free block is still referenced (double allocation risk)&quot;
+    assert len(a.free) + sum(1 for r in a.ref if r &gt; 0) == num_blocks, &quot;a block was lost (leak)&quot;</pre>
+<p>All 20 seeds should pass, and each run should report about 115 to 155 copy-on-write events.</p></details>
+<p>Then prove the tests work: break the allocator on purpose and make sure a test fails. Try each bug, one at a time:</p>
+<ul>
+  <li>In <code>append</code>, disable the copy-on-write branch (change it to <code>elif False:</code>). Invariant 1 catches it: two sequences now write into one shared block.</li>
+  <li>In <code>fork</code>, forget to increase the reference counts. Invariant 4 catches it.</li>
+  <li>In <code>_drop</code>, append to the free list without checking the count. Invariant 3 catches it.</li>
+</ul>
+<p>Notice that the structural invariants alone (2 to 5) do not catch the missing copy-on-write. Only the data check does. Real engine bugs of this kind show up as one user's output containing another user's text.</p>
+<h3>Part D: watch a real engine (T4)</h3>
+<p>Start vLLM with Qwen2.5-0.5B (chapter 3.1, Part D) and find the startup lines that report the KV cache size and the maximum concurrency. Check them with the formula of section 5 (KV bytes per token 12,288; block size from the log or the default). Then send one request with <code>"n": 8</code> and a 1,500-token prompt, and compare <code>vllm:kv_cache_usage_perc</code> with eight separate requests of the same prompt sent with prefix caching disabled (<code>--no-enable-prefix-caching</code>). Explain the difference with section 6.</p>
+
+<h2 id="realworld">12. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Paging in production</span>
+  <ul>
+    <li><strong>Every major engine</strong> uses a paged KV cache: vLLM (where PagedAttention was introduced), SGLang (with its radix-tree cache on top, chapter 3.5) and TensorRT-LLM (paged KV cache with block reuse).</li>
+    <li><strong>Capacity planning</strong> uses average real lengths and the engine's reported KV capacity, then leaves headroom so preemption stays rare.</li>
+    <li><strong>Parallel sampling and agents</strong> benefit most from sharing: many branches over one long context cost little extra memory.</li>
+    <li><strong>New architectures</strong> (sliding windows, hybrids, MLA) each needed allocator work in engines before they could be served efficiently.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">13. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz33"></div>
+<script type="application/json" id="qz33">[
+{"q":"In a paged KV cache, what does a block table map?","o":["Tokens to vocabulary IDs","A request's logical blocks to physical blocks in GPU memory","Layers to GPUs","Experts to tokens"],"a":1,"e":"Entry i points at the physical block holding tokens iB to (i+1)B − 1."},
+{"q":"Why does paging remove external fragmentation?","o":["Blocks are compressed","All blocks are the same size, so any free block can serve any request","It uses CPU memory","It reserves the maximum length"],"a":1,"e":"No odd-sized gaps can form."},
+{"q":"A 70-token prompt with 16-token blocks needs how many blocks?","o":["4","5","70","16"],"a":1,"e":"⌈70 ÷ 16⌉ = 5; the last block has 10 used slots and 6 free."},
+{"q":"Two sequences share a full block. One generates a token. What happens to the shared block?","o":["It is copied","Nothing: the new token goes into the sequence's next block","It is freed","Both sequences write into it"],"a":1,"e":"Full blocks never change; copy-on-write is only needed for a shared partly filled block."},
+{"q":"A block's reference count drops to 0. The allocator:","o":["Keeps it reserved","Returns it to the free pool","Copies it","Moves it to the CPU"],"a":1,"e":"No block table points at it any more."},
+{"q":"Recompute-based preemption costs:","o":["CPU memory","Extra prefill compute when the request resumes","Nothing","PCIe bandwidth"],"a":1,"e":"The dropped KV must be rebuilt by prefilling the tokens again."},
+{"q":"Why can a paged engine fit about 7 times more requests than a contiguous one in Part B?","o":["It compresses the KV cache","It allocates for real lengths (rounded to blocks) instead of the maximum length","It uses FP8","It lowers the model size"],"a":1,"e":"1,200-token average requests no longer reserve 8,192 tokens each."}
+]</script>
+
+<h2 id="summary">14. Summary</h2>
+<ul>
+  <li>Contiguous KV allocation wastes memory through reservations and fragmentation; earlier systems used only 20% to 38% of KV memory for real tokens.</li>
+  <li>Paging cuts the cache into fixed-size blocks, allocates them on demand, and records them in a per-request block table. Waste is at most B − 1 slots per request.</li>
+  <li>PagedAttention kernels read K and V through the block table with the same results as normal attention.</li>
+  <li>Reference counts let requests share blocks (parallel sampling, beam search, prefix caching); copy-on-write handles writes to shared partial blocks.</li>
+  <li>When blocks run out: stop admitting, then preempt by recompute or swap. Aborts free blocks at once.</li>
+  <li>Hybrid models need a cache manager that handles windows, multiple layer groups and fixed-size states.</li>
+</ul>
+
+<h2 id="refs">15. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://hamzaelshafie.bearblog.dev/paged-attention-from-first-principles-a-view-inside-vllm/">Hamza Elshafie: PagedAttention from first principles</a></td><td>A step-by-step build of blocks, block tables, the free pool, reference counts and copy-on-write, with diagrams.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2309.06180">Kwon et al., Efficient Memory Management for LLM Serving with PagedAttention</a></td><td>The original design and the measured waste of earlier systems.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/design/paged_attention.html">vLLM: PagedAttention design</a></td><td>How the kernel reads keys and values through block tables.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager.html">vLLM: Hybrid KV cache manager</a></td><td>One pool and one page size for full, sliding-window and Mamba layers.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/design/prefix_caching.html">vLLM: Automatic prefix caching</a></td><td>Block hashing for reuse across requests; developed in chapter 3.5.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2405.04437">Prabhu et al., vAttention</a></td><td>Paging through GPU virtual memory instead of block tables.</td></tr>
+<tr><td>Fuheng Wu, <em>Distributed AI Systems</em>, chapter 6</td><td>PagedAttention inside a vLLM deployment.</td></tr>
+<tr><td>Chi Wang and Peiheng Hu, <em>Hands-On LLM Serving and Optimization</em>, chapters 6 and 7</td><td>KV cache management among essential and advanced optimizations.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 09</td><td>A block manager and fragmentation simulation notebook.</td></tr>
+</table></div>
+<h3>Triaged out</h3>
+<div class="tbl"><table>
+<tr><th>Source</th><th>Reason</th></tr>
+<tr><td>LLM Optimization Lecture 4: GQA and PagedAttention (video)</td><td>Video only; its content is covered by the sources above and chapter 2.4.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The day 09 README of <em>100 Days of Inference</em> gives Llama 3 8B's KV cache as about 512 KB per token. With 32 layers, 8 KV heads, head size 128 and BF16, it is 128 KiB (131,072 bytes). The same README's utilization figures (80% to 90% vs 40% to 60%) are not sourced; this chapter uses the vLLM paper's measured figures instead.</li>
+</ul>
+<p class="note">Facts checked on 6 November 2026. The allocator and its tests were run with Python 3.13.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+const NB=48,BS=4,MAXT=32;let mode='paged',A,sel=null,nextId=1,msg='';
+const COLORS=['--pre','--dec','--kv','--good','--bad'];
+function reset(){A={free:[...Array(NB).keys()],ref:new Array(NB).fill(0),tables:{},ntok:{},owner:{},contig:{},copies:0,color:{}};sel=null;nextId=1;msg='';draw();}
+function take(){if(!A.free.length)throw 'full';const b=A.free.shift();A.ref[b]=1;return b;}
+function drop(b){A.ref[b]--;if(A.ref[b]===0)A.free.push(b);}
+function add(){const id=nextId++;const P=1+Math.floor(Math.random()*9);A.color[id]=COLORS[(id-1)%COLORS.length];
+  try{if(mode==='paged'){const need=Math.ceil(P/BS);if(need>A.free.length)throw 'full';A.tables[id]=[...Array(need)].map(take);}
+    else{const need=MAXT/BS;const run=findRun(need);if(run<0)throw 'full';A.tables[id]=[...Array(need)].map((_,i)=>run+i);A.tables[id].forEach(b=>{A.free.splice(A.free.indexOf(b),1);A.ref[b]=1;});}
+    A.ntok[id]=P;sel=id;msg=`Request ${id} admitted with a ${P}-token prompt.`;}catch(e){msg=mode==='paged'?'No free blocks: the scheduler would wait or preempt.':'No contiguous run of 8 free blocks: request must wait (external fragmentation) even if total free blocks are enough.';delete A.color[id];}
+  draw();}
+function findRun(n){const f=new Set(A.free);for(let s=0;s<=NB-n;s++){let ok=true;for(let i=0;i<n;i++)if(!f.has(s+i)){ok=false;break;}if(ok)return s;}return -1;}
+function step(){let full=false;for(const id of Object.keys(A.tables).map(Number)){const n=A.ntok[id];if(mode==='contig'){if(n<MAXT)A.ntok[id]=n+1;continue;}
+  const t=A.tables[id];try{if(n%BS===0)t.push(take());else if(A.ref[t[t.length-1]]>1){const nb=take();A.copies++;drop(t[t.length-1]);t[t.length-1]=nb;}A.ntok[id]=n+1;}catch(e){full=true;}}
+  msg=full?'Pool empty: some requests could not grow this step. A real scheduler would preempt one.':'Every request grew by one token.';draw();}
+function fork(){if(sel==null||!A.tables[sel])return;if(mode==='contig'){msg='Contiguous mode cannot share: a fork would need a full second reservation.';return draw();}
+  const id=nextId++;A.tables[id]=A.tables[sel].slice();A.ntok[id]=A.ntok[sel];A.tables[id].forEach(b=>A.ref[b]++);A.color[id]=A.color[sel];msg=`Request ${id} forked from ${sel}: it shares all ${A.tables[id].length} blocks (no copy). The next new token in a shared partial block triggers copy-on-write.`;sel=id;draw();}
+function fin(){if(sel==null||!A.tables[sel])return;A.tables[sel].forEach(drop);delete A.tables[sel];delete A.ntok[sel];msg=`Request ${sel} finished: blocks with no other owners returned to the free pool.`;sel=null;draw();}
+function draw(){const s=$('paSvg');s.innerHTML='';const cols=16,cw=40,ch=60,ox=12,oy=12;
+  const owners={};Object.entries(A.tables).forEach(([id,t])=>t.forEach((b,i)=>{(owners[b]=owners[b]||[]).push([+id,i]);}));
+  for(let b=0;b<NB;b++){const x=ox+(b%cols)*cw,y=oy+Math.floor(b/cols)*ch;const o=owners[b];const isSel=o&&o.some(z=>z[0]===sel);
+    let used=0;if(o){const [id,i]=o[0];used=Math.max(0,Math.min(BS,A.ntok[id]-i*BS));}
+    el('rect',{x,y,width:cw-4,height:ch-12,rx:4,fill:o?css('--panel'):css('--panel2'),stroke:isSel?css('--ink'):css('--line'),'stroke-width':isSel?2:1},s);
+    if(o){for(let k=0;k<BS;k++)el('rect',{x:x+4,y:y+4+k*9,width:cw-12,height:7,rx:2,fill:k<used?css(A.color[o[0][0]]):css('--bg'),opacity:k<used?0.85:1},s);
+      el('text',{x:x+(cw-4)/2,y:y+ch-16,'text-anchor':'middle','font-size':9,fill:css('--ink')},s,o.length>1?`×${o.length}`:'r'+o[0][0]);}
+    el('text',{x:x+2,y:y-2,'font-size':8,fill:css('--mute')},s,b);}
+  const ids=Object.keys(A.tables);
+  $('paTable').innerHTML=ids.length?ids.map(id=>`<div style="padding:2px 6px;${+id===sel?'background:var(--panel2);border-radius:4px':''}" data-id="${id}"><b>request ${id}</b> (${A.ntok[id]} tokens): block table [${A.tables[id].join(', ')}]</div>`).join(''):'<span class="note">No requests yet. Press "Add request".</span>';
+  $('paTable').querySelectorAll('[data-id]').forEach(d=>d.onclick=()=>{sel=+d.dataset.id;draw();});
+  const usedSlots=Object.values(A.ntok).reduce((a,b)=>a+b,0);const alloc=NB-A.free.length;
+  const realTokens=(()=>{let seen=new Set(),n=0;Object.entries(A.tables).forEach(([id,t])=>t.forEach((b,i)=>{if(!seen.has(b)){seen.add(b);n+=Math.max(0,Math.min(BS,A.ntok[id]-i*BS));}}));return n;})();
+  $('paStats').innerHTML=[['Requests',ids.length],['Blocks in use',`${alloc} / ${NB}`],['Slots holding real tokens',alloc?(realTokens/(alloc*BS)*100).toFixed(0)+'%':'n/a'],['Copy-on-write events',A.copies]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');
+  $('paMsg').textContent=msg;}
+document.querySelectorAll('#paW [data-pm]').forEach(b=>b.onclick=()=>{mode=b.dataset.pm;document.querySelectorAll('#paW [data-pm]').forEach(x=>x.classList.toggle('on',x===b));reset();});
+$('paAdd').onclick=add;$('paStep').onclick=step;$('paFork').onclick=fork;$('paFin').onclick=fin;$('paReset').onclick=reset;
+reset();IE.onTheme(draw);
+function cc(){const P=+$('ccP').value*1e9,K=+$('ccK').value,M=+$('ccM').value,Av=+$('ccA').value,B=+$('ccB').value;
+  const contig=Math.floor(P/(M*K));const per=Math.ceil(Av/B)*B*K;const paged=Math.floor(P/per);const waste=(Math.ceil(Av/B)*B-Av)/(Math.ceil(Av/B)*B);
+  $('ccStats').innerHTML=[['Contiguous (reserve max length)',IE.int(contig)],['Paged',IE.int(paged)],['Gain',contig?(paged/contig).toFixed(1)+'×':'n/a'],['Block bytes',IE.int(B*K)],['Waste in last block (average)',(waste*100).toFixed(1)+'%']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['ccP','ccK','ccM','ccA','ccB'].forEach(id=>$(id).addEventListener('input',cc));cc();
+})();
+</script>

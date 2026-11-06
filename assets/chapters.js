@@ -109,7 +109,7 @@ window.IE_CHAPTERS = [
 "title": "PagedAttention and KV memory management",
 "slug": "3-3-paged-attention",
 "part": 3,
-"ready": false
+"ready": true
 },
 {
 "n": "3.4",
