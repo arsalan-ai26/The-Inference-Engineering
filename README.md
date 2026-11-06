@@ -1,0 +1,18 @@
+# The Inference Engineering Book
+
+An interactive, chapter-by-chapter book that takes an AI engineer with little systems experience to expert-level LLM inference engineering.
+
+Read it on GitHub Pages: open `index.html` from the published site.
+
+- Eight parts: foundations, transformer inference mechanics, engines and serving, model optimization, GPUs and kernels, production infrastructure, fine-tuning, and specialized workloads.
+- Every chapter has interactive visuals, a lab that runs on a free GPU (Colab or Kaggle), source corrections, a quiz and checked references.
+- Facts, defaults and prices carry the date they were checked.
+
+## Structure
+
+```
+index.html            table of contents
+chapters/<n>-<m>-<slug>.html   one self-contained page per chapter
+```
+
+No build step. Each page is plain HTML, CSS and JavaScript.

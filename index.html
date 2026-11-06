@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Inference Engineering Book</title>
+</head>
+<body>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root{
+  --bg:#f3f5f8; --panel:#ffffff; --panel2:#e9edf3; --ink:#14213d; --ink2:#46546e; --line:#cfd6e2;
+  --pre:#4f46e5; --pre-s:#e3e1fc; --dec:#c26a06; --dec-s:#fbe9cf; --kv:#0d8a7e; --kv-s:#d2f1ec;
+  --bad:#b4262e; --bad-s:#f8dcdd; --good:#1f7a3a; --good-s:#d9f0df; --mute:#8a95a8;
+  --code-bg:#0f1a2e; --code-fg:#e6ecf5;
+  --f-disp:"Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --f-body:"Source Serif 4", Georgia, "Times New Roman", serif;
+  --f-mono:"JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#0d1424; --panel:#141d31; --panel2:#1b2640; --ink:#e4e9f2; --ink2:#a9b4c8; --line:#2c3a57;
+  --pre:#8f8afc; --pre-s:#262560; --dec:#f0a23b; --dec-s:#47300f; --kv:#3cc7b6; --kv-s:#0f3b38;
+  --bad:#f07a80; --bad-s:#4a1b20; --good:#6ad08a; --good-s:#173a24; --mute:#6f7b92;
+  --code-bg:#070c18; --code-fg:#e6ecf5; color-scheme:dark }}
+:root[data-theme="dark"]{
+  --bg:#0d1424; --panel:#141d31; --panel2:#1b2640; --ink:#e4e9f2; --ink2:#a9b4c8; --line:#2c3a57;
+  --pre:#8f8afc; --pre-s:#262560; --dec:#f0a23b; --dec-s:#47300f; --kv:#3cc7b6; --kv-s:#0f3b38;
+  --bad:#f07a80; --bad-s:#4a1b20; --good:#6ad08a; --good-s:#173a24; --mute:#6f7b92;
+  --code-bg:#070c18; --code-fg:#e6ecf5; color-scheme:dark }
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:18px;line-height:1.6;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.wrap{max-width:1100px;margin:0 auto;padding-block:48px 96px}
+h1,h2{font-family:var(--f-disp);margin:0;text-wrap:balance}
+h1{font-size:clamp(36px,6vw,58px);letter-spacing:-.01em}
+.lede{font-size:20px;color:var(--ink2);max-width:62ch;margin-top:14px}
+.legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:18px;font-family:var(--f-disp);font-size:14px;color:var(--ink2)}
+.legend b{color:var(--pre)} .legend i{color:var(--dec);font-style:normal;font-weight:700} .legend u{color:var(--kv);text-decoration:none;font-weight:700}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:18px;margin-top:40px}
+.part{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;min-width:0}
+.pn{font-family:var(--f-disp);font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--kv);font-weight:700}
+.part h2{font-size:21px;margin-top:6px}
+.part ol{list-style:none;padding:0;margin:14px 0 0;display:flex;flex-direction:column;gap:6px;font-size:16px}
+.part li{display:flex;gap:10px;align-items:baseline;color:var(--ink2)}
+.part li.ready{color:var(--ink)}
+.num{font-family:var(--f-mono);font-size:13px;color:var(--mute);min-width:2.6em}
+.part a{color:var(--ink);font-weight:600}
+.tag{font-family:var(--f-disp);font-size:11px;font-weight:700;color:var(--good);border:1px solid var(--good);border-radius:999px;padding:0 7px;margin-left:auto}
+footer{margin-top:48px;font-size:14px;color:var(--ink2)}
+</style>
+<div class="wrap">
+<h1>The Inference Engineering Book</h1>
+<p class="lede">From AI engineer to inference expert, in eight parts. Every chapter teaches from first principles, with interactive visuals, labs that run on free GPUs, corrections to popular sources, and checked references.</p>
+<div class="legend"><span><b>Prefill</b> is indigo</span><span><i>Decode</i> is amber</span><span><u>KV cache</u> is teal</span><span>(the same colours in every chapter)</span></div>
+<div class="grid"><section class="part" id="part-1"><div class="pn">Part 1 · 2.5 weeks</div><h2>Math, PyTorch and neural net foundations</h2><ol><li class=""><span class="num">1.1</span><span>Linear algebra for LLMs</span></li><li class=""><span class="num">1.2</span><span>Probability and sampling</span></li><li class=""><span class="num">1.3</span><span>Number formats</span></li><li class=""><span class="num">1.4</span><span>PyTorch reading literacy</span></li><li class=""><span class="num">1.5</span><span>Neural nets from first principles</span></li><li class=""><span class="num">1.6</span><span>Remote GPU machines and a reproducible setup</span></li></ol></section><section class="part" id="part-2"><div class="pn">Part 2 · 3.5 weeks</div><h2>Transformers and LLM inference mechanics</h2><ol><li class=""><span class="num">2.1</span><span>Tokenization and embeddings</span></li><li class=""><span class="num">2.2</span><span>Attention and the transformer block</span></li><li class=""><span class="num">2.3</span><span>Positional information</span></li><li class="ready"><span class="num">2.4</span><a href="chapters/2-4-kv-cache.html">Autoregressive generation and the KV cache</a><span class="tag">ready</span></li><li class=""><span class="num">2.5</span><span>Inference arithmetic</span></li><li class=""><span class="num">2.6</span><span>Dense vs mixture-of-experts models</span></li><li class=""><span class="num">2.7</span><span>Expert depth: frontier architectures and research</span></li></ol></section><section class="part" id="part-3"><div class="pn">Part 3 · 3.5 weeks</div><h2>Inference engines and serving</h2><ol><li class=""><span class="num">3.1</span><span>Model formats and runtimes</span></li><li class=""><span class="num">3.2</span><span>Batching and scheduling</span></li><li class=""><span class="num">3.3</span><span>PagedAttention and KV memory management</span></li><li class=""><span class="num">3.4</span><span>Engine internals</span></li><li class=""><span class="num">3.5</span><span>SGLang, RadixAttention and structured output</span></li><li class=""><span class="num">3.6</span><span>TensorRT-LLM, NVIDIA Dynamo and edge runtimes</span></li><li class=""><span class="num">3.7</span><span>Expert depth: the serving ecosystem, multimodal and diffusion serving</span></li></ol></section><section class="part" id="part-4"><div class="pn">Part 4 · 4.5 weeks</div><h2>Model optimization</h2><ol><li class=""><span class="num">4.1</span><span>Quantization</span></li><li class=""><span class="num">4.2</span><span>Efficient attention and attention kernels</span></li><li class=""><span class="num">4.3</span><span>Speculative decoding</span></li><li class=""><span class="num">4.4</span><span>Prefix caching and KV reuse</span></li><li class=""><span class="num">4.5</span><span>Model parallelism</span></li><li class=""><span class="num">4.6</span><span>Prefill/decode disaggregation</span></li><li class=""><span class="num">4.7</span><span>Long-context and tiered KV systems</span></li></ol></section><section class="part" id="part-5"><div class="pn">Part 5 · 4 weeks</div><h2>GPUs, hardware and kernels</h2><ol><li class=""><span class="num">5.1</span><span>Compute, memory and overhead</span></li><li class=""><span class="num">5.2</span><span>GPU architecture</span></li><li class=""><span class="num">5.3</span><span>The CUDA execution model</span></li><li class=""><span class="num">5.4</span><span>Kernels, fusion and Triton</span></li><li class=""><span class="num">5.5</span><span>Hardware landscape</span></li><li class=""><span class="num">5.6</span><span>Profiling</span></li><li class=""><span class="num">5.7</span><span>Compilation and CUDA graphs</span></li><li class=""><span class="num">5.8</span><span>Expert depth: writing high-performance kernels and kernel compilers</span></li></ol></section><section class="part" id="part-6"><div class="pn">Part 6 · 5 weeks</div><h2>Production inference infrastructure</h2><ol><li class=""><span class="num">6.1</span><span>Benchmarking</span></li><li class=""><span class="num">6.2</span><span>Packaging, API layer, startup and shutdown</span></li><li class=""><span class="num">6.3</span><span>Autoscaling and concurrency</span></li><li class=""><span class="num">6.4</span><span>Routing, load balancing and queueing</span></li><li class=""><span class="num">6.5</span><span>Capacity, deployment and cost</span></li><li class=""><span class="num">6.6</span><span>Observability and correctness</span></li><li class=""><span class="num">6.7</span><span>Expert depth: production case studies, cluster infrastructure and confidential inference</span></li><li class=""><span class="num">6.8</span><span>Expert depth: agentic workloads and tooling</span></li><li class=""><span class="num">6.9</span><span>Fault tolerance, security and incident response</span></li><li class=""><span class="num">6.10</span><span>Capstone: public engine teardown</span></li></ol></section><section class="part" id="part-7"><div class="pn">Part 7 · 3 weeks</div><h2>Fine-tuning and post-training</h2><ol><li class=""><span class="num">7.1</span><span>The post-training landscape</span></li><li class=""><span class="num">7.2</span><span>Supervised fine-tuning and data</span></li><li class=""><span class="num">7.3</span><span>LoRA and QLoRA</span></li><li class=""><span class="num">7.4</span><span>Preference tuning and RL</span></li><li class=""><span class="num">7.5</span><span>Distillation</span></li><li class=""><span class="num">7.6</span><span>Evaluating and serving fine-tuned models</span></li><li class=""><span class="num">7.7</span><span>Expert depth: training systems</span></li></ol></section><section class="part" id="part-8"><div class="pn">Part 8 · 5 weeks</div><h2>Specialized workloads, engine internals and research</h2><ol><li class=""><span class="num">8.1</span><span>Specialized inference workloads (elective: pick at least 2)</span></li><li class=""><span class="num">8.2</span><span>Read an inference engine</span></li><li class=""><span class="num">8.3</span><span>Build a mini inference engine</span></li><li class=""><span class="num">8.4</span><span>Reproduce an inference systems paper</span></li><li class=""><span class="num">8.5</span><span>Final capstone: defend a complete inference system</span></li></ol></section></div>
+<footer>Chapters are released as they are written. Facts and prices carry a check date on each page.</footer>
+</div>
+</body>
+</html>
