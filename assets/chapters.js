@@ -32,7 +32,7 @@ window.IE_CHAPTERS = [
 "title": "Neural nets from first principles",
 "slug": "1-5-neural-nets",
 "part": 1,
-"ready": false
+"ready": true
 },
 {
 "n": "1.6",

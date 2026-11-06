@@ -1,0 +1,402 @@
+<div class="kicker">Part 1 · Foundations · Chapter 1.5</div>
+<h1>Neural nets from first principles</h1>
+<p class="lede">A neural network is a stack of matmuls with simple bends between them, tuned by a loop that nudges every weight to reduce an error. This chapter builds that idea from one neuron up to the pieces every transformer uses: embeddings, normalization and residual connections. It ends with the reason older networks failed on long text, which is the problem attention solves.</p>
+<div class="meta">
+  <span class="chip">Level: beginner</span>
+  <span class="chip">Time: 4 to 5 hours with the lab</span>
+  <span class="chip">Needs: 1.1 to 1.4</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why does a network need an activation function between its matmuls?</li>
+    <li>In one sentence, what does backpropagation compute?</li>
+    <li>Why do transformers add the input of each block back to its output?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Without it, a stack of matmuls equals one matmul, so extra layers add nothing.</li>
+    <li>The gradient of the loss with respect to every weight, using the chain rule from the output back to the input.</li>
+    <li>The residual connection gives gradients a direct path through deep stacks, and lets each block add a small change instead of rebuilding the whole vector.</li>
+  </ol></details>
+</div>
+
+<h2 id="neuron">1. One neuron</h2>
+<p>A neuron takes a vector of inputs, computes a dot product with its own weight vector, adds a bias, and applies a simple non-linear function:</p>
+<div class="formula">output = activation( w · x + b )</div>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Weight (w):</strong> a learned number that says how much one input matters.</p>
+  <p><strong>Bias (b):</strong> a learned number added after the dot product. It shifts the output.</p>
+  <p><strong>Activation function:</strong> a fixed non-linear function applied to the result.</p>
+  <p><strong>Parameters:</strong> all weights and biases together. "8B parameters" counts these.</p>
+</div>
+<p>A <strong>layer</strong> is many neurons that read the same input. Stack their weight vectors as columns and the whole layer is one matmul plus a bias vector: y = activation(x W + b). That is the linear layer from chapter 1.1, followed by an activation.</p>
+
+<h2 id="activation">2. Why the bend matters</h2>
+<p>Matmuls compose. Applying W₁ and then W₂ is the same as applying the single matrix W₁W₂. So without an activation, a 100-layer network collapses into a 1-layer network. It can only draw straight lines (more exactly, flat planes) through the data.</p>
+<p>An activation function breaks this. Each layer can now bend the space a little, and many bends together can fit almost any shape.</p>
+<div class="tbl"><table>
+<tr><th>Activation</th><th>Formula</th><th>Where you see it</th></tr>
+<tr><td>ReLU</td><td>max(0, x)</td><td>Classic networks; simple and cheap</td></tr>
+<tr><td>GELU</td><td>x × Φ(x), a smooth ReLU (Φ is the normal distribution's cumulative function)</td><td>GPT-2, BERT</td></tr>
+<tr><td>SiLU (Swish)</td><td>x × sigmoid(x)</td><td>Llama, Qwen, Mistral (inside the SwiGLU MLP)</td></tr>
+</table></div>
+<div class="widget" id="actW">
+  <div class="wt">Interactive: activation functions</div>
+  <div class="ws">Hover or tap the chart to read values. The dashed line is no activation (y = x).</div>
+  <div class="svgwrap"><svg id="actSvg" viewBox="0 0 640 240" width="640" style="max-width:100%;height:auto" role="img" aria-label="Plot of ReLU, GELU and SiLU"></svg></div>
+  <div class="legend"><span><i style="background:var(--pre)"></i>ReLU</span><span><i style="background:var(--dec)"></i>GELU</span><span><i style="background:var(--kv)"></i>SiLU</span></div>
+  <p class="note" id="actMsg">x = 0</p>
+</div>
+<p>Modern LLMs use a gated MLP called <strong>SwiGLU</strong>: two parallel linear layers, one passed through SiLU, multiplied element by element, then a third linear layer. You read its code in chapter 1.4. It has three weight matrices instead of two, which is why Llama's MLP holds 3 × 4,096 × 14,336 parameters per layer.</p>
+
+<h2 id="loss">3. Loss: a number that says how wrong</h2>
+<p>To improve a network, you need a single number that measures how bad its output is. This is the <strong>loss</strong>. Lower is better.</p>
+<ul>
+  <li><strong>Mean squared error</strong> for numbers: the average of (prediction − target)².</li>
+  <li><strong>Cross-entropy</strong> for choices among classes: −log(probability given to the correct class). If the model gives the right token probability 0.9, the loss is −ln(0.9) = 0.105. If it gives 0.01, the loss is 4.6.</li>
+</ul>
+<p>LLMs are trained with cross-entropy on the next token, averaged over every position in the text. This is exactly the negative of the mean logprob from chapter 1.2, and perplexity is e raised to it. A pre-trained model is simply a network that got this loss low on trillions of tokens.</p>
+
+<h2 id="gradient">4. Gradients: which way is downhill</h2>
+<p>Picture the loss as a landscape. Each weight is one direction you can move in. The <strong>gradient</strong> of the loss with respect to a weight tells you two things: which direction increases the loss, and how steeply.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Derivative:</strong> how much an output changes when you change one input by a tiny amount. If dL/dw = 3, increasing w by 0.001 increases L by about 0.003.</p>
+  <p><strong>Gradient:</strong> the list of derivatives of the loss with respect to every parameter.</p>
+  <p><strong>Gradient descent:</strong> move each weight a small step against its gradient: w ← w − (learning rate × dL/dw).</p>
+  <p><strong>Learning rate:</strong> the step size. Too small: training is slow. Too large: the loss jumps around or explodes.</p>
+</div>
+
+<div class="widget" id="gdW">
+  <div class="wt">Interactive: gradient descent on a two-weight landscape</div>
+  <div class="ws">Contours show the loss for every pair of weights. Click or tap the map to choose a start point. Press Step to move against the gradient. Try a large learning rate.</div>
+  <div class="ctrls">
+    <label>Learning rate: <span class="mono" id="gdLv"></span><input type="range" id="gdL" min="0.01" max="1.05" step="0.01" value="0.15"></label>
+    <button class="pri" id="gdStep">Step</button><button id="gdRun">Run 20 steps</button><button id="gdReset">Reset</button>
+  </div>
+  <div class="svgwrap"><svg id="gdSvg" viewBox="0 0 420 300" width="420" style="max-width:100%;height:auto;cursor:crosshair" role="img" aria-label="Loss contour map with gradient descent path"></svg></div>
+  <div class="stats" id="gdStats"></div>
+</div>
+
+<h2 id="backprop">5. Backpropagation: the chain rule, run backwards</h2>
+<p>A network is a chain of simple steps. The <strong>chain rule</strong> says: the derivative of the whole chain is the product of the derivatives of each step. If L depends on ŷ, and ŷ depends on w, then dL/dw = dL/dŷ × dŷ/dw.</p>
+<p>Backpropagation applies this from the loss backwards through every step. Each step needs only its own local derivative and the gradient that arrives from the step after it. One backward pass gives the gradient of every weight, for about twice the cost of the forward pass. That is why training a model costs about 3 times the FLOPs of running it (forward plus about 2× for backward).</p>
+
+<div class="widget" id="bpW">
+  <div class="wt">Interactive: one gradient step on a two-weight network</div>
+  <div class="ws">Network: h = w₁ × x, a = ReLU(h), ŷ = w₂ × a, loss L = (ŷ − y)². Forward values are in indigo. Gradients flowing back are in amber. Press the buttons in order.</div>
+  <div class="ctrls">
+    <label>x <input type="number" id="bpX" value="2" step="0.5" style="width:70px"></label>
+    <label>target y <input type="number" id="bpY" value="3" step="0.5" style="width:70px"></label>
+    <label>w₁ <input type="number" id="bpW1" value="0.5" step="0.1" style="width:80px"></label>
+    <label>w₂ <input type="number" id="bpW2" value="0.8" step="0.1" style="width:80px"></label>
+    <label>learning rate <input type="number" id="bpLR" value="0.05" step="0.01" style="width:80px"></label>
+  </div>
+  <div class="ctrls" style="margin-top:10px"><button class="pri" id="bpF">1. Forward</button><button class="pri" id="bpB">2. Backward</button><button class="pri" id="bpU">3. Update weights</button><button id="bpR">Reset</button></div>
+  <div class="svgwrap"><svg id="bpSvg" viewBox="0 0 700 210" width="700" style="max-width:100%;height:auto" role="img" aria-label="Computation graph with forward values and gradients"></svg></div>
+  <p class="note" id="bpMsg"></p>
+</div>
+<div class="box ex">
+  <span class="lbl">Worked example (the default numbers)</span>
+  <p><strong>Forward:</strong> h = 0.5 × 2 = 1. a = ReLU(1) = 1. ŷ = 0.8 × 1 = 0.8. L = (0.8 − 3)² = 4.84.</p>
+  <p><strong>Backward:</strong> dL/dŷ = 2(ŷ − y) = −4.4. dL/dw₂ = dL/dŷ × a = −4.4. dL/da = dL/dŷ × w₂ = −3.52. ReLU passes the gradient through because h &gt; 0, so dL/dh = −3.52. dL/dw₁ = dL/dh × x = −7.04.</p>
+  <p><strong>Update with learning rate 0.05:</strong> w₁ = 0.5 + 0.352 = 0.852. w₂ = 0.8 + 0.22 = 1.02. New loss = (1.02 × 1.704 − 3)² ≈ 1.59. The loss fell from 4.84.</p>
+</div>
+
+<h2 id="training">6. Training vs inference</h2>
+<div class="tbl"><table>
+<tr><th></th><th>Training</th><th>Inference</th></tr>
+<tr><td>Passes per step</td><td>Forward, backward, update</td><td>Forward only</td></tr>
+<tr><td>FLOPs per token</td><td>About 6 × parameters</td><td>About 2 × parameters</td></tr>
+<tr><td>Memory</td><td>Weights + gradients + optimizer state + saved activations. With the Adam optimizer and mixed precision, about 16 bytes per parameter before activations</td><td>Weights + KV cache + small working buffers</td></tr>
+<tr><td>Weights</td><td>Change every step</td><td>Fixed</td></tr>
+<tr><td>Main limit</td><td>Total compute</td><td>Memory bandwidth and latency per request</td></tr>
+</table></div>
+<p>This is why inference is its own engineering field. The weights never change, so you can compress them, compile the model for one GPU type, and reorganize memory for many users at once. Fine-tuning (Part 7) brings training back in a small, controlled form.</p>
+
+<h2 id="embeddings">7. Embeddings: turning IDs into vectors</h2>
+<p>A network needs vectors, but text arrives as token IDs: integers such as 15496. An <strong>embedding table</strong> is a learned matrix of shape [vocabulary size, hidden size]. Row i is the vector for token i. Looking up a token is just reading one row; there is no multiplication.</p>
+<p>During training, tokens used in similar contexts get similar rows, so their dot products are high. That is how "meaning" enters the network as geometry. The embedding table of Llama 3.1 8B is 128,256 × 4,096 = 525 M parameters, about 6.5% of the model. Chapter 2.1 covers this in depth.</p>
+
+<h2 id="norm">8. Normalization: keeping numbers in range</h2>
+<p>As a vector passes through many layers, its values can grow or shrink a lot. Large swings make training unstable and push values out of the safe range of low-precision formats (chapter 1.3). A <strong>normalization layer</strong> rescales each token vector to a standard size.</p>
+<ul>
+  <li><strong>LayerNorm:</strong> subtract the vector's mean, divide by its standard deviation, then multiply by a learned scale and add a learned shift. Used in GPT-2.</li>
+  <li><strong>RMSNorm:</strong> divide by the root mean square of the vector (no mean subtraction, no shift), then multiply by a learned scale. Cheaper, and used by Llama, Qwen and most current LLMs.</li>
+</ul>
+<div class="formula">RMSNorm(x) = x ÷ √(mean(x²) + ε) × g</div>
+<p>ε is a tiny number (such as 10⁻⁶) that prevents division by zero. g is the learned scale, one value per element. The norm works on each token vector separately, along the hidden dimension. For inference, normalization is cheap in FLOPs but it reads and writes the whole activation, so engines fuse it into neighbouring kernels (chapter 5.4).</p>
+
+<h2 id="residual">9. Residual connections: the main road</h2>
+<p>Deep networks used to be hard to train. Gradients pass back through every layer, and each layer multiplies them by its local derivative. Through 50 layers, a factor of 0.8 per layer leaves 0.8⁵⁰ ≈ 0.00001 of the signal. The early layers stop learning. This is the <strong>vanishing gradient</strong> problem.</p>
+<p>A <strong>residual connection</strong> (also called a skip or shortcut connection) adds the block's input to its output:</p>
+<div class="formula">x_next = x + Block(x)</div>
+<p>The derivative of x with respect to itself is 1, so gradients always have a direct path back through the "+". Each block only has to learn a correction, not the whole vector.</p>
+<p>A good mental model is the <strong>residual stream</strong>: a main road that runs from the embedding to the output. Each attention block and each MLP block reads from the road, computes something, and adds its result back onto the road. Every transformer layer has this structure:</p>
+<div class="svgwrap"><svg viewBox="0 0 700 200" width="700" style="max-width:100%;height:auto" role="img" aria-label="Residual stream diagram: embedding, then attention and MLP blocks that read from and add to a main road, then the output head">
+  <defs><marker id="ar15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="var(--ink2)"/></marker></defs>
+  <line x1="20" y1="120" x2="680" y2="120" stroke="var(--kv)" stroke-width="6" marker-end="url(#ar15)"/>
+  <text x="24" y="150" font-size="12" fill="var(--kv)">1. token embedding enters the stream</text>
+  <g font-size="12" fill="var(--ink)">
+    <rect x="120" y="30" width="120" height="44" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="180" y="50" text-anchor="middle">2. RMSNorm +</text><text x="180" y="66" text-anchor="middle">attention</text>
+    <path d="M140 120 V74" stroke="var(--ink2)" fill="none" marker-end="url(#ar15)"/><path d="M220 74 V112" stroke="var(--ink2)" fill="none" marker-end="url(#ar15)"/><text x="228" y="100" font-size="16" fill="var(--kv)">+</text>
+    <rect x="300" y="30" width="120" height="44" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="360" y="50" text-anchor="middle">3. RMSNorm +</text><text x="360" y="66" text-anchor="middle">MLP</text>
+    <path d="M320 120 V74" stroke="var(--ink2)" fill="none" marker-end="url(#ar15)"/><path d="M400 74 V112" stroke="var(--ink2)" fill="none" marker-end="url(#ar15)"/><text x="408" y="100" font-size="16" fill="var(--kv)">+</text>
+    <text x="490" y="60" text-anchor="middle" fill="var(--ink2)">4. repeat for every layer</text><text x="490" y="78" text-anchor="middle" fill="var(--ink2)">(32 in Llama 3.1 8B)</text>
+    <rect x="560" y="140" width="110" height="44" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="615" y="160" text-anchor="middle">5. final norm +</text><text x="615" y="176" text-anchor="middle">output head</text>
+  </g>
+</svg></div>
+<p>The blocks read a normalized copy ("pre-norm"), but they add to the un-normalized stream. That detail matters when you read model code: there are two normalizations per layer, plus a final one before the output head.</p>
+
+<h2 id="rnn">10. Why older networks failed on long text</h2>
+<p>Before transformers, text models were mostly <strong>recurrent neural networks</strong> (RNNs and their improved form, LSTMs). An RNN reads one token at a time and keeps a fixed-size "memory" vector. At each step it mixes the new token into that vector.</p>
+<p>This design has two problems that matter for this book:</p>
+<ol>
+  <li><strong>Information fades.</strong> Everything the model knows about token 1 must survive being squeezed through every later update. By token 1,000, early details are mostly gone. Gradients that would teach it to keep them also fade on the way back.</li>
+  <li><strong>No parallelism over the sequence.</strong> Step t needs the memory from step t − 1, so training cannot process the tokens of a text at the same time. GPUs, which want huge parallel matmuls, sit mostly idle.</li>
+</ol>
+<div class="widget" id="rnnW">
+  <div class="wt">Interactive: how much of token 1 survives?</div>
+  <div class="ws">A simple model of fading: each RNN step keeps a share r of the old signal. Attention looks back at every earlier token directly, so the distance does not matter.</div>
+  <div class="ctrls"><label>Share kept per step r: <span class="mono" id="rnRv"></span><input type="range" id="rnR" min="0.8" max="0.999" step="0.001" value="0.95"></label></div>
+  <div class="svgwrap"><svg id="rnSvg" viewBox="0 0 640 220" width="640" style="max-width:100%;height:auto" role="img" aria-label="Signal remaining against distance"></svg></div>
+  <p class="note" id="rnMsg"></p>
+</div>
+<p>Attention (chapter 2.2) fixes both: every token can read every earlier token directly through a dot product, and all positions are computed in parallel during training and prefill. The price is that the model must keep a record of every earlier token. That record is the KV cache (chapter 2.4), and managing it is much of what inference engineering is about. Some new architectures bring back fixed-size state to avoid that cost (chapter 2.7).</p>
+
+<h2 id="expert">11. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Why inference cares about training choices</span>
+  <p>Training decisions set inference costs. Pre-norm with RMSNorm keeps activations in a range that suits BF16. Gated MLPs add a third matrix. Weight tying (sharing the embedding and output head) saves memory. Grouped-query attention, chosen at training time, shrinks the KV cache. You inherit all of these when you serve a model.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Massive activations and outliers</span>
+  <p>Trained LLMs develop a few hidden dimensions with values hundreds of times larger than the rest, often tied to specific tokens such as the first token. Normalization keeps the network working, but these outliers break naive 8-bit and 4-bit activation quantization (chapter 4.1).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Autograd is a graph, not magic</span>
+  <p>PyTorch records each operation during the forward pass and stores what each local derivative needs (for example, the input of a ReLU). Backward replays the graph in reverse. A micrograd-style engine with about 100 lines of Python does the same thing for scalars. Building one, as in the lab, removes the mystery.</p>
+</div>
+
+<h2 id="mistakes">12. Common mistakes</h2>
+<ul>
+  <li>Thinking more layers help without activations. Linear layers compose into one.</li>
+  <li>Thinking the gradient points downhill. It points uphill; descent moves against it.</li>
+  <li>Using inference FLOPs (2 × parameters) to estimate training cost. Training is about 6 × parameters per token.</li>
+  <li>Normalizing over the wrong dimension. LayerNorm and RMSNorm act on each token's hidden vector, not across the batch.</li>
+  <li>Forgetting that the residual stream is not normalized. The norm is applied to the copy a block reads.</li>
+</ul>
+
+<h2 id="lab">13. Lab</h2>
+<p><strong>Goal:</strong> do a gradient step by hand, build a tiny autograd engine, check both with PyTorch, then train a small network.</p>
+<h3>Part A: one step by hand</h3>
+<p>Use x = 1.5, y = 2, w₁ = −0.4, w₂ = 1.2 with the network of section 5. On paper (or in the widget), compute the loss, both gradients and the new weights with learning rate 0.1.</p>
+<details><summary>Hint</summary><p>Look at h first. What does ReLU do to its gradient when its input is negative?</p></details>
+<details><summary>Answer</summary><p>h = −0.6, a = 0, ŷ = 0, L = 4. dL/dŷ = −4, dL/dw₂ = −4 × 0 = 0. ReLU blocks the gradient (h &lt; 0), so dL/dw₁ = 0. Nothing updates. This is a "dead ReLU": a neuron whose input is always negative never learns. Smooth activations such as GELU and SiLU avoid this.</p></details>
+<h3>Part B: check with PyTorch autograd</h3>
+<pre>import torch
+x, y = torch.tensor(2.0), torch.tensor(3.0)
+w1 = torch.tensor(0.5, requires_grad=True)
+w2 = torch.tensor(0.8, requires_grad=True)
+loss = (w2 * torch.relu(w1 * x) - y) ** 2
+loss.backward()
+print(loss.item(), w1.grad.item(), w2.grad.item())   # 4.84, -7.04, -4.4</pre>
+<p>Change the numbers to your Part A values and confirm both gradients are 0.</p>
+<h3>Part C: a 40-line autograd engine</h3>
+<p>Read this code line by line. The AI can explain any line, but you should be able to say what <code>_backward</code> does for each operation.</p>
+<pre>class Value:
+    def __init__(self, data, parents=(), op=""):
+        self.data, self.grad = data, 0.0
+        self._parents, self._op = parents, op
+        self._backward = lambda: None
+    def __add__(self, o):
+        o = o if isinstance(o, Value) else Value(o)
+        out = Value(self.data + o.data, (self, o), "+")
+        def bw(): self.grad += out.grad; o.grad += out.grad          # d(a+b)/da = 1
+        out._backward = bw; return out
+    def __mul__(self, o):
+        o = o if isinstance(o, Value) else Value(o)
+        out = Value(self.data * o.data, (self, o), "*")
+        def bw(): self.grad += o.data * out.grad; o.grad += self.data * out.grad   # d(ab)/da = b
+        out._backward = bw; return out
+    def relu(self):
+        out = Value(max(0.0, self.data), (self,), "relu")
+        def bw(): self.grad += (out.data > 0) * out.grad
+        out._backward = bw; return out
+    def __pow__(self, k):
+        out = Value(self.data ** k, (self,), f"**{k}")
+        def bw(): self.grad += k * self.data ** (k - 1) * out.grad
+        out._backward = bw; return out
+    def __sub__(self, o): return self + (o * -1 if isinstance(o, Value) else -o)
+    def backward(self):
+        order, seen = [], set()
+        def build(v):                       # topological order: parents before children
+            if v not in seen:
+                seen.add(v); [build(p) for p in v._parents]; order.append(v)
+        build(self); self.grad = 1.0
+        for v in reversed(order): v._backward()
+
+w1, w2 = Value(0.5), Value(0.8)
+L = (w2 * (w1 * 2.0).relu() - 3.0) ** 2
+L.backward()
+print(L.data, w1.grad, w2.grad)            # must match Part B</pre>
+<p>Why does the code use <code>+=</code> for gradients and not <code>=</code>? Try <code>a = Value(3.0); b = a * a; b.backward()</code> and check that <code>a.grad</code> is 6.</p>
+<h3>Part D: train a small network</h3>
+<p>Fit a curve with a 2-layer MLP. Predict first: with no activation, can it fit y = sin(x)?</p>
+<pre>import torch, torch.nn as nn, math
+torch.manual_seed(0)
+X = torch.linspace(-math.pi, math.pi, 256).unsqueeze(1)    # [256, 1]
+Y = torch.sin(X)
+for act in [nn.Identity(), nn.ReLU(), nn.SiLU()]:
+    net = nn.Sequential(nn.Linear(1, 64), act, nn.Linear(64, 64), act, nn.Linear(64, 1))
+    opt = torch.optim.Adam(net.parameters(), lr=1e-2)
+    for step in range(2000):
+        loss = ((net(X) - Y) ** 2).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+    print(f"{act.__class__.__name__:9s} final loss {loss.item():.5f}")</pre>
+<p>Identity stays stuck near 0.2, the error of the best straight line through a sine wave. ReLU and SiLU go close to zero (about 10⁻⁶).</p>
+<h3>Part E: see normalization and residuals work</h3>
+<pre>def deep(n_layers, residual, norm):
+    torch.manual_seed(0)
+    layers = nn.ModuleList([nn.Linear(256, 256) for _ in range(n_layers)])
+    x = torch.randn(32, 256, requires_grad=True)
+    h = x
+    for lin in layers:
+        z = torch.tanh(lin(nn.functional.rms_norm(h, (256,)) if norm else h))
+        h = h + z if residual else z
+    h.pow(2).mean().backward()
+    return h.abs().mean().item(), layers[0].weight.grad.abs().mean().item()
+
+for res in [False, True]:
+    for norm in [False, True]:
+        act, g = deep(50, res, norm)
+        print(f"residual={res!s:5} norm={norm!s:5}  |activation|={act:8.3f}  |grad of layer 0|={g:.2e}")</pre>
+<p>Look at the gradient reaching layer 0 of a 50-layer stack. Which combination keeps it largest? Which keeps the activations in a stable range?</p>
+<details><summary>What you should see</summary><p>With no residual and no norm, the gradient at layer 0 is around 10⁻¹⁷: it has vanished. Adding RMSNorm alone brings it to about 10⁻³. The residual connection alone gives the largest gradient (about 0.05), but the activations grow as each layer adds to the stream. Residual plus norm keeps a healthy gradient (about 0.01) with activations that grow more slowly. Real transformers use both, plus careful weight initialization. Exact values depend on the PyTorch version.</p></details>
+
+<h2 id="realworld">14. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Where this shows up in serving</span>
+  <ul>
+    <li><strong>Every decoder layer</strong> of Llama, Qwen, Mistral and DeepSeek is "RMSNorm, attention, add, RMSNorm, MLP, add". Inference engines implement exactly these steps, often fused into fewer kernels.</li>
+    <li><strong>Training cost estimates</strong> use 6 × parameters × training tokens. Inference estimates use 2 × parameters per token.</li>
+    <li><strong>Fine-tuning</strong> (Part 7) uses backpropagation, but often updates only small added matrices (LoRA) to save memory.</li>
+    <li><strong>Numerical issues</strong> in production (NaNs, quality drops after quantization) often trace back to normalization, outlier activations or overflow in the residual stream.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">15. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz15"></div>
+<script type="application/json" id="qz15">[
+{"q":"Ten linear layers with no activation functions between them are equivalent to:","o":["Ten times more capacity","One linear layer","A ReLU network","Nothing useful at all"],"a":1,"e":"Matmuls compose: W1 W2 ... W10 is one matrix."},
+{"q":"The model gives the correct next token probability 0.5. Cross-entropy loss is:","o":["0.5","0.693","1.0","−0.5"],"a":1,"e":"−ln(0.5) ≈ 0.693."},
+{"q":"Gradient descent updates a weight by:","o":["Adding the gradient","Subtracting learning rate × gradient","Setting it to the gradient","Multiplying it by the gradient"],"a":1,"e":"The gradient points uphill, so step against it."},
+{"q":"About how many FLOPs per token does training a 7B model take?","o":["14 billion","42 billion","7 billion","700 billion"],"a":1,"e":"About 6 × parameters: 2 for forward and about 4 for backward."},
+{"q":"What does RMSNorm do to a token vector?","o":["Subtracts the batch mean","Divides by the vector's root mean square, then scales by learned weights","Adds positional information","Applies softmax"],"a":1,"e":"RMSNorm rescales each token vector along the hidden dimension."},
+{"q":"Why do residual connections help deep networks train?","o":["They remove activations","They give gradients a direct path with derivative 1 through the addition","They reduce parameters","They normalize the output"],"a":1,"e":"x + f(x) has a derivative of at least the identity path, so gradients do not vanish."},
+{"q":"The main reason RNNs lose information over long texts is:","o":["Their vocabulary is small","Everything must pass through a fixed-size state updated step by step","They use too much memory","They cannot use GPUs at all"],"a":1,"e":"The fixed state is overwritten a little each step, so early information fades."}
+]</script>
+
+<h2 id="summary">16. Summary</h2>
+<ul>
+  <li>A layer is a matmul plus a bias, followed by a non-linear activation. Without activations, layers collapse into one.</li>
+  <li>Loss measures error; LLMs use cross-entropy on the next token.</li>
+  <li>Backpropagation uses the chain rule to get every weight's gradient; gradient descent steps against it.</li>
+  <li>Training costs about 6 × parameters FLOPs per token; inference about 2 ×.</li>
+  <li>Embeddings turn token IDs into vectors; RMSNorm keeps vectors in range; residual connections keep gradients alive.</li>
+  <li>RNNs squeeze history into a fixed state, so they forget and cannot parallelize. Attention keeps every token, at the cost of the KV cache.</li>
+</ul>
+
+<h2 id="refs">17. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://www.3blue1brown.com/topics/neural-networks">3Blue1Brown: Neural Networks</a>, chapters 1 to 4</td><td>The visual story of neurons, gradient descent and backpropagation.</td></tr>
+<tr><td><a href="https://karpathy.ai/zero-to-hero.html">Andrej Karpathy: Neural Networks, Zero to Hero</a> (micrograd lecture)</td><td>Builds the scalar autograd engine of Part C live, step by step.</td></tr>
+<tr><td>Sebastian Raschka, <em>Build a Large Language Model (From Scratch)</em>, sections 4.2 to 4.4 and appendix A.4</td><td>Layer normalization, GELU, shortcut connections with a vanishing-gradient experiment, and autograd in PyTorch.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 2.1.1 to 2.1.3</td><td>Linear layers, activations and why non-linearity prevents layers from collapsing.</td></tr>
+<tr><td>Jay Alammar and Maarten Grootendorst, <em>Hands-On Large Language Models</em>, chapter 1</td><td>A gentle history from bag-of-words and RNNs to attention, with clear figures.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/1910.07467">Zhang and Sennrich, Root Mean Square Layer Normalization</a></td><td>The RMSNorm paper.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2002.05202">Shazeer, GLU Variants Improve Transformer</a></td><td>The SwiGLU MLP used in Llama-style models.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/1512.03385">He et al., Deep Residual Learning</a></td><td>The paper that introduced residual connections.</td></tr>
+</table></div>
+<p class="note">Facts checked on 6 November 2026.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+/* activations */
+const erf=x=>{const t=1/(1+0.3275911*Math.abs(x));const y=1-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*Math.exp(-x*x);return x>=0?y:-y;};
+const A={relu:x=>Math.max(0,x),gelu:x=>0.5*x*(1+erf(x/Math.SQRT2)),silu:x=>x/(1+Math.exp(-x))};
+let ax=0;
+function actDraw(){const s=$('actSvg');s.innerHTML='';const W=640,H=240,X=v=>40+(v+4)/8*(W-60),Y=v=>H-30-(v+1.5)/5.5*(H-50);
+  for(let v=-4;v<=4;v++){el('line',{x1:X(v),x2:X(v),y1:Y(-1.5),y2:Y(4),class:'axis'},s);el('text',{x:X(v),y:H-12,'text-anchor':'middle',class:'tick'},s,v);}
+  for(let v=-1;v<=4;v++){el('line',{x1:X(-4),x2:X(4),y1:Y(v),y2:Y(v),class:'axis'},s);el('text',{x:32,y:Y(v)+4,'text-anchor':'end',class:'tick'},s,v);}
+  el('line',{x1:X(-1.5),y1:Y(-1.5),x2:X(4),y2:Y(4),stroke:css('--mute'),'stroke-dasharray':'4 4'},s);
+  [['relu','--pre'],['gelu','--dec'],['silu','--kv']].forEach(([k,c])=>{let d='';for(let i=0;i<=160;i++){const v=-4+8*i/160;d+=(i?'L':'M')+X(v)+' '+Y(A[k](v));}el('path',{d,fill:'none',stroke:css(c),'stroke-width':2.5},s);});
+  el('line',{x1:X(ax),x2:X(ax),y1:Y(-1.5),y2:Y(4),stroke:css('--ink2')},s);
+  $('actMsg').textContent=`x = ${ax.toFixed(2)}:  ReLU ${A.relu(ax).toFixed(3)}   GELU ${A.gelu(ax).toFixed(3)}   SiLU ${A.silu(ax).toFixed(3)}`;}
+$('actSvg').addEventListener('pointermove',e=>{const r=$('actSvg').getBoundingClientRect();const px=(e.clientX-r.left)*640/r.width;ax=Math.max(-4,Math.min(4,(px-40)/(580)*8-4));actDraw();});
+IE.onTheme(actDraw);
+/* gradient descent: L = 0.5*(a w1^2 + b w2^2) rotated */
+const ca=1,cb=6,th=0.5;
+const rot=(u,v)=>[Math.cos(th)*u+Math.sin(th)*v,-Math.sin(th)*u+Math.cos(th)*v];
+const L=(u,v)=>{const [p,q]=rot(u,v);return 0.5*(ca*p*p+cb*q*q);};
+const G=(u,v)=>{const [p,q]=rot(u,v);const gp=ca*p,gq=cb*q;return[Math.cos(th)*gp-Math.sin(th)*gq,Math.sin(th)*gp+Math.cos(th)*gq];};
+let path=[[-2.4,1.6]];
+const SX=u=>210+u*70,SY=v=>150-v*70;
+function gdDraw(){const s=$('gdSvg');s.innerHTML='';$('gdLv').textContent=(+$('gdL').value).toFixed(2);
+  const N=60;for(let i=0;i<N;i++)for(let j=0;j<N;j++){const u=-3+6*i/N,v=-2.14+4.28*j/N;const l=L(u,v);const t=Math.min(1,Math.log(1+l)/Math.log(1+20));
+    el('rect',{x:SX(u),y:SY(v)-300/N*1.03,width:420/N+0.5,height:300/N+0.5,fill:css('--kv'),opacity:(0.08+0.6*(1-t)).toFixed(2)},s);}
+  for(const lv of [0.1,0.5,1,2,4,8,14]){/* contour ellipse */let d='';for(let k=0;k<=64;k++){const a=2*Math.PI*k/64;const p=Math.sqrt(2*lv/ca)*Math.cos(a),q=Math.sqrt(2*lv/cb)*Math.sin(a);const u=Math.cos(th)*p-Math.sin(th)*q,v=Math.sin(th)*p+Math.cos(th)*q;d+=(k?'L':'M')+SX(u)+' '+SY(v);}el('path',{d,fill:'none',stroke:css('--ink2'),'stroke-width':0.6,opacity:0.6},s);}
+  el('path',{d:path.map((p,i)=>(i?'L':'M')+SX(p[0])+' '+SY(p[1])).join(' '),fill:'none',stroke:css('--dec'),'stroke-width':2},s);
+  path.forEach((p,i)=>el('circle',{cx:SX(p[0]),cy:SY(p[1]),r:i===path.length-1?5:3,fill:css(i===path.length-1?'--bad':'--dec')},s));
+  el('circle',{cx:SX(0),cy:SY(0),r:4,fill:css('--good')},s);el('text',{x:SX(0)+8,y:SY(0)-6,class:'tick'},s,'minimum');
+  const p=path[path.length-1];const l=L(p[0],p[1]);
+  $('gdStats').innerHTML=[['Steps',path.length-1],['w₁, w₂',`${p[0].toFixed(2)}, ${p[1].toFixed(2)}`],['Loss',isFinite(l)?l.toPrecision(3):'∞'],['Status',l>50?'diverging':l<0.01?'converged':'moving']].map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');}
+function gdStep(){const p=path[path.length-1];const g=G(p[0],p[1]);const lr=+$('gdL').value;const n=[p[0]-lr*g[0],p[1]-lr*g[1]];if(Math.abs(n[0])<1e3&&Math.abs(n[1])<1e3)path.push(n);}
+$('gdStep').onclick=()=>{gdStep();gdDraw();};$('gdRun').onclick=()=>{for(let i=0;i<20;i++)gdStep();gdDraw();};$('gdReset').onclick=()=>{path=[path[0]];gdDraw();};
+$('gdSvg').addEventListener('click',e=>{const r=$('gdSvg').getBoundingClientRect();const px=(e.clientX-r.left)*420/r.width,py=(e.clientY-r.top)*300/r.height;path=[[(px-210)/70,(150-py)/70]];gdDraw();});
+$('gdL').addEventListener('input',gdDraw);IE.onTheme(gdDraw);
+/* backprop graph */
+let B={stage:0};
+function bpGet(){return{x:+$('bpX').value,y:+$('bpY').value,w1:+$('bpW1').value,w2:+$('bpW2').value,lr:+$('bpLR').value};}
+function bpDraw(){const s=$('bpSvg');s.innerHTML='';const v=bpGet();
+  const h=v.w1*v.x,a=Math.max(0,h),yh=v.w2*a,Lo=(yh-v.y)**2;
+  const dy=2*(yh-v.y),dw2=dy*a,da=dy*v.w2,dh=h>0?da:0,dw1=dh*v.x;
+  const nodes=[['x',60,110,v.x,null],['w₁',60,40,v.w1,dw1],['h = w₁x',180,80,h,dh],['a = ReLU(h)',320,80,a,da],['w₂',320,170,v.w2,dw2],['ŷ = w₂a',460,120,yh,dy],['L = (ŷ−y)²',600,120,Lo,1]];
+  const edges=[[0,2],[1,2],[2,3],[3,5],[4,5],[5,6]];
+  edges.forEach(([i,j])=>el('line',{x1:nodes[i][1]+40,y1:nodes[i][2],x2:nodes[j][1]-48,y2:nodes[j][2],stroke:css('--line'),'stroke-width':2},s));
+  const f=n=>Math.abs(n)>=100?n.toFixed(0):n.toFixed(3).replace(/\.?0+$/,'')||'0';
+  nodes.forEach(([n,x,y,val,g])=>{el('rect',{x:x-48,y:y-24,width:96,height:48,rx:8,fill:css('--panel2'),stroke:css('--line')},s);
+    el('text',{x,y:y-8,'text-anchor':'middle','font-size':11,fill:css('--ink')},s,n);
+    if(B.stage>=1||n==='x'||n.startsWith('w'))el('text',{x,y:y+8,'text-anchor':'middle','font-size':12,fill:css('--pre'),'font-weight':700},s,f(val));
+    if(B.stage>=2&&g!==null)el('text',{x,y:y+21,'text-anchor':'middle','font-size':11,fill:css('--dec'),'font-weight':700},s,'grad '+f(g));});
+  let msg='Press Forward.';
+  if(B.stage===1)msg=`Forward done. Loss = ${f(Lo)}.`;
+  if(B.stage>=2)msg=`Backward done. dL/dw₁ = ${f(dw1)}, dL/dw₂ = ${f(dw2)}.${h<=0?' ReLU input is not positive, so no gradient reaches w₁.':''}`;
+  if(B.stage===3)msg=B.msg;
+  $('bpMsg').textContent=msg;
+  return{dw1,dw2,Lo};}
+$('bpF').onclick=()=>{B.stage=1;bpDraw();};$('bpB').onclick=()=>{if(B.stage<1)B.stage=1;B.stage=2;bpDraw();};
+$('bpU').onclick=()=>{const v=bpGet();const r=bpDraw();const n1=v.w1-v.lr*r.dw1,n2=v.w2-v.lr*r.dw2;$('bpW1').value=+n1.toFixed(4);$('bpW2').value=+n2.toFixed(4);
+  const nl=(n2*Math.max(0,n1*v.x)-v.y)**2;B.stage=3;B.msg=`Updated: w₁ = ${n1.toFixed(3)}, w₂ = ${n2.toFixed(3)}. Loss went from ${r.Lo.toFixed(3)} to ${nl.toFixed(3)}. Press Forward and Backward again for the next step.`;bpDraw();B.stage=0;};
+$('bpR').onclick=()=>{$('bpX').value=2;$('bpY').value=3;$('bpW1').value=0.5;$('bpW2').value=0.8;$('bpLR').value=0.05;B.stage=0;bpDraw();};
+['bpX','bpY','bpW1','bpW2','bpLR'].forEach(id=>$(id).addEventListener('input',()=>{B.stage=0;bpDraw();}));
+IE.onTheme(bpDraw);
+/* rnn fade */
+function rnDraw(){const r=+$('rnR').value;$('rnRv').textContent=r.toFixed(3);const s=$('rnSvg');s.innerHTML='';const W=640,H=220,N=2000;
+  const X=d=>50+d/N*(W-70),Y=v=>H-30-v*(H-50);
+  for(let i=0;i<=4;i++){el('line',{x1:50,x2:W-20,y1:Y(i/4),y2:Y(i/4),class:'axis'},s);el('text',{x:44,y:Y(i/4)+4,'text-anchor':'end',class:'tick'},s,(i*25)+'%');}
+  [0,500,1000,1500,2000].forEach(d=>el('text',{x:X(d),y:H-12,'text-anchor':'middle',class:'tick'},s,d));
+  let d='';for(let i=0;i<=200;i++){const t=N*i/200;d+=(i?'L':'M')+X(t)+' '+Y(Math.pow(r,t));}
+  el('path',{d,fill:'none',stroke:css('--dec'),'stroke-width':2.5},s);
+  el('line',{x1:X(0),x2:X(N),y1:Y(1),y2:Y(1),stroke:css('--kv'),'stroke-width':2.5,'stroke-dasharray':'6 4'},s);
+  el('text',{x:X(N)-4,y:Y(1)-8,'text-anchor':'end','font-size':12,fill:css('--kv')},s,'attention: direct access');
+  el('text',{x:X(60),y:Y(0.1)-8,'font-size':12,fill:css('--dec')},s,'RNN: fades step by step');
+  const half=Math.log(0.5)/Math.log(r);$('rnMsg').textContent=`With r = ${r.toFixed(3)}, half the signal is gone after ${half.toFixed(0)} tokens, and 99% after ${(Math.log(0.01)/Math.log(r)).toFixed(0)}. (Real RNNs and LSTMs learn gates to fade more slowly, but they still squeeze everything into one fixed-size state.)`;}
+$('rnR').addEventListener('input',rnDraw);IE.onTheme(rnDraw);
+})();
+</script>
