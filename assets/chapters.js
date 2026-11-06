@@ -123,7 +123,7 @@ window.IE_CHAPTERS = [
 "title": "SGLang, RadixAttention and structured output",
 "slug": "3-5-prefix-caching-structured-output",
 "part": 3,
-"ready": false
+"ready": true
 },
 {
 "n": "3.6",

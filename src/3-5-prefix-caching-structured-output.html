@@ -1,0 +1,391 @@
+<div class="kicker">Part 3 · Inference engines and serving · Chapter 3.5</div>
+<h1>Prefix caching, RadixAttention and structured output</h1>
+<p class="lede">Real traffic repeats itself. The same system prompt starts thousands of requests, every turn of a chat re-sends the whole history, and agents call the model again and again over a growing context. Reusing the KV cache of repeated prefixes can remove most of the prefill work. This chapter covers how engines find and keep reusable prefixes (block hashing in vLLM, the radix tree in SGLang), what makes reuse safe, and the second big SGLang idea: forcing output to follow a grammar, which is how JSON mode and tool calling work inside an engine.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 5 hours with the lab</span>
+  <span class="chip">Needs: 1.2, 2.1, 3.2, 3.3</span>
+  <span class="chip">Compute: Colab CPU for the simulators; T4 for vLLM</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Two requests share a 1,000-token system prompt. With 16-token blocks, how many prompt tokens can the second request skip?</li>
+    <li>Two prompts produce the same text but through different chat templates. Can they share cached KV?</li>
+    <li>How does an engine guarantee that output is valid JSON?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>992 (62 full blocks). The last 8 tokens are in a partial block and are prefilled again.</li>
+    <li>Only if they produce exactly the same token IDs in the same order. Reuse is by tokens (plus model, adapter and other keys), not by text meaning.</li>
+    <li>Constrained decoding: at each step a grammar built from the JSON schema computes which tokens are allowed, and all others get their logits set to minus infinity before sampling.</li>
+  </ol></details>
+</div>
+
+<h2 id="problem">1. The problem: the same prefill again and again</h2>
+<p>Recall from chapter 2.4 that a token's keys and values depend only on the tokens before it. So if two requests start with exactly the same tokens, the KV cache for that shared start is identical. Computing it twice is pure waste. Where repeated prefixes come from:</p>
+<ul>
+  <li><strong>System prompts and few-shot examples</strong> shared by every request of an application.</li>
+  <li><strong>Multi-turn chat:</strong> turn 10 re-sends turns 1 to 9.</li>
+  <li><strong>RAG:</strong> popular documents appear in many prompts.</li>
+  <li><strong>Agents:</strong> each tool-use step re-sends the growing transcript.</li>
+  <li><strong>Parallel sampling and evaluation:</strong> many completions or questions over one long context.</li>
+</ul>
+<p>Prefill is compute-bound (chapter 2.5). Skipping it lowers time to first token directly and frees GPU time for other requests. That is why hosted APIs bill cached input tokens at a discount.</p>
+
+<h2 id="hash">2. Block hashing (vLLM automatic prefix caching)</h2>
+<p>vLLM builds prefix caching on the paged KV cache of chapter 3.3. Each <em>full</em> block gets a hash computed from three things:</p>
+<div class="formula">block hash = hash( parent block's hash , this block's token IDs , extra keys )</div>
+<ul>
+  <li>The <strong>parent hash</strong> chains every block to everything before it, so equal hashes mean equal full prefixes, not just equal blocks.</li>
+  <li>The <strong>token IDs</strong> of the block itself.</li>
+  <li><strong>Extra keys</strong> that must also match: the LoRA adapter, hashes of images or other multimodal inputs, and an optional per-request <strong>cache salt</strong>.</li>
+</ul>
+<p>The engine keeps a table from block hash to physical block. When a request arrives:</p>
+<ol>
+  <li>Hash the prompt block by block and look each hash up, stopping at the first miss.</li>
+  <li>Point the request's block table at the matching cached blocks (raising their reference counts) and schedule only the remaining tokens for prefill.</li>
+  <li>After the new blocks are filled, add their hashes to the table.</li>
+</ol>
+<p>When a request finishes, its blocks are not erased. Their reference counts fall to 0 and they join the free queue <em>with their contents and hashes intact</em>. They are evicted only when the allocator needs a free block, in least-recently-used order. So the cache uses all otherwise-idle KV memory, at no cost to normal allocation.</p>
+<p>Since v0.11, vLLM's default hash is SHA-256, chosen to make collisions practically impossible. Faster non-cryptographic hashes are available as options, with a documented collision risk.</p>
+
+<h2 id="radix">3. RadixAttention (SGLang)</h2>
+<p>SGLang takes a different data structure. It keeps a <strong>radix tree</strong> (a compressed prefix tree) over the token sequences of all cached requests. Each edge holds a run of tokens and points at their KV entries. Requests that share a beginning share the path from the root.</p>
+
+<div class="widget" id="rxW">
+  <div class="wt">Interactive: a radix tree of prompts</div>
+  <div class="ws">Each line is one prompt, written as words (one word stands in for one token). Shared beginnings become shared branches. The number on an edge is how many prompts used it. Edit the prompts or load an example.</div>
+  <div class="ctrls">
+    <span class="seg" role="group" aria-label="Examples"><button data-ex="sys">Shared system prompt</button><button data-ex="chat">Multi-turn chat</button><button data-ex="rag">RAG documents</button><button data-ex="fewshot">Few-shot + questions</button></span>
+  </div>
+  <textarea id="rxIn" rows="5" style="width:100%;margin-top:10px;font-family:var(--f-mono);font-size:13px;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px"></textarea>
+  <div class="svgwrap"><svg id="rxSvg" role="img" aria-label="Radix tree of shared prompt prefixes"></svg></div>
+  <div class="stats" id="rxStats"></div>
+</div>
+<div class="tbl"><table>
+<tr><th></th><th>Block hashing (vLLM)</th><th>Radix tree (SGLang)</th></tr>
+<tr><td>Granularity</td><td>Whole blocks (often 16 tokens)</td><td>Single tokens by default (page size 1), or pages</td></tr>
+<tr><td>Lookup</td><td>Hash each block in order</td><td>Walk the tree</td></tr>
+<tr><td>Eviction</td><td>LRU over freed blocks</td><td>LRU over leaves of the tree</td></tr>
+<tr><td>Scheduling use</td><td>Admission skips cached tokens</td><td>Cache-aware ordering: requests with longer cached prefixes can be served first to raise hit rates</td></tr>
+</table></div>
+<p>The SGLang paper reported up to 6.4 times higher throughput than earlier systems on workloads with heavy sharing (agents, few-shot, RAG, multi-turn chat, JSON decoding). Both designs now perform well; the bigger difference in practice is how each engine's scheduler and router use the cache.</p>
+
+<h2 id="safe">4. When is reuse safe?</h2>
+<p>Prefix caching does not change outputs when it is correct, because the reused keys and values are exactly what prefill would compute. Correctness depends on the cache key covering everything that changes the KV:</p>
+<div class="tbl"><table>
+<tr><th>Must match</th><th>Why</th><th>How engines handle it</th></tr>
+<tr><td>Exact token IDs from the start</td><td>K and V depend on every earlier token</td><td>Chained block hashes or tree paths</td></tr>
+<tr><td>Model weights and revision</td><td>Different weights give different K and V</td><td>One cache per loaded model</td></tr>
+<tr><td>Tokenizer and chat template</td><td>Same text can tokenize differently; templates add tokens</td><td>Reuse is by token IDs, so mismatches simply miss</td></tr>
+<tr><td>LoRA adapter</td><td>Adapters change the projections</td><td>Adapter ID in the extra keys</td></tr>
+<tr><td>Images and other media</td><td>Placeholder tokens look identical for different images</td><td>Media hashes in the extra keys</td></tr>
+<tr><td>Tenant (optional)</td><td>A shared cache leaks timing: a fast TTFT reveals that someone else sent that prefix</td><td>A per-tenant cache salt mixed into the first block's hash</td></tr>
+</table></div>
+<div class="box watch">
+  <span class="lbl">Watch out: hash collisions</span>
+  <p>If two different prefixes ever produced the same hash, one request would silently reuse another's KV cache: wrong output, and possibly another user's data in the response. That is why vLLM moved to SHA-256 by default, and why some small engines also compare the stored token IDs after a hash match before reusing a block.</p>
+</div>
+
+<h2 id="churn">5. Eviction, churn and hit rates</h2>
+<p>The prefix cache lives in free KV memory, so its size changes with load. When many requests are running, there is little free memory, cached blocks are evicted quickly, and the hit rate falls exactly when you need it most. This is <strong>cache churn</strong>.</p>
+<div class="widget" id="chuW">
+  <div class="wt">Interactive: hit rate vs cache size</div>
+  <div class="ws">A simulated mixed workload: a shared 600-token system prompt, RAG documents with a few very popular ones, and multi-turn sessions that grow by about 180 tokens a turn. LRU eviction over 16-token blocks.</div>
+  <div class="ctrls">
+    <label>Cache capacity (blocks): <span class="mono" id="chuCv"></span><input type="range" id="chuC" min="0" max="8" value="3"></label>
+    <label>Sessions active <select id="chuS"><option>20</option><option selected>100</option><option>400</option></select></label>
+    <label>Documents <select id="chuD"><option>50</option><option selected>200</option><option>1000</option></select></label>
+    <button class="pri" id="chuRun">Run 1,000 requests</button>
+  </div>
+  <div class="svgwrap"><svg id="chuSvg" viewBox="0 0 680 220" width="680" style="max-width:100%;height:auto" role="img" aria-label="Hit rate against cache capacity"></svg></div>
+  <div class="stats" id="chuStats"></div>
+</div>
+<p>Ways teams raise hit rates:</p>
+<ul>
+  <li><strong>Put stable content first.</strong> System prompt, then tools, then documents, then the conversation, then the new question. Anything that changes per request (a timestamp, a user name) placed early breaks every block after it.</li>
+  <li><strong>Route by prefix.</strong> Send requests that share a prefix to the same replica (chapter 6.4). A cache on replica A does nothing for a request sent to replica B.</li>
+  <li><strong>Extend the cache beyond GPU memory.</strong> Offload cold blocks to CPU memory or SSD and load them back on a hit (chapter 4.7).</li>
+  <li><strong>Measure.</strong> vLLM reports <code>prefix_cache_queries</code> and <code>prefix_cache_hits</code> (in tokens); the ratio is the hit rate (chapter 3.1).</li>
+</ul>
+<div class="box ex">
+  <span class="lbl">Real-world case: scoring many items with one prefix</span>
+  <p>LinkedIn uses SGLang for recommendation scoring: a long member context followed by one short candidate item, with almost no output. Prefix caching alone still re-sends the member context once per item. Their "multi-item scoring" packs the member prefix and many candidate items into one prompt, with a custom attention mask so each item sees the prefix but not the other items. They added this mask to FlashInfer's attention kernels and contributed it upstream.</p>
+</div>
+
+<h2 id="structured">6. Structured output: making the model follow a grammar</h2>
+<p>Applications often need output that a program can parse: JSON matching a schema, a value from a fixed list, a date in one format, or a function call. Asking politely in the prompt works most of the time. "Most of the time" breaks production code.</p>
+<p><strong>Constrained decoding</strong> (also called guided decoding or structured output) guarantees the format. It builds on the logit bias of chapter 1.2:</p>
+<ol>
+  <li><strong>Compile.</strong> Turn the JSON schema, regular expression or grammar into an automaton: a machine that knows which characters may come next in any state.</li>
+  <li><strong>Mask.</strong> At each step, find every vocabulary token whose characters keep the automaton in a valid state. Build a bitmask over the vocabulary.</li>
+  <li><strong>Apply.</strong> Set the logits of all masked-out tokens to −∞, then sample as usual (temperature, top-p and so on still apply among the allowed tokens).</li>
+  <li><strong>Advance.</strong> Feed the chosen token's characters into the automaton.</li>
+</ol>
+
+<div class="widget" id="cdW">
+  <div class="wt">Interactive: constrained decoding, token by token</div>
+  <div class="ws">Target schema: <code>{"city": string, "temp": integer}</code>. A toy model prefers some tokens (bar height). Grey tokens are blocked by the grammar in the current state. With the grammar off, the model's favourite at one step breaks the JSON.</div>
+  <div class="ctrls">
+    <div class="seg" role="group" aria-label="Grammar"><button id="cdOn" class="on">Grammar on</button><button id="cdOff">Grammar off</button></div>
+    <button class="pri" id="cdStep">Next token</button><button id="cdReset">Reset</button>
+  </div>
+  <div class="mono" id="cdText" style="margin-top:12px;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);min-height:2.2em;white-space:pre-wrap"></div>
+  <div class="svgwrap"><svg id="cdSvg" viewBox="0 0 680 210" width="680" style="max-width:100%;height:auto" role="img" aria-label="Token preferences and grammar mask"></svg></div>
+  <p class="note" id="cdMsg"></p>
+</div>
+
+<h3>What it costs, and how engines hide it</h3>
+<p>A vocabulary has 100,000 to 260,000 tokens, and a single token can span several grammar symbols (for example <code>":"</code>). Checking every token at every step is expensive. Modern grammar engines are fast because of two ideas:</p>
+<ul>
+  <li><strong>Precompute what does not depend on context.</strong> XGrammar splits the vocabulary into tokens whose validity can be decided ahead of time for each grammar position, and the few that must be checked at run time against the parser's stack. It caches the precomputed masks.</li>
+  <li><strong>Work lazily and in parallel.</strong> LLGuidance builds its automaton lazily and walks a prefix tree of the vocabulary each step, so it starts quickly even for new schemas.</li>
+</ul>
+<p>Engines then <strong>overlap</strong> mask generation with the GPU's forward pass, so the mask is ready when the logits are. An independent benchmark across vLLM and SGLang found the best choice depends on the workload: with one schema reused many times, XGrammar's precomputation and caching gave the highest throughput; with a new schema on every request, grammar compile time dominated, and the lazy approach and each engine's integration mattered more. Compiling a new grammar can add noticeable latency to the first request that uses it; vLLM's documentation warns of several seconds for complex schemas.</p>
+<p>SGLang's paper adds <strong>jump-forward decoding</strong> with a compressed automaton: when the grammar allows only one continuation (for example the literal <code>"temp": </code> after a comma), the engine appends those tokens directly without running the model for each one.</p>
+<div class="box watch">
+  <span class="lbl">Watch out: valid is not the same as correct</span>
+  <p>Constraints guarantee format, not content. Forcing a structure the model did not plan can also lower quality, for example when a schema puts the answer field before the reasoning field. Describe the schema in the prompt too, so the model's intent and the mask agree.</p>
+</div>
+
+<h2 id="tools">7. Tool calling at the inference layer</h2>
+<p>When you send <code>tools</code> to an OpenAI-compatible endpoint, four layers work together:</p>
+<ol>
+  <li><strong>API request.</strong> Tools arrive as a separate field with JSON schemas.</li>
+  <li><strong>Chat template.</strong> The model's template renders the tool definitions into the prompt in the format the model was trained on (chapter 2.1). This is why a wrong template breaks tool use.</li>
+  <li><strong>Generation.</strong> The model writes the call as text in its own format, often inside special markers such as <code>&lt;tool_call&gt;...&lt;/tool_call&gt;</code>. With <code>tool_choice</code> set to <code>"required"</code> or to a named function, vLLM uses structured output to force a call that matches the schema. With <code>"auto"</code>, the model decides whether to call a tool, unconstrained by default.</li>
+  <li><strong>Parsing.</strong> A model-family-specific <strong>tool parser</strong> (selected in vLLM with <code>--tool-call-parser</code>, with <code>--enable-auto-tool-choice</code>) extracts the call from the text and returns it in the structured <code>tool_calls</code> field. When streaming, it must emit partial calls as arguments arrive.</li>
+</ol>
+<p>Each layer is a place to fail: a template that renders tools differently from training, a parser that does not match the model's markers, or arguments that are valid JSON but violate the schema when unconstrained. Tool-calling quality varies noticeably between inference providers serving the same open model, mostly for these reasons.</p>
+
+<h2 id="expert">8. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Programs, not prompts</span>
+  <p>SGLang began as a language for LLM programs: primitives such as <code>gen</code>, <code>select</code> and <code>fork</code> let one program branch into parallel calls that share a prefix. The runtime sees the whole program, so it can keep the shared prefix cached and schedule the branches together. Agent frameworks get much of the same benefit from prefix caching plus prefix-aware routing.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Positions and cached prefixes</span>
+  <p>Cached keys already carry their RoPE positions (chapter 2.3). A cached block can therefore only be reused at the same position in a new sequence. Reusing a document's KV in the middle of a different prompt, at a different offset, is not exact; research on "position-independent" caching tries to correct for this, at some quality cost.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Cache-aware scheduling trade-offs</span>
+  <p>Serving requests with the longest cached prefix first raises hit rates but can starve requests that share nothing. Engines combine cache-aware ordering with fairness limits. Across replicas, routers face the same trade-off between cache affinity and load balance (chapter 6.4).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Token-efficient formats</span>
+  <p>JSON spends many tokens on quotes, braces and repeated keys. Some projects propose compact structured notations to cut output tokens, and so decode time and cost. Measure with your model's tokenizer before switching: models are trained mostly on JSON, and an unfamiliar format can cost accuracy.</p>
+</div>
+
+<h2 id="mistakes">9. Common mistakes</h2>
+<ul>
+  <li>Putting a timestamp, request ID or user name at the start of the system prompt, breaking every cache hit after it.</li>
+  <li>Measuring prefix-cache benefit on an idle server; churn under load can remove most of it.</li>
+  <li>Sharing one cache across tenants without a salt when timing side channels matter.</li>
+  <li>Using a new JSON schema per request and blaming the model for slow first tokens; check grammar compile time.</li>
+  <li>Assuming <code>tool_choice: "auto"</code> guarantees schema-valid arguments.</li>
+  <li>Serving a model with the wrong tool parser or chat template and concluding the model is bad at tools.</li>
+</ul>
+
+<h2 id="lab">10. Lab</h2>
+<p><strong>Goal:</strong> measure prefix reuse and its collapse under churn, and measure the cost of structured output.</p>
+<h3>Part A: the 100 Days notebook</h3>
+<p>Run day 10 (SGLang and RadixAttention) of <em>100 Days of Inference</em>. Note the hit rates it reports for its sharing patterns.</p>
+<h3>Part B: a prefix-cache simulator</h3>
+<p>This tested simulator implements block hashing with LRU eviction and a mixed workload. Read it, then predict the hit rate for each capacity before you run it.</p>
+<pre>import hashlib, random
+from collections import OrderedDict
+
+class PrefixCache:
+    """Block-hash prefix cache with LRU eviction (the idea behind vLLM automatic prefix caching)."""
+    def __init__(self, capacity_blocks, block_size=16, salt=""):
+        self.cap, self.bs, self.salt = capacity_blocks, block_size, salt
+        self.lru = OrderedDict()                       # block hash -> None, oldest first
+        self.queries = self.hits = 0                   # counted in tokens
+
+    def _hashes(self, tokens, extra=""):
+        h, out = (self.salt + extra).encode(), []
+        for i in range(len(tokens) // self.bs):        # only FULL blocks can be cached
+            blk = tokens[i * self.bs:(i + 1) * self.bs]
+            h = hashlib.sha256(h + repr(blk).encode()).digest()   # parent hash + this block's tokens
+            out.append(h)
+        return out
+
+    def run(self, tokens, extra=""):
+        """Process one prompt. Returns the number of prompt tokens that must be prefilled."""
+        hs = self._hashes(tokens, extra)
+        hit = 0
+        for h in hs:                                   # longest cached prefix, block by block
+            if h in self.lru:
+                hit += 1; self.lru.move_to_end(h)
+            else:
+                break
+        for h in hs[hit:]:                             # the new blocks become cached after prefill
+            self.lru[h] = None; self.lru.move_to_end(h)
+            while len(self.lru) &gt; self.cap:
+                self.lru.popitem(last=False)           # evict least recently used
+        self.queries += len(tokens); self.hits += hit * self.bs
+        return len(tokens) - hit * self.bs
+
+def workload(seed=0, n=2000, n_docs=200, n_sessions=100):
+    rnd = random.Random(seed)
+    system = list(range(1000, 1600))                   # 600-token shared system prompt
+    docs = [[rnd.randint(0, 50000) for _ in range(800)] for _ in range(n_docs)]
+    sessions = {s: [] for s in range(n_sessions)}
+    for _ in range(n):
+        s = rnd.randrange(n_sessions)
+        doc = docs[min(int(rnd.paretovariate(1.2)) - 1, n_docs - 1)]   # popular documents are reused
+        if not sessions[s]: sessions[s] = system + doc
+        sessions[s] = sessions[s] + [rnd.randint(0, 50000) for _ in range(60)]   # new user turn
+        yield list(sessions[s])
+        sessions[s] = sessions[s] + [rnd.randint(0, 50000) for _ in range(120)]  # model reply joins history
+
+for cap in [200, 1000, 5000, 20000]:
+    c = PrefixCache(cap); prefill = sum(c.run(p) for p in workload())
+    print(f"cache {cap:6d} blocks: token hit rate {c.hits / c.queries:6.1%}  prefill tokens {prefill:,}")</pre>
+<details><summary>What you should see</summary><p>About 14%, 39%, 59% and 94% token hit rates for 200, 1,000, 5,000 and 20,000 blocks. The hit rate rises steeply once the cache can hold the active sessions' histories. Then try: (1) put a random 16-token "timestamp" at the start of every prompt and watch the hit rate collapse; (2) use a different <code>salt</code> per session and see what isolation costs.</p></details>
+<h3>Part C: churn on a real engine (T4)</h3>
+<p>Start vLLM twice with Qwen2.5-0.5B: once normally, and once with a tiny KV pool (<code>--num-gpu-blocks-override 200</code>) so the cache churns. For each, replay the multi-turn workload of Part B as real requests (decode the token lists with random words, or build prompts from a shared system prompt plus growing chat histories). Record TTFT p50 and the hit rate from <code>/metrics</code> (<code>vllm:prefix_cache_hits</code> ÷ <code>vllm:prefix_cache_queries</code>). Predict both before you run.</p>
+<h3>Part D: the cost of structured output</h3>
+<pre>import time, json, requests
+URL = "http://localhost:8000/v1/chat/completions"
+schema = {"type": "object", "properties": {"title": {"type": "string"}, "author": {"type": "string"},
+          "year": {"type": "integer"}, "genres": {"type": "array", "items": {"type": "string"}}},
+          "required": ["title", "author", "year", "genres"]}
+def ask(i, constrained):
+    body = {"model": "Qwen/Qwen2.5-0.5B-Instruct", "max_tokens": 120, "temperature": 0,
+            "messages": [{"role": "user", "content": f"Give book metadata as JSON with title, author, year, genres for a famous novel number {i}."}]}
+    if constrained:
+        body["response_format"] = {"type": "json_schema", "json_schema": {"name": "book", "schema": schema}}
+    t = time.perf_counter(); r = requests.post(URL, json=body).json(); dt = time.perf_counter() - t
+    txt = r["choices"][0]["message"]["content"]
+    try: obj = json.loads(txt); ok = all(k in obj for k in schema["required"])
+    except Exception: ok = False
+    return dt, ok
+for constrained in [False, True]:
+    res = [ask(i, constrained) for i in range(20)]
+    print(f"constrained={constrained}: first {res[0][0]:.2f}s, mean {sum(r[0] for r in res)/len(res):.2f}s, valid {sum(r[1] for r in res)}/20")</pre>
+<p>Predict first: how many of the 20 unconstrained answers will be valid JSON with all four keys? Will the first constrained request be slower than the rest, and why?</p>
+
+<h2 id="realworld">11. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Prefix reuse and structure in production</span>
+  <ul>
+    <li><strong>Hosted APIs</strong> offer prompt caching with a discount on cached input tokens and a limited cache lifetime. Providers tell customers to put stable content first, exactly as in section 5.</li>
+    <li><strong>Agent platforms</strong> depend on prefix caching: each step re-sends a growing context, and without reuse the cost of an agent grows with the square of its steps.</li>
+    <li><strong>Routers</strong> in large deployments are prefix-aware, sending related requests to the replica that holds their cache (chapter 6.4).</li>
+    <li><strong>Structured output</strong> through XGrammar or LLGuidance is the default in vLLM and SGLang; JSON mode and tool calling in OpenAI-compatible servers are built on it.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">12. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz35"></div>
+<script type="application/json" id="qz35">[
+{"q":"Why does vLLM's block hash include the parent block's hash?","o":["Speed","A block's K and V depend on all earlier tokens, so only equal full prefixes may share","To save memory","For LoRA"],"a":1,"e":"Chaining makes the hash identify the whole prefix."},
+{"q":"A finished request's cached blocks in vLLM are:","o":["Erased immediately","Kept with their contents in the free queue until the allocator needs them, then evicted LRU","Moved to disk","Copied to every replica"],"a":1,"e":"Free but still cached: reuse costs nothing until memory is needed."},
+{"q":"You add the current time to the start of every system prompt. The prefix-cache hit rate:","o":["Rises","Falls close to zero","Does not change","Only changes for images"],"a":1,"e":"The first block differs every time, and every later block's hash depends on it."},
+{"q":"What does a cache salt protect against?","o":["Hash collisions","Timing side channels that reveal other tenants' prompts","Eviction","Long prompts"],"a":1,"e":"Different salts make different tenants' hashes differ, so their caches never mix."},
+{"q":"Constrained decoding works by:","o":["Retraining the model","Masking invalid tokens' logits to −∞ at every step according to a grammar","Post-processing the text","Raising the temperature"],"a":1,"e":"Only grammar-valid tokens can be sampled."},
+{"q":"Why can the first request with a new JSON schema be slow?","o":["The model reloads","The grammar must be compiled into an automaton and masks precomputed","The KV cache is cleared","Tokenization is slower"],"a":1,"e":"Compilation happens once per new grammar, then is cached."},
+{"q":"With tool_choice 'auto' in vLLM, are tool arguments guaranteed to match the schema?","o":["Yes, always","No; 'required' or a named function uses structured output to enforce it","Only for Llama","Only when streaming"],"a":1,"e":"Auto lets the model choose freely; the parser extracts what it wrote."}
+]</script>
+
+<h2 id="summary">13. Summary</h2>
+<ul>
+  <li>Identical token prefixes have identical KV; reusing them skips compute-bound prefill and cuts TTFT.</li>
+  <li>vLLM hashes each full block with its parent hash and extra keys, keeps freed blocks cached, and evicts LRU. SGLang keeps a radix tree with token granularity and cache-aware scheduling.</li>
+  <li>Reuse is safe only when tokens, model, adapter, media and (optionally) tenant salt all match; strong hashes prevent collisions.</li>
+  <li>Hit rates fall under load (churn). Put stable content first, route by prefix, and offload cold blocks.</li>
+  <li>Structured output compiles a grammar and masks invalid tokens each step; XGrammar precomputes, LLGuidance works lazily; engines overlap masks with GPU work.</li>
+  <li>Tool calling = template + generation (+ constraints for required or named calls) + model-specific parser.</li>
+</ul>
+
+<h2 id="refs">14. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/design/prefix_caching.html">vLLM: Automatic prefix caching design</a></td><td>Block hashes, extra keys, cache salts, the free queue and eviction, and the hashing options.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 4.3.2</td><td>SGLang's design goals, model support and when to choose it.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2312.07104">Zheng et al., SGLang: Efficient Execution of Structured Language Model Programs</a></td><td>RadixAttention, the compressed finite-state machine and the frontend language.</td></tr>
+<tr><td><a href="https://blog.squeezebits.com/70642">SqueezeBits: Guided decoding performance on vLLM and SGLang</a></td><td>A benchmark of XGrammar and LLGuidance across engines, with fixed and changing schemas.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2411.15100">Dong et al., XGrammar</a></td><td>Context-independent token precomputation and the persistent stack.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/features/structured_outputs.html">vLLM: Structured outputs</a> and <a href="https://docs.vllm.ai/en/latest/features/tool_calling.html">Tool calling</a></td><td>Backends, request options, <code>tool_choice</code> modes and tool parsers.</td></tr>
+<tr><td><a href="https://www.baseten.co/blog/tool-calling-in-inference/">Baseten: Tool calling in inference</a></td><td>Why tool-calling quality varies between providers serving the same model.</td></tr>
+<tr><td><a href="https://www.linkedin.com/blog/engineering/ai/turbocharging-linkedins-recommendation-systems-with-sglang">LinkedIn Engineering: Turbocharging recommendation systems with SGLang</a></td><td>Kept from triage: multi-item scoring with a shared prefix and a custom attention mask.</td></tr>
+<tr><td><a href="https://www.sglang.io/">SGLang</a></td><td>Kept from triage: project documentation for RadixAttention, structured output and server options.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 10</td><td>A RadixAttention notebook.</td></tr>
+</table></div>
+<h3>Triaged out</h3>
+<div class="tbl"><table>
+<tr><th>Source</th><th>Reason</th></tr>
+<tr><td>SGLang Cookbook</td><td>The page did not resolve from this environment; recipes are covered by the SGLang documentation.</td></tr>
+<tr><td>TSON: Token-Efficient Structured Object Notation</td><td>The repository did not open from this environment; the idea is noted in the expert layer with a caution.</td></tr>
+</table></div>
+<p class="note">Facts checked on 6 November 2026. The prefix-cache simulator was run with Python 3.13.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+const EX={sys:"You are a helpful support agent for Acme. Be brief. User: reset my password\nYou are a helpful support agent for Acme. Be brief. User: cancel my order\nYou are a helpful support agent for Acme. Be brief. User: where is my order\nYou are a helpful tutor. User: explain fractions",
+chat:"System: be kind. User: hi Bot: hello\nSystem: be kind. User: hi Bot: hello User: how are you Bot: fine\nSystem: be kind. User: hi Bot: hello User: how are you Bot: fine User: tell a joke",
+rag:"Answer from the document. Doc: GPU memory basics ... Q: what is HBM\nAnswer from the document. Doc: GPU memory basics ... Q: what is bandwidth\nAnswer from the document. Doc: Tokenizers explained ... Q: what is BPE\nAnswer from the document. Doc: GPU memory basics ... Q: what is a cache",
+fewshot:"Classify. Ex: great movie positive Ex: awful food negative Text: lovely day\nClassify. Ex: great movie positive Ex: awful food negative Text: broken phone\nClassify. Ex: great movie positive Ex: awful food negative Text: okay service"};
+function build(lines){const root={kids:{},n:0};lines.forEach(l=>{let nd=root;l.trim().split(/\s+/).filter(Boolean).forEach(w=>{nd.kids[w]=nd.kids[w]||{kids:{},n:0};nd=nd.kids[w];nd.n++;});});
+  const compress=nd=>{Object.keys(nd.kids).forEach(k=>{let c=nd.kids[k],lab=[k];while(Object.keys(c.kids).length===1&&Object.values(c.kids)[0].n===c.n){const k2=Object.keys(c.kids)[0];lab.push(k2);c=c.kids[k2];}c.label=lab;delete nd.kids[k];nd.kids[lab.join(' ')]=c;compress(c);});};compress(root);return root;}
+function rx(){const lines=$('rxIn').value.split('\n').filter(l=>l.trim());const root=build(lines);const s=$('rxSvg');s.innerHTML='';
+  const nodes=[];let row=0;const walk=(nd,depth)=>{Object.values(nd.kids).forEach(c=>{const y=row;walk(c,depth+1);if(!Object.keys(c.kids).length)row++;c.y=Object.keys(c.kids).length?(Object.values(c.kids)[0].y+Object.values(c.kids).slice(-1)[0].y)/2:y;c.depth=depth;nodes.push(c);});};walk(root,0);
+  const colW=210,rowH=30,W=Math.max(680,20+ (Math.max(0,...nodes.map(n=>n.depth))+1)*colW),H=Math.max(60,row*rowH+20);s.setAttribute('viewBox',`0 0 ${W} ${H}`);s.setAttribute('width',W);s.style.maxWidth='100%';s.style.height='auto';
+  const X=d=>14+d*colW,Y=y=>16+y*rowH;
+  const link=(nd)=>Object.values(nd.kids).forEach(c=>{if(nd!==root)el('path',{d:`M${X(nd.depth)+colW-16} ${Y(nd.y)+8} C${X(c.depth)-8} ${Y(nd.y)+8},${X(c.depth)-8} ${Y(c.y)+8},${X(c.depth)} ${Y(c.y)+8}`,fill:'none',stroke:css('--line'),'stroke-width':1.5},s);link(c);});link(root);
+  let total=0,uniq=0;lines.forEach(l=>total+=l.trim().split(/\s+/).length);
+  nodes.forEach(n=>{uniq+=n.label.length;const shared=n.n>1;const txt=n.label.join(' ');const t=txt.length>26?txt.slice(0,25)+'…':txt;
+    el('rect',{x:X(n.depth),y:Y(n.y)-4,width:colW-18,height:24,rx:6,fill:shared?css('--kv-s'):css('--panel2'),stroke:shared?css('--kv'):css('--line')},s);
+    el('text',{x:X(n.depth)+6,y:Y(n.y)+12,'font-size':11,fill:css('--ink')},s,t);
+    el('text',{x:X(n.depth)+colW-24,y:Y(n.y)+12,'text-anchor':'end','font-size':10,fill:css(shared?'--kv':'--mute'),'font-weight':700},s,'×'+n.n);});
+  $('rxStats').innerHTML=[['Prompts',lines.length],['Tokens sent',total],['Tokens stored once in the tree',uniq],['Prefill saved by sharing',total?((1-uniq/total)*100).toFixed(0)+'%':'0%']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+document.querySelectorAll('#rxW [data-ex]').forEach(b=>b.onclick=()=>{$('rxIn').value=EX[b.dataset.ex];rx();});$('rxIn').addEventListener('input',rx);$('rxIn').value=EX.sys;IE.onTheme(rx);
+/* churn sim (mirrors the Python simulator, with a simple string hash) */
+const CAPS=[100,250,500,1000,2500,5000,10000,20000,40000];let CH=null;
+function rnd(seed){let s=seed>>>0||1;return()=>{s^=s<<13;s>>>=0;s^=s>>17;s^=s<<5;s>>>=0;return s/4294967296;};}
+function sim(cap,nS,nD){const r=rnd(7);const sys=[...Array(600).keys()].map(i=>1000+i);const docs=[...Array(nD)].map(()=>[...Array(800)].map(()=>Math.floor(r()*50000)));const sess=new Map();const lru=new Map();let q=0,h=0;
+  for(let i=0;i<1000;i++){const s=Math.floor(r()*nS);const di=Math.min(Math.floor(Math.pow(1-r(),-1/1.2))-1,nD-1);let toks=sess.get(s)||sys.concat(docs[di]);for(let k=0;k<60;k++)toks.push(Math.floor(r()*50000));
+    let hh='',hit=0,miss=false;const hs=[];for(let b=0;b+16<=toks.length;b+=16){hh=hh.length>40?hh.slice(-40):hh;hh=(hh+'|'+toks.slice(b,b+16).join(','));let x=0;for(let c=0;c<hh.length;c++)x=(x*31+hh.charCodeAt(c))|0;hh=String(x)+':'+b;hs.push(hh);}
+    for(const k of hs){if(!miss&&lru.has(k)){hit++;lru.delete(k);lru.set(k,1);}else{miss=true;lru.delete(k);lru.set(k,1);if(lru.size>cap)lru.delete(lru.keys().next().value);}}
+    q+=toks.length;h+=hit*16;for(let k=0;k<120;k++)toks.push(Math.floor(r()*50000));sess.set(s,toks);}
+  return h/q;}
+function chu(){$('chuCv').textContent=IE.int(CAPS[+$('chuC').value]);drawChu();}
+function runChu(){const nS=+$('chuS').value,nD=+$('chuD').value;CH={pts:CAPS.map(c=>[c,sim(c,nS,nD)]),nS,nD};drawChu();}
+function drawChu(){const s=$('chuSvg');s.innerHTML='';const W=680,H=220,l=50,r=20,t=14,bt=34;const X=i=>l+i/(CAPS.length-1)*(W-l-r),Y=v=>H-bt-v*(H-t-bt);
+  for(let i=0;i<=4;i++){el('line',{x1:l,x2:W-r,y1:Y(i/4),y2:Y(i/4),class:'axis'},s);el('text',{x:l-6,y:Y(i/4)+4,'text-anchor':'end',class:'tick'},s,(i*25)+'%');}
+  CAPS.forEach((c,i)=>el('text',{x:X(i),y:H-bt+16,'text-anchor':'middle',class:'tick'},s,c>=1000?(c/1000)+'K':c));
+  el('text',{x:l+(W-l-r)/2,y:H-6,'text-anchor':'middle',class:'tick'},s,'cache capacity in 16-token blocks (log)');
+  const ci=+$('chuC').value;el('line',{x1:X(ci),x2:X(ci),y1:t,y2:H-bt,stroke:css('--ink2'),'stroke-dasharray':'4 4'},s);
+  if(CH){el('path',{d:CH.pts.map((p,i)=>(i?'L':'M')+X(i)+' '+Y(p[1])).join(' '),fill:'none',stroke:css('--kv'),'stroke-width':2.5},s);CH.pts.forEach((p,i)=>el('circle',{cx:X(i),cy:Y(p[1]),r:4,fill:css('--kv')},s));
+    const hv=CH.pts[ci][1];$('chuStats').innerHTML=[['Token hit rate at this capacity',(hv*100).toFixed(0)+'%'],['Prefill work removed',(hv*100).toFixed(0)+'%'],['Cache memory (Llama 3.1 8B)',IE.gb(CAPS[ci]*16*131072)+' GB']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+  else $('chuStats').innerHTML='<div class="stat"><div class="k">Press Run</div><div class="v">…</div></div>';}
+$('chuC').addEventListener('input',chu);$('chuRun').onclick=runChu;['chuS','chuD'].forEach(id=>$(id).addEventListener('change',()=>{CH=null;drawChu();}));chu();IE.onTheme(drawChu);
+/* constrained decoding demo */
+const STEPS=[
+ {pref:{'{':3,'Sure':4,'"':1},valid:['{']},
+ {pref:{'"city"':4,'"name"':2,'}':1,' ':1},valid:['"city"']},
+ {pref:{':':4,',':1,'=':1},valid:[':']},
+ {pref:{' "':4,' Paris':3,' 12':1},valid:[' "']},
+ {pref:{'Paris':5,'paris':1,'"':1},valid:['Paris','paris']},
+ {pref:{'"':4,',':1,'!':1},valid:['"']},
+ {pref:{',':3,'}':2,' and':1},valid:[',','}']},
+ {pref:{' "temp"':4,' "weather"':2,'}':1},valid:[' "temp"']},
+ {pref:{':':4,' is':1},valid:[':']},
+ {pref:{' "21':3,' 21':3,' twenty':2},valid:[' 21']},
+ {pref:{'°C':3,'}':2,'.5':1},valid:['}']}];
+let cd=0,on=true,out='',broken=false;
+function cdDraw(){const s=$('cdSvg');s.innerHTML='';if(cd>=STEPS.length){$('cdMsg').textContent=broken?'Without the grammar the output is not valid JSON: a parser would fail.':'Done. Every step picked the best allowed token, so the output is valid JSON matching the schema.';$('cdText').textContent=out;return;}
+  const st=STEPS[cd];const toks=Object.keys(st.pref);const mx=Math.max(...Object.values(st.pref));const bw=Math.min(120,(680-40)/toks.length);
+  toks.forEach((t,i)=>{const ok=st.valid.includes(t);const x=20+i*bw;const h=st.pref[t]/mx*130;const allowed=!on||ok;
+    el('rect',{x:x+8,y:160-h,width:bw-16,height:h,rx:4,fill:allowed?css(ok?'--kv':'--dec'):css('--mute'),opacity:allowed?1:0.35},s);
+    el('text',{x:x+bw/2,y:178,'text-anchor':'middle','font-size':12,fill:css(allowed?'--ink':'--mute')},s,JSON.stringify(t));
+    el('text',{x:x+bw/2,y:196,'text-anchor':'middle','font-size':10,fill:css(ok?'--good':'--bad')},s,ok?'grammar: valid':'grammar: invalid');});
+  $('cdText').textContent=out+'▌';$('cdMsg').textContent=on?'Grey bars are masked to −∞; the sampler picks the highest remaining bar.':'Grammar off: the sampler picks the highest bar, valid or not.';}
+function cdStep(){if(cd>=STEPS.length)return;const st=STEPS[cd];const cand=Object.entries(st.pref).filter(([t])=>!on||st.valid.includes(t)).sort((a,b)=>b[1]-a[1]);const pick=cand[0][0];if(!st.valid.includes(pick))broken=true;out+=pick;cd++;cdDraw();}
+$('cdOn').onclick=()=>{on=true;$('cdOn').classList.add('on');$('cdOff').classList.remove('on');cdReset();};$('cdOff').onclick=()=>{on=false;$('cdOff').classList.add('on');$('cdOn').classList.remove('on');cdReset();};
+function cdReset(){cd=0;out='';broken=false;cdDraw();}$('cdStep').onclick=cdStep;$('cdReset').onclick=cdReset;IE.onTheme(cdDraw);
+})();
+</script>
