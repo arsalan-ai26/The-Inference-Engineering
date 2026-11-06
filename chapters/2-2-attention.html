@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>2.2 Attention and the transformer block</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="2.2">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 2 · Chapter 2.2</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 2 · Transformers and LLM inference mechanics · Chapter 2.2</div>
+<h1>Attention and the transformer block</h1>
+<p class="lede">Attention lets every token look at every earlier token and pull in the information it needs. It is the one idea that separates transformers from older networks, and it is the part of the model whose cost grows with context. This chapter builds attention from a dot product up to a full transformer block, with every shape and every FLOP counted.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 5 to 6 hours with the lab</span>
+  <span class="chip">Needs: 1.1, 1.2 (softmax), 1.4, 1.5, 2.1</span>
+  <span class="chip">Compute: Colab CPU; T4 for Part E</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Write the attention formula and say what each part does.</li>
+    <li>Why divide the scores by √d?</li>
+    <li>For a 2,048-token prompt, 32 heads and head size 128, how big is one layer's full score matrix in BF16?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>softmax(QKᵀ / √d + mask) V. QKᵀ scores every query against every key; the mask hides future tokens; softmax turns each row of scores into weights; multiplying by V takes the weighted average of value vectors.</li>
+    <li>A dot product of two length-d vectors with unit-variance elements has variance d. Dividing by √d keeps scores near unit size, so softmax does not saturate into a hard one-hot choice.</li>
+    <li>32 × 2,048 × 2,048 × 2 bytes ≈ 268 MB per layer (per sequence). This is why fused kernels never store it.</li>
+  </ol></details>
+</div>
+
+<h2 id="problem">1. The problem: each word needs its context</h2>
+<p>After the embedding step (chapter 2.1), each token has a vector that does not depend on its neighbours. But meaning does. In "I wrote a book because I thought it would be easy", the vector for "it" must somehow learn that "it" means the book, not "I".</p>
+<p>Chapter 1.5 showed why recurrent networks struggle: they squeeze everything into one state that fades. Attention takes a different route. For each token, it <em>looks at every earlier token directly</em>, decides how relevant each one is, and mixes their information in, weighted by relevance. Distance does not matter.</p>
+
+<h2 id="qkv">2. Queries, keys and values</h2>
+<p>A helpful analogy is a library search. You have a question (the <strong>query</strong>). Every book has a label on its spine (the <strong>key</strong>) and content inside (the <strong>value</strong>). You compare your question with every label, and read more from the books whose labels match best.</p>
+<p>Attention does this with vectors. Each token's vector x is multiplied by three learned weight matrices:</p>
+<div class="formula">q = x W_Q      k = x W_K      v = x W_V</div>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Query (q):</strong> what this token is looking for.</p>
+  <p><strong>Key (k):</strong> what this token offers to be found by. Compared with queries.</p>
+  <p><strong>Value (v):</strong> the information this token passes on when another token attends to it.</p>
+  <p><strong>Attention weight:</strong> how much one token reads from another. The weights for one query add up to 1.</p>
+</div>
+<p>The same three matrices are used for every token. That is why attention works for any sequence length: the weights do not depend on how many tokens there are.</p>
+
+<h2 id="formula">3. The formula, one step at a time</h2>
+<p>For a sequence of T tokens, stack the vectors into matrices Q, K and V, each of shape [T, d]. Then:</p>
+<div class="formula"><b>Attention(Q, K, V)</b> = softmax( Q Kᵀ / √d + mask ) V</div>
+<ol>
+  <li><strong>Score.</strong> Q Kᵀ has shape [T, T]. Entry (i, j) is the dot product of query i with key j: how well token j matches what token i is looking for (chapter 1.1).</li>
+  <li><strong>Scale.</strong> Divide by √d. Without this, large d makes scores large, and softmax becomes almost one-hot: a single token takes all the weight and gradients vanish.</li>
+  <li><strong>Mask.</strong> Add −∞ to every entry where j &gt; i. After softmax these become 0, so a token cannot see the future (section 5).</li>
+  <li><strong>Normalize.</strong> Softmax each row (chapter 1.2). Row i now holds token i's attention weights, adding up to 1.</li>
+  <li><strong>Mix.</strong> Multiply by V. Row i of the result is a weighted average of all value vectors, weighted by row i's attention weights. Shape [T, d].</li>
+</ol>
+
+<div class="widget" id="attW">
+  <div class="wt">Interactive: attention on one sentence</div>
+  <div class="ws">An illustrative example with hand-made 4-dimensional vectors, chosen so the pattern is easy to see. Click a row (a query token) to see its scores, its weights and the tokens it reads from. Toggle the mask and the √d scaling.</div>
+  <div class="ctrls">
+    <div class="seg" role="group" aria-label="Mask"><button id="atMaskOn" class="on">Causal mask on</button><button id="atMaskOff">Mask off</button></div>
+    <div class="seg" role="group" aria-label="Scaling"><button id="atScOn" class="on">Divide by √d</button><button id="atScOff">No scaling</button></div>
+    <label>Score sharpness (×): <span class="mono" id="atSv"></span><input type="range" id="atS" min="0.5" max="6" step="0.5" value="2"></label>
+  </div>
+  <div class="grid2" style="margin-top:12px">
+    <div class="svgwrap"><svg id="atHeat" viewBox="0 0 400 400" width="400" style="max-width:100%;height:auto" role="img" aria-label="Attention weight heatmap"></svg></div>
+    <div class="svgwrap"><svg id="atBars" viewBox="0 0 360 400" width="360" style="max-width:100%;height:auto" role="img" aria-label="Attention weights of the selected query"></svg></div>
+  </div>
+  <p class="note" id="atMsg"></p>
+</div>
+
+<div class="box ex">
+  <span class="lbl">Worked example: 3 tokens, d = 2</span>
+  <p>Queries and keys (one row per token): Q = [[1, 0], [0, 1], [1, 1]], K = [[1, 0], [0, 2], [1, 1]]. Values V = [[10, 0], [0, 10], [5, 5]].</p>
+  <p>Look at token 3 (the last query, [1, 1]). Its dot products with the three keys: 1, 2 and 2. Divide by √2: 0.71, 1.41, 1.41. Softmax: [0.20, 0.40, 0.40].</p>
+  <p>Output for token 3: 0.20 × [10, 0] + 0.40 × [0, 10] + 0.40 × [5, 5] = [4, 6]. Token 3 now carries a mix of the information from all three tokens, weighted towards tokens 2 and 3.</p>
+  <p>Token 1 can see only itself because of the mask, so its weights are [1, 0, 0] and its output is V's first row, [10, 0].</p>
+</div>
+
+<h2 id="multihead">4. Multi-head attention</h2>
+<p>One attention operation produces one set of weights per token. But a token may need several kinds of information at once: which noun "it" refers to, what the verb tense is, what came just before. So the model runs several attention operations in parallel, called <strong>heads</strong>, each with its own smaller Q, K and V.</p>
+<ol>
+  <li>Project x (size D) to Q, K and V, each of size D.</li>
+  <li>Split each into H heads of size d = D / H. For Llama 3.1 8B: 32 heads of 128.</li>
+  <li>Run attention separately in each head.</li>
+  <li>Join (concatenate) the head outputs back into size D.</li>
+  <li>Multiply by an output matrix W_O of shape [D, D] to mix information across heads.</li>
+</ol>
+<p>In code, step 2 is the <code>view</code> and <code>transpose</code> pattern from chapter 1.4. Shapes for a batch: x [B, T, D] → Q [B, H, T, d] → scores [B, H, T, T] → output [B, H, T, d] → [B, T, D].</p>
+<div class="svgwrap"><svg viewBox="0 0 700 220" width="700" style="max-width:100%;height:auto" role="img" aria-label="Multi-head attention: input splits into heads, each head attends, outputs join and pass through W_O">
+  <defs><marker id="ar22" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--ink2)"/></marker></defs>
+  <g font-size="12">
+    <rect x="10" y="80" width="90" height="56" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="55" y="104" text-anchor="middle" fill="var(--ink)">1. x</text><text x="55" y="120" text-anchor="middle" fill="var(--ink2)">[T, D]</text>
+    <rect x="130" y="80" width="110" height="56" rx="8" fill="var(--pre-s)" stroke="var(--pre)"/><text x="185" y="104" text-anchor="middle" fill="var(--ink)">2. W_Q, W_K, W_V</text><text x="185" y="120" text-anchor="middle" fill="var(--ink2)">project + split</text>
+    <g><rect x="280" y="14" width="150" height="40" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="355" y="38" text-anchor="middle" fill="var(--ink)">3. head 1: attention</text>
+       <rect x="280" y="62" width="150" height="40" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="355" y="86" text-anchor="middle" fill="var(--ink)">head 2: attention</text>
+       <text x="355" y="122" text-anchor="middle" fill="var(--ink2)">⋮</text>
+       <rect x="280" y="162" width="150" height="40" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="355" y="186" text-anchor="middle" fill="var(--ink)">head H: attention</text></g>
+    <rect x="470" y="80" width="100" height="56" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="520" y="104" text-anchor="middle" fill="var(--ink)">4. concat</text><text x="520" y="120" text-anchor="middle" fill="var(--ink2)">[T, D]</text>
+    <rect x="600" y="80" width="90" height="56" rx="8" fill="var(--dec-s)" stroke="var(--dec)"/><text x="645" y="104" text-anchor="middle" fill="var(--ink)">5. W_O</text><text x="645" y="120" text-anchor="middle" fill="var(--ink2)">[T, D]</text>
+    <path d="M100 108H128M240 100L278 34M240 106L278 82M240 116L278 182M430 34L468 100M430 82L468 106M430 182L468 116M570 108H598" stroke="var(--ink2)" fill="none" marker-end="url(#ar22)"/>
+  </g>
+</svg></div>
+<p>Multi-head attention costs the same FLOPs as one big head of size D for the projections; only the score step changes shape. Trained heads do specialize: some track the previous token, some track matching brackets or quotes, some follow references back to a name.</p>
+<p>Many recent models use fewer key and value heads than query heads. This is <strong>grouped-query attention</strong> (GQA): several query heads share one key head and one value head. It does not change the attention math for each query head, but it makes K and V much smaller. That matters enormously for the KV cache, so chapter 2.4 covers it in detail.</p>
+
+<h2 id="mask">5. The causal mask, and self vs cross attention</h2>
+<p>A language model is trained to predict the next token. If token i could see token i + 1, the task would be trivial and the model would learn nothing useful. The <strong>causal mask</strong> blocks every position j &gt; i. Its pattern is a lower triangle.</p>
+<p>The mask has a second, very important effect for inference: <strong>the output at position i depends only on tokens 1 to i</strong>. Adding tokens at the end never changes earlier positions' keys and values. Chapter 2.4 builds the KV cache on this fact.</p>
+<div class="tbl"><table>
+<tr><th>Type</th><th>Q comes from</th><th>K and V come from</th><th>Where</th></tr>
+<tr><td>Causal self-attention</td><td>The sequence</td><td>The same sequence, earlier positions only</td><td>Every decoder-only LLM</td></tr>
+<tr><td>Bidirectional self-attention</td><td>The sequence</td><td>The whole sequence</td><td>Encoders such as BERT; embedding models</td></tr>
+<tr><td>Cross-attention</td><td>The sequence being generated</td><td>A different input (an encoded image, audio or source text)</td><td>Encoder-decoder models (Whisper, T5), many image generators</td></tr>
+</table></div>
+
+<h2 id="block">6. The transformer block</h2>
+<p>A transformer block wraps attention with the pieces from chapter 1.5. Modern LLMs use the <strong>pre-norm</strong> order:</p>
+<div class="formula">h = x + Attention( RMSNorm(x) )        out = h + MLP( RMSNorm(h) )</div>
+<ul>
+  <li><strong>Attention</strong> moves information <em>between</em> tokens.</li>
+  <li><strong>The MLP</strong> (also called the feed-forward network, FFN) works on each token <em>separately</em>. It holds most of the parameters and is often described as where the model stores facts.</li>
+  <li><strong>Residual adds</strong> keep a main road through the network; <strong>norms</strong> keep values in range.</li>
+</ul>
+<p>The whole model is: embedding lookup → N identical blocks → final norm → output head (chapter 1.2). Llama 3.1 8B has 32 blocks; Llama 3.1 70B has 80. The forward-pass tracer in chapter 1.4 walks one block line by line with real shapes.</p>
+
+<h2 id="cost">7. What attention costs</h2>
+<p>A block has two kinds of work with very different scaling.</p>
+<ol>
+  <li><strong>Projections and MLP</strong> (all the matmuls with weight matrices). FLOPs = 2 × tokens × parameters. Linear in T.</li>
+  <li><strong>The attention core</strong> (QKᵀ and the multiply by V). Per layer, QKᵀ costs 2 × T × T × d per head, and the multiply by V costs the same. Over H heads with H × d = D, that is about 4 × T² × D FLOPs. Quadratic in T. A causal mask means only about half of the entries are needed, and good kernels skip the masked half.</li>
+</ol>
+<p>For short prompts the matmuls dominate. For long prompts, the T² term takes over. There is also a memory problem: the full score matrix is [H, T, T] per layer. Writing it to GPU memory and reading it back is slow, and at long context it does not fit at all.</p>
+
+<div class="widget" id="costW">
+  <div class="wt">Interactive: where the prefill FLOPs go</div>
+  <div class="ws">One prefill of T tokens through the whole model. Linear FLOPs = 2 × T × (non-embedding parameters). Attention-core FLOPs = 4 × T² × (heads × head size) × layers, halved for the causal mask.</div>
+  <div class="ctrls">
+    <label>Model <select id="cM">
+      <option value="24,896,14,64,0.358">Qwen2.5-0.5B</option>
+      <option value="32,4096,32,128,6.98" selected>Llama 3.1 8B</option>
+      <option value="80,8192,64,128,68.5">Llama 3.1 70B</option>
+    </select></label>
+    <label>Prompt tokens T: <span class="mono" id="cTv"></span><input type="range" id="cT" min="0" max="10" step="1" value="3"></label>
+  </div>
+  <div class="svgwrap"><svg id="cSvg" viewBox="0 0 640 90" width="640" style="max-width:100%;height:auto" role="img" aria-label="Share of FLOPs in linear layers and attention"></svg></div>
+  <div class="stats" id="cStats"></div>
+</div>
+<div class="box watch">
+  <span class="lbl">Watch out: "the KV cache makes attention linear"</span>
+  <p>You may read that the KV cache turns attention from quadratic to linear. That is only half true. With a cache, <em>each decode step</em> costs attention work linear in the current context, because one new query reads all cached keys. But a full generation of N tokens still does about N²/2 key reads in total, and prefill of a T-token prompt is still quadratic in T. What the cache removes is the recomputation of old keys and values (chapter 2.4).</p>
+</div>
+
+<h2 id="flash">8. How real kernels compute attention</h2>
+<p>Inference engines never build the full [T, T] score matrix in GPU memory. They use <strong>fused attention kernels</strong> such as FlashAttention, which do the whole formula in one pass:</p>
+<ol>
+  <li>Split Q, K and V into small tiles that fit in fast on-chip memory.</li>
+  <li>For each tile of queries, loop over tiles of keys and values.</li>
+  <li>Compute that block of scores, apply the mask, and update a running softmax: keep the running maximum and running sum for each row, and rescale the partial output when a new maximum appears (the "online softmax").</li>
+  <li>Write only the final output [T, d] back to memory.</li>
+</ol>
+<p>The FLOPs are the same, or slightly more. What changes is memory traffic: the T × T matrix never leaves the chip. The result is exact, not an approximation, and much faster. In PyTorch, <code>F.scaled_dot_product_attention</code> picks such a kernel when one is available. Chapter 4.2 goes inside these kernels.</p>
+
+<h2 id="expert">9. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Attention sinks</span>
+  <p>Trained models often put a large share of attention weight on the very first token, whatever it is. Softmax weights must add up to 1, so heads that "do not need anything" park their weight there. This matters for long-context tricks: if you drop the first tokens to save memory, quality collapses. Keeping a few "sink" tokens, as StreamingLLM does, avoids this. Some newer models add a learned sink value per head.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Sliding-window and local attention</span>
+  <p>Some models limit each token to the last W tokens (for example W = 4,096). The attention core then costs T × W instead of T², and the cache stops growing. Many models mix window layers with full-attention layers to keep long-range ability (chapter 2.4, expert layer).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Softmax in low precision</span>
+  <p>Scores can be large. Kernels subtract the row maximum before exponentiation (chapter 1.2) and keep the running sums in FP32 even when Q, K and V are BF16 or FP8. FP8 attention is possible on Hopper and Blackwell GPUs, but needs careful scaling.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Interpretability view</span>
+  <p>Research on trained transformers finds "induction heads": pairs of heads that find an earlier occurrence of the current token and copy what came after it. They are a key mechanism behind in-context learning. This is why the attention pattern, not just the weights, encodes much of what a model does with a prompt.</p>
+</div>
+
+<h2 id="mistakes">10. Common mistakes</h2>
+<ul>
+  <li>Applying softmax over the wrong dimension. Each <em>query row</em> must sum to 1 (dim = −1 on [.., T_q, T_k]).</li>
+  <li>Forgetting the √d scale or the causal mask when writing attention by hand.</li>
+  <li>Thinking attention parameters grow with context. W_Q, W_K, W_V and W_O have fixed shapes; only the work grows.</li>
+  <li>Counting attention FLOPs for both triangles under a causal mask. Efficient kernels skip the masked half.</li>
+  <li>Assuming the score matrix is stored in memory during inference. Fused kernels never store it.</li>
+</ul>
+
+<h2 id="lab">11. Lab</h2>
+<p><strong>Goal:</strong> write attention yourself, prove the causal property, look at a real model's attention, and measure the quadratic cost.</p>
+<h3>Part A: the 100 Days notebook</h3>
+<p>Run day 04 (attention) of <em>100 Days of Inference</em>. Before you print the attention matrix, predict its shape from the sequence length and head count.</p>
+<h3>Part B: attention from scratch</h3>
+<pre>import torch, math
+torch.manual_seed(0)
+def attention(q, k, v, causal=True):
+    # q, k, v: [B, H, T, d]
+    d = q.shape[-1]
+    scores = ...          # TODO: q times k transposed on the last two dims, divided by sqrt(d)
+    if causal:
+        T = q.shape[-2]
+        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=q.device), diagonal=1)
+        scores = scores.masked_fill(mask, float("-inf"))
+    w = ...               # TODO: softmax over the key dimension
+    return w @ v, w
+
+B, H, T, d = 2, 4, 6, 16
+q, k, v = (torch.randn(B, H, T, d) for _ in range(3))
+out, w = attention(q, k, v)
+ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+print(out.shape, torch.allclose(out, ref, atol=1e-5))
+print(w[0, 0].round(decimals=2))           # lower triangle; each row sums to 1</pre>
+<details><summary>Solution</summary>
+<pre>    scores = q @ k.transpose(-2, -1) / math.sqrt(d)
+    w = torch.softmax(scores, dim=-1)</pre>
+</details>
+<p>Check the worked example of section 3 with your function: put Q, K and V of that example in tensors of shape [1, 1, 3, 2] and confirm the last output row is [4, 6].</p>
+<h3>Part C: prove the causal property</h3>
+<pre>q2, k2, v2 = q.clone(), k.clone(), v.clone()
+q2[..., -1, :] += 5; k2[..., -1, :] += 5; v2[..., -1, :] += 5     # change only the LAST token
+out2, _ = attention(q2, k2, v2)
+print("earlier positions unchanged:", torch.allclose(out[..., :-1, :], out2[..., :-1, :]))
+print("last position changed:     ", not torch.allclose(out[..., -1, :], out2[..., -1, :]))</pre>
+<p>Explain in one sentence why this result makes the KV cache possible.</p>
+<h3>Part D: a real model's attention</h3>
+<pre>from transformers import AutoModelForCausalLM, AutoTokenizer
+tok = AutoTokenizer.from_pretrained("openai-community/gpt2")
+m = AutoModelForCausalLM.from_pretrained("openai-community/gpt2", attn_implementation="eager").eval()
+text = "The animal did not cross the street because it was too tired"
+ids = tok(text, return_tensors="pt").input_ids
+with torch.inference_mode():
+    att = m(ids, output_attentions=True).attentions     # tuple: one [1, H, T, T] per layer
+toks = tok.convert_ids_to_tokens(ids[0])
+print(len(att), att[0].shape)
+it = toks.index("Ġit")
+for layer in [2, 5, 9]:
+    w = att[layer][0, :, it].mean(0)                   # average over heads
+    top = w.topk(3)
+    print(layer, [(toks[i], round(p.item(), 2)) for p, i in zip(top.values, top.indices)])
+print("weight on first token, averaged:", round(sum(a[0, :, :, 0].mean().item() for a in att) / len(att), 2))</pre>
+<p>Look for two things: which tokens "it" attends to in middle layers, and how much weight goes to the first token (the attention sink of the expert layer). In GPT-2 small, expect about two thirds of all attention weight, averaged over layers and heads, to land on the first token, and "animal" to appear only weakly in the top three. Averaging over heads hides the few heads that do resolve references; try printing single heads of layers 5 to 9. Plot one layer's [T, T] map with matplotlib if you like: <code>plt.imshow(att[5][0].mean(0))</code>.</p>
+<h3>Part E: measure the quadratic cost (T4)</h3>
+<pre>import time
+F = torch.nn.functional
+dev = "cuda"
+def bench(T, fused, H=16, d=64, reps=10):
+    q, k, v = (torch.randn(1, H, T, d, device=dev, dtype=torch.float16) for _ in range(3))
+    f = (lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True)) if fused else (lambda: attention(q, k, v)[0])
+    f(); torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+    t = time.perf_counter()
+    for _ in range(reps): f()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t) / reps * 1e3, torch.cuda.max_memory_allocated() / 1e6
+
+for T in [512, 1024, 2048, 4096, 8192]:
+    ms_f, mb_f = bench(T, True)
+    try: ms_n, mb_n = bench(T, False)
+    except torch.OutOfMemoryError: ms_n, mb_n = float("nan"), float("nan")
+    print(f"T={T:5d}  fused {ms_f:7.2f} ms {mb_f:7.0f} MB   naive {ms_n:7.2f} ms {mb_n:7.0f} MB")</pre>
+<p>Predict first: when T doubles, by what factor should time grow? By what factor does the naive version's memory grow?</p>
+<details><summary>What you should see</summary><p>The fused kernel's time grows close to 4 times per doubling at large T (the T² term), and its memory stays small. The naive version's memory grows about 4 times per doubling, because it stores the full [H, T, T] score matrix, and at some T it runs out of memory on a 16 GB T4.</p></details>
+
+<h2 id="realworld">12. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Attention in production systems</span>
+  <ul>
+    <li><strong>Every serving engine</strong> uses fused attention kernels (FlashAttention, FlashInfer, or vendor kernels in TensorRT-LLM). They choose different kernels for prefill (many queries) and decode (one query per sequence).</li>
+    <li><strong>Long-context products</strong> (100K to 1M tokens) are limited mostly by attention: quadratic prefill time and the memory for keys and values.</li>
+    <li><strong>Model design</strong> trades attention cost against quality: grouped-query attention, multi-head latent attention, sliding windows and hybrid layers are all ways to make attention cheaper to serve.</li>
+    <li><strong>Multimodal models</strong> run the same attention over image or audio tokens, so a single image can add hundreds to thousands of tokens to the sequence.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">13. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz22"></div>
+<script type="application/json" id="qz22">[
+{"q":"In softmax(QKᵀ/√d)V, which part decides how much token i reads from token j?","o":["V","The softmax of row i of QKᵀ/√d","W_O","The embedding table"],"a":1,"e":"Row i of the softmaxed scores holds token i's attention weights over all keys."},
+{"q":"Q is [B, H, T, d]. The score tensor QKᵀ has shape:","o":["[B, H, d, d]","[B, H, T, T]","[B, T, D]","[T, T]"],"a":1,"e":"One T × T score grid per batch item per head."},
+{"q":"Why is the causal mask needed for language model training?","o":["To save memory","So a token cannot see the tokens it must predict","To make softmax faster","To shrink the vocabulary"],"a":1,"e":"Without it, the next token would be visible and the task trivial."},
+{"q":"Doubling the prompt length roughly does what to attention-core FLOPs in prefill?","o":["Doubles them","Quadruples them","No change","Halves them"],"a":1,"e":"The attention core scales with T²."},
+{"q":"What does FlashAttention change?","o":["It approximates attention","It avoids writing the T × T score matrix to GPU memory by tiling and an online softmax","It removes the softmax","It reduces the number of heads"],"a":1,"e":"Same exact result, far less memory traffic."},
+{"q":"Which part of a transformer block mixes information between different tokens?","o":["The MLP","Attention","RMSNorm","The residual add"],"a":1,"e":"The MLP acts on each token separately; attention is the only cross-token step."},
+{"q":"In a decoder-only LLM, does adding a token at the end change the keys of earlier positions?","o":["Yes, every time","No, because of the causal mask","Only in the last layer","Only with GQA"],"a":1,"e":"Earlier positions never see later tokens, so their keys and values stay fixed. This is the basis of the KV cache."}
+]</script>
+
+<h2 id="summary">14. Summary</h2>
+<ul>
+  <li>Attention = softmax(QKᵀ/√d + mask) V. Each token mixes value vectors from earlier tokens, weighted by query-key match.</li>
+  <li>Q, K and V come from three learned projections; heads split the work into H parallel attentions of size d = D/H, joined by W_O.</li>
+  <li>The causal mask makes position i depend only on tokens 1 to i. This is what makes caching possible.</li>
+  <li>A block is: x + Attention(Norm(x)), then + MLP(Norm(·)). Attention moves information between tokens; the MLP works per token.</li>
+  <li>Projections cost 2 × T × parameters; the attention core costs about 4 × T² × D per layer (half with causal skipping).</li>
+  <li>Fused kernels compute attention exactly without storing the T × T matrix.</li>
+</ul>
+
+<h2 id="refs">15. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 2.2.2 to 2.2.3</td><td>The transformer block, the attention equation, self vs cross attention, and why attention dominates long-context cost.</td></tr>
+<tr><td><a href="https://jalammar.github.io/illustrated-transformer/">Jay Alammar: The Illustrated Transformer</a></td><td>The classic visual walk-through of Q, K, V, multi-head attention and the block.</td></tr>
+<tr><td><a href="https://arpitbhayani.me/blogs/qkv-matrices">Arpit Bhayani: Q, K and V matrices</a></td><td>A plain explanation of the three projections and their shapes.</td></tr>
+<tr><td><a href="https://www.3blue1brown.com/topics/neural-networks">3Blue1Brown: Neural Networks</a>, transformer and attention chapters</td><td>Geometric intuition for attention as directions in embedding space.</td></tr>
+<tr><td>Sebastian Raschka, <em>Build a Large Language Model (From Scratch)</em>, chapter 3</td><td>Self-attention built up from a simple version to causal, multi-head attention in PyTorch.</td></tr>
+<tr><td>Jay Alammar and Maarten Grootendorst, <em>Hands-On Large Language Models</em>, chapter 3</td><td>Relevance scoring and combining information, with diagrams of the forward pass.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/1706.03762">Vaswani et al., Attention Is All You Need</a></td><td>The original transformer and the scaled dot-product formula.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2205.14135">Dao et al., FlashAttention</a></td><td>Tiling and online softmax for exact attention with low memory traffic.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2309.17453">Xiao et al., Efficient Streaming Language Models with Attention Sinks</a></td><td>The attention-sink effect and how to keep long streams stable.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 04</td><td>A runnable attention notebook.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The book states that "in practice, attention is linear, not quadratic, thanks to the KV cache". As the watch-out box in section 7 explains, this holds per decode step only; prefill and total generation work remain quadratic.</li>
+</ul>
+<p class="note">Facts checked on 6 November 2026.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+const TOK=['The','book','was','long','but','it','was','easy'];
+/* hand-made 4-d query/key vectors: dims = [noun-ness, verb, adjective, recency/self] */
+const K=[[0.2,0,0,0.3],[1.2,0,0,0.2],[0,1,0,0.2],[0,0,1,0.2],[0,0.2,0,0.2],[0.9,0,0,0.2],[0,1,0,0.2],[0,0,1,0.2]];
+const Q=[[0,0,0,1],[0.3,0,0,0.6],[0.9,0,0,0.2],[1,0.3,0,0.1],[0,0.5,0.6,0.2],[1.3,0,0,0],[1,0,0,0.3],[1,0.6,0,0]];
+let sel=5,mask=true,scale=true;
+function compute(){const s=+$('atS').value;$('atSv').textContent=s.toFixed(1);const d=4;
+  return Q.map((q,i)=>{const sc=K.map((k,j)=>{if(mask&&j>i)return -Infinity;let v=q.reduce((a,x,t)=>a+x*k[t],0)*s;return scale?v/Math.sqrt(d):v;});const m=Math.max(...sc);const e=sc.map(v=>v===-Infinity?0:Math.exp(v-m));const z=e.reduce((a,b)=>a+b,0);return{sc,w:e.map(v=>v/z)};});}
+function draw(){const R=compute();const h=$('atHeat');h.innerHTML='';const n=TOK.length,c=40,ox=64,oy=56;
+  TOK.forEach((t,j)=>el('text',{x:ox+j*c+c/2,y:oy-8,'text-anchor':'middle','font-size':11,fill:css('--ink2'),transform:`rotate(-35 ${ox+j*c+c/2} ${oy-8})`},h,t));
+  el('text',{x:ox,y:16,'font-size':11,fill:css('--ink2')},h,'keys (tokens read from) →');
+  R.forEach((r,i)=>{el('text',{x:ox-6,y:oy+i*c+c/2+4,'text-anchor':'end','font-size':11,fill:css(i===sel?'--ink':'--ink2'),'font-weight':i===sel?700:400},h,TOK[i]);
+    r.w.forEach((w,j)=>{const masked=mask&&j>i;const rc=el('rect',{x:ox+j*c+1,y:oy+i*c+1,width:c-2,height:c-2,rx:3,fill:masked?css('--panel2'):css('--kv'),'fill-opacity':masked?1:Math.max(0.04,w).toFixed(3),stroke:i===sel?css('--dec'):css('--line'),'stroke-width':i===sel?2:1,style:'cursor:pointer'},h);
+      rc.addEventListener('click',()=>{sel=i;draw();});
+      if(!masked&&w>0.08)el('text',{x:ox+j*c+c/2,y:oy+i*c+c/2+4,'text-anchor':'middle','font-size':10,fill:css('--ink'),'pointer-events':'none'},h,w.toFixed(2));});});
+  el('text',{x:4,y:oy+n*c/2,'font-size':11,fill:css('--ink2'),transform:`rotate(-90 12 ${oy+n*c/2})`},h,'queries');
+  const b=$('atBars');b.innerHTML='';const r=R[sel];
+  el('text',{x:10,y:20,'font-size':12,fill:css('--ink')},b,`Query: "${TOK[sel]}" (position ${sel+1})`);
+  r.w.forEach((w,j)=>{const y=40+j*42;const masked=mask&&j>sel;el('text',{x:10,y:y+18,'font-size':12,fill:css(masked?'--mute':'--ink')},b,TOK[j]);
+    el('rect',{x:70,y:y+4,width:Math.max(0,w*250),height:20,rx:3,fill:css(masked?'--mute':'--kv')},b);
+    el('text',{x:76+w*250,y:y+18,'font-size':11,fill:css('--ink2')},b,masked?'masked':`${w.toFixed(3)}  (score ${isFinite(r.sc[j])?r.sc[j].toFixed(2):'−∞'})`);});
+  const top=r.w.map((w,j)=>[w,j]).sort((a,b)=>b[0]-a[0])[0];
+  $('atMsg').textContent=`"${TOK[sel]}" reads most from "${TOK[top[1]]}" (weight ${top[0].toFixed(2)}). Raise the sharpness to see softmax turn almost one-hot; turn off scaling to see the same effect.${!mask?' With the mask off, tokens can read from the future, which a language model must never do.':''}`;}
+$('atMaskOn').onclick=()=>{mask=true;$('atMaskOn').classList.add('on');$('atMaskOff').classList.remove('on');draw();};
+$('atMaskOff').onclick=()=>{mask=false;$('atMaskOff').classList.add('on');$('atMaskOn').classList.remove('on');draw();};
+$('atScOn').onclick=()=>{scale=true;$('atScOn').classList.add('on');$('atScOff').classList.remove('on');draw();};
+$('atScOff').onclick=()=>{scale=false;$('atScOff').classList.add('on');$('atScOn').classList.remove('on');draw();};
+$('atS').addEventListener('input',draw);IE.onTheme(draw);
+/* cost split */
+const TS=[128,256,512,1024,2048,4096,8192,16384,32768,65536,131072];
+function cost(){const [L,D,H,d,body]=$('cM').value.split(',').map(Number);const T=TS[+$('cT').value];$('cTv').textContent=IE.tok(T);
+  const lin=2*T*body*1e9,att=4*T*T*H*d*L/2,tot=lin+att;const s=$('cSvg');s.innerHTML='';const W=640;
+  el('rect',{x:0,y:10,width:W*lin/tot,height:40,fill:css('--pre')},s);el('rect',{x:W*lin/tot,y:10,width:W*att/tot,height:40,fill:css('--dec')},s);
+  el('text',{x:6,y:72,'font-size':12,fill:css('--pre')},s,`linear ${(100*lin/tot).toFixed(1)}%`);el('text',{x:W-6,y:72,'text-anchor':'end','font-size':12,fill:css('--dec')},s,`attention core ${(100*att/tot).toFixed(1)}%`);
+  const fmt=x=>x>=1e15?(x/1e15).toFixed(2)+' P':x>=1e12?(x/1e12).toFixed(2)+' T':(x/1e9).toFixed(1)+' G';
+  const scoreMB=H*T*T*2/1e6;const cross=body*1e9/(H*d*L);
+  $('cStats').innerHTML=[['Linear FLOPs',fmt(lin)],['Attention-core FLOPs',fmt(att)],['Total',fmt(tot)],['Score matrix per layer if stored (BF16)',scoreMB>=1000?(scoreMB/1000).toFixed(1)+' GB':scoreMB.toFixed(0)+' MB'],['T where attention = linear',IE.int(cross)],['H100 time at 50% of 989 TFLOP/s',(tot/(0.5*989e12)*1e3).toFixed(1)+' ms']].map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');}
+['cM','cT'].forEach(id=>$(id).addEventListener('input',cost));IE.onTheme(cost);
+})();
+</script>
+
+</body>
+</html>

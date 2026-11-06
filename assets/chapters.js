@@ -53,7 +53,7 @@ window.IE_CHAPTERS = [
 "title": "Attention and the transformer block",
 "slug": "2-2-attention",
 "part": 2,
-"ready": false
+"ready": true
 },
 {
 "n": "2.3",
