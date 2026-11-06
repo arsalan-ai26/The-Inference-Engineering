@@ -1,0 +1,456 @@
+<div class="kicker">Part 1 · Foundations · Chapter 1.1</div>
+<h1>Linear algebra for LLMs</h1>
+<p class="lede">An LLM is mostly one operation repeated billions of times: multiply a grid of numbers by another grid of numbers. This chapter teaches the four ideas you need to read model code and estimate its cost: vectors, the dot product, matrix multiplication and tensor shapes. You will count the work of a real model layer by the end.</p>
+<div class="meta">
+  <span class="chip">Level: beginner</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: basic Python</span>
+  <span class="chip">Compute: Colab CPU is enough</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <p>If you can answer all three, skim this chapter and go to the <a href="#lab">lab</a>:</p>
+  <ol>
+    <li>What is the shape of <code>A @ B</code> if A is [32, 4096] and B is [4096, 14336]?</li>
+    <li>How many floating-point operations (FLOPs) does that multiply take?</li>
+    <li>Two vectors have a dot product of 0. What does that tell you?</li>
+  </ol>
+  <details><summary>Answers</summary>
+    <ol>
+      <li>[32, 14336]. The inner sizes (4096) must match and disappear.</li>
+      <li>2 × 32 × 4096 × 14336 ≈ 3.76 billion FLOPs.</li>
+      <li>They are perpendicular (orthogonal). Neither vector points at all in the other's direction.</li>
+    </ol>
+  </details>
+</div>
+
+<h2 id="why">1. Why an inference engineer needs this</h2>
+<p>When a model reads a token, it turns the token into a list of numbers. Every layer then multiplies that list by tables of learned numbers called <strong>weights</strong>. The output of one layer is the input of the next.</p>
+<p>So the cost of running a model is mostly the cost of these multiplications. If you can count them, you can predict how long a request takes, how much memory it needs and which GPU you need. Every later chapter uses these counts.</p>
+<p>You do not need proofs, determinants or eigenvalues for this work. You need to know the shapes of things and how to count the work.</p>
+
+<h2 id="vectors">2. Vectors: a list of numbers with a meaning</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Scalar:</strong> one number, for example 0.7.</p>
+  <p><strong>Vector:</strong> an ordered list of numbers, for example [0.2, −1.3, 0.5]. The number of items is its <strong>dimension</strong> or <strong>length</strong>.</p>
+  <p><strong>Element:</strong> one item in a vector. In code, <code>v[0]</code> is the first element.</p>
+</div>
+<p>You can think of a vector in two ways. Both are useful.</p>
+<ul>
+  <li><strong>As an arrow.</strong> A 2-dimensional vector [3, 2] is an arrow from the origin to the point (3, 2). It has a direction and a length.</li>
+  <li><strong>As a description.</strong> Each element measures one feature. A house could be [rooms, area, age]. In an LLM, each token becomes a vector with thousands of elements. Llama 3.1 8B uses 4,096. No single element has a simple name, but together they encode what the token means in its context.</li>
+</ul>
+<p>Two basic operations act element by element:</p>
+<div class="formula">[1, 2, 3] + [10, 20, 30] = [11, 22, 33]        2 × [1, 2, 3] = [2, 4, 6]</div>
+<p>Adding vectors joins two descriptions. Scaling a vector makes it longer or shorter without changing its direction. Transformers add vectors all the time: the "residual stream" you meet in chapter 1.5 is a running sum of vectors.</p>
+<p>The <strong>length</strong> (or norm) of a vector is the square root of the sum of its squared elements. The length of [3, 4] is √(9 + 16) = 5.</p>
+
+<h2 id="dot">3. The dot product: how much two vectors agree</h2>
+<p>The dot product takes two vectors of the same length and gives one number. Multiply the matching elements, then add the results:</p>
+<div class="formula">a · b = a₁b₁ + a₂b₂ + ... + aₙbₙ</div>
+<div class="box ex">
+  <span class="lbl">Worked example</span>
+  <p>a = [1, 2, 3] and b = [4, −5, 6].</p>
+  <p>a · b = (1 × 4) + (2 × −5) + (3 × 6) = 4 − 10 + 18 = 12.</p>
+  <p>Cost: 3 multiplications and 2 additions. For vectors of length n, the cost is n multiplications and n − 1 additions, so about <strong>2n operations</strong>.</p>
+</div>
+<p>The geometric meaning is the important part. The dot product also equals:</p>
+<div class="formula">a · b = |a| × |b| × cos(angle between a and b)</div>
+<ul>
+  <li>Large and positive: the vectors point in a similar direction.</li>
+  <li>Zero: the vectors are perpendicular. They share nothing.</li>
+  <li>Negative: they point in opposite directions.</li>
+</ul>
+<p>If you divide by both lengths, you get the <strong>cosine similarity</strong>, a score from −1 to 1 that ignores length and measures only direction. Search engines, RAG systems and embedding models use it to find similar text. Inside a transformer, attention (chapter 2.2) uses raw dot products to decide which earlier tokens matter to the current one.</p>
+
+<div class="widget" id="dotW">
+  <div class="wt">Interactive: drag the arrows</div>
+  <div class="ws">Drag the tip of a or b. Watch the dot product and the cosine change. The dashed line is the projection of b onto a: the part of b that points along a.</div>
+  <div class="svgwrap"><svg id="dotSvg" viewBox="0 0 420 320" width="420" style="max-width:100%;height:auto;touch-action:none" role="img" aria-label="Two draggable vectors with their dot product"></svg></div>
+  <div class="stats" id="dotStats"></div>
+</div>
+
+<div class="box try">
+  <span class="lbl">Try it</span>
+  <ol>
+    <li>Make the dot product exactly zero. What is the angle?</li>
+    <li>Keep the angle fixed and make b twice as long. What happens to the dot product and to the cosine?</li>
+  </ol>
+  <details><summary>Answers</summary><ol><li>90 degrees.</li><li>The dot product doubles. The cosine stays the same, because cosine ignores length.</li></ol></details>
+</div>
+
+<h2 id="matrix">4. Matrices: many vectors in a grid</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Matrix:</strong> a 2-D grid of numbers with <em>rows</em> and <em>columns</em>. A matrix with m rows and n columns has shape <strong>[m, n]</strong>.</p>
+  <p><strong>Weight matrix:</strong> a matrix of learned numbers inside a model layer.</p>
+  <p><strong>Transpose:</strong> the same matrix with rows and columns swapped. Shape [m, n] becomes [n, m]. Written Aᵀ, or <code>A.T</code> in code.</p>
+</div>
+<p>A useful way to see a matrix: <strong>a stack of vectors</strong>. A batch of 32 tokens, each a 4,096-element vector, is a matrix of shape [32, 4096]. Each row is one token.</p>
+<p>A weight matrix is also a stack of vectors. Each column is a "detector": a direction in the vector space. Multiplying a token vector by the matrix asks each detector, with a dot product, "how much does this token point your way?"</p>
+
+<h2 id="matmul">5. Matrix multiplication: many dot products at once</h2>
+<p>To multiply A [m, k] by B [k, n]:</p>
+<ol>
+  <li>Take row i of A (length k).</li>
+  <li>Take column j of B (length k).</li>
+  <li>Their dot product is the output element at row i, column j.</li>
+  <li>Do this for every row i and every column j.</li>
+</ol>
+<p>The result has shape <strong>[m, n]</strong>. The inner sizes must match, because a dot product needs two vectors of the same length. The inner size k "disappears" into the sums.</p>
+<div class="formula">[m, k] @ [k, n] → [m, n]          the two k's must be equal</div>
+
+<div class="widget" id="mmW">
+  <div class="wt">Interactive: build a matmul one cell at a time</div>
+  <div class="ws">Each step computes one output cell as the dot product of a row of A (indigo) and a column of B (amber). The counter adds 2k operations per cell.</div>
+  <div class="ctrls">
+    <label>m (rows of A) <select id="mmM"><option>2</option><option selected>3</option><option>4</option></select></label>
+    <label>k (inner size) <select id="mmK"><option>2</option><option>3</option><option selected>4</option><option>5</option></select></label>
+    <label>n (columns of B) <select id="mmN"><option>2</option><option selected>3</option><option>4</option></select></label>
+    <button class="pri" id="mmStep">Next cell</button>
+    <button id="mmAll">Fill all</button>
+    <button id="mmReset">Reset</button>
+  </div>
+  <div class="svgwrap"><svg id="mmSvg" role="img" aria-label="Matrix multiplication grid"></svg></div>
+  <div class="stats" id="mmStats"></div>
+  <p class="note" id="mmMsg"></p>
+</div>
+
+<h3>Counting the work: 2 × m × n × k</h3>
+<p>The output has m × n cells. Each cell is a dot product of length k, which costs k multiplications and about k additions. So:</p>
+<div class="formula"><b>FLOPs of a matmul</b> = 2 × m × n × k</div>
+<p>A <strong>FLOP</strong> is one floating-point operation: one multiply or one add. GPU makers count a fused multiply-add as 2 FLOPs, which matches this formula. (FLOP/s, with a lower-case s, is FLOPs per second: a speed. Do not confuse them.)</p>
+<div class="box ex">
+  <span class="lbl">Worked example: one layer of a real model</span>
+  <p>Llama 3.1 8B has a hidden size of 4,096. Its MLP block first multiplies each token by an "up" matrix of shape [4096, 14336].</p>
+  <p>For one token: [1, 4096] @ [4096, 14336] → [1, 14336]. FLOPs = 2 × 1 × 14,336 × 4,096 ≈ 117 million.</p>
+  <p>For a batch of 32 tokens: [32, 4096] @ [4096, 14336] → [32, 14336]. FLOPs ≈ 3.76 billion. The work grows in a straight line with the number of tokens.</p>
+</div>
+
+<h3>Counting the data: bytes moved</h3>
+<p>Work is half the story. The computer must also read A and B from memory and write the result. With 2 bytes per number (the BF16 format from chapter 1.3):</p>
+<div class="formula">bytes ≈ (m × k + k × n + m × n) × bytes per number</div>
+<p>For the one-token example, the weight matrix alone is 4,096 × 14,336 × 2 bytes ≈ 117 MB. You read 117 MB to do 117 million FLOPs: about <strong>1 FLOP per byte</strong>. For 32 tokens you read almost the same 117 MB and do 32 times the work: about <strong>32 FLOPs per byte</strong>.</p>
+<p>This ratio, work per byte, is called <strong>arithmetic intensity</strong>. It explains most of LLM performance. A GPU can do hundreds of FLOPs in the time it reads one byte, so a matmul with a low ratio leaves the math units waiting for data. Chapter 2.5 develops this into the roofline model. For now, remember one fact: <em>a batch of tokens reuses the same weights, so batching raises the work per byte.</em></p>
+
+<div class="widget" id="fbW">
+  <div class="wt">Interactive: FLOPs and bytes of a matmul</div>
+  <div class="ws">Pick a real layer from Llama 3.1 8B, or enter your own shape. m is the number of tokens processed together.</div>
+  <div class="ctrls">
+    <label>Layer <select id="fbLayer">
+      <option value="4096,4096">Attention Q projection [4096 → 4096]</option>
+      <option value="4096,1024">Attention K or V projection [4096 → 1024]</option>
+      <option value="4096,14336" selected>MLP up or gate [4096 → 14336]</option>
+      <option value="14336,4096">MLP down [14336 → 4096]</option>
+      <option value="4096,128256">Output head [4096 → 128256 vocab]</option>
+      <option value="custom">Custom</option>
+    </select></label>
+    <label>k <input type="number" id="fbK" value="4096" min="1" style="width:100px"></label>
+    <label>n <input type="number" id="fbN" value="14336" min="1" style="width:100px"></label>
+    <label>Tokens m: <span class="mono" id="fbMV"></span><input type="range" id="fbM" min="0" max="12" value="0"></label>
+    <label>Bytes per number <select id="fbB"><option value="4">4 (FP32)</option><option value="2" selected>2 (BF16)</option><option value="1">1 (FP8)</option></select></label>
+  </div>
+  <div class="stats" id="fbStats"></div>
+  <div class="svgwrap"><svg id="fbSvg" viewBox="0 0 640 220" width="640" style="max-width:100%;height:auto" role="img" aria-label="FLOPs per byte against number of tokens"></svg></div>
+  <p class="note">The curve shows FLOPs per byte as m grows from 1 to 4,096 (log scale). It rises almost linearly at first because the weight read is shared, then flattens when the input and output matrices become as large as the weights.</p>
+</div>
+
+<h2 id="shapes">6. Tensors and shapes</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Tensor:</strong> a grid of numbers with any number of dimensions. A scalar has 0, a vector 1, a matrix 2. LLM code uses 3-D and 4-D tensors all the time.</p>
+  <p><strong>Shape:</strong> the size of each dimension, written as a list. [2, 8, 4096] means 2 × 8 × 4,096 numbers.</p>
+  <p><strong>Batched matmul:</strong> a matmul on the last two dimensions, done independently for every index of the dimensions in front.</p>
+</div>
+<p>Model code names dimensions with letters. You will see these constantly:</p>
+<div class="tbl"><table>
+<tr><th>Letter</th><th>Meaning</th><th>Llama 3.1 8B example</th></tr>
+<tr><td>B</td><td>Batch: number of sequences processed together</td><td>1 to hundreds</td></tr>
+<tr><td>T (or S, L)</td><td>Tokens in each sequence</td><td>up to 131,072</td></tr>
+<tr><td>D (or C, d_model)</td><td>Hidden size: length of each token vector</td><td>4,096</td></tr>
+<tr><td>H</td><td>Number of attention heads</td><td>32</td></tr>
+<tr><td>d (or d_head)</td><td>Size of each head</td><td>128</td></tr>
+<tr><td>V</td><td>Vocabulary size</td><td>128,256</td></tr>
+</table></div>
+<p>A linear layer in PyTorch takes an input of shape [B, T, D] and acts on the last dimension only. It treats B × T as "many rows". So [2, 8, 4096] @ [4096, 14336] gives [2, 8, 14336], and the FLOPs are 2 × (2 × 8) × 14,336 × 4,096. The rule: <strong>multiply all leading dimensions together to get m</strong>.</p>
+<div class="box try">
+  <span class="lbl">Try it: predict the shape</span>
+  <ol>
+    <li>x is [4, 100, 4096]. W is [4096, 1024]. Shape of <code>x @ W</code>?</li>
+    <li>q is [4, 32, 100, 128] and k is [4, 32, 100, 128]. Shape of <code>q @ k.transpose(-2, -1)</code>?</li>
+    <li>How many FLOPs is the product in question 2?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>[4, 100, 1024].</li>
+    <li>k transposed on the last two dims is [4, 32, 128, 100]. The product is [4, 32, 100, 100]: one 100 × 100 score grid per sequence per head. You will meet this grid again as the attention matrix in chapter 2.2.</li>
+    <li>There are 4 × 32 = 128 separate matmuls, each [100, 128] @ [128, 100]. FLOPs = 128 × 2 × 100 × 100 × 128 ≈ 328 million.</li>
+  </ol></details>
+</div>
+<p><strong>Broadcasting</strong> is the rule that lets you add a smaller tensor to a bigger one. A bias of shape [14336] added to [2, 8, 14336] is copied along the leading dimensions. Read shapes from the right: dimensions must be equal, or one of them must be 1 (or missing). Chapter 1.4 practises this.</p>
+
+<h2 id="model">7. Putting it together: the matmuls inside one model</h2>
+<p>Almost all parameters of a transformer live in a few weight matrices per layer. For Llama 3.1 8B, each of the 32 layers has:</p>
+<div class="tbl"><table>
+<tr><th>Matrix</th><th class="n">Shape</th><th class="n">Parameters</th></tr>
+<tr><td>Query projection</td><td class="n">4096 × 4096</td><td class="n">16.8 M</td></tr>
+<tr><td>Key projection</td><td class="n">4096 × 1024</td><td class="n">4.2 M</td></tr>
+<tr><td>Value projection</td><td class="n">4096 × 1024</td><td class="n">4.2 M</td></tr>
+<tr><td>Output projection</td><td class="n">4096 × 4096</td><td class="n">16.8 M</td></tr>
+<tr><td>MLP gate</td><td class="n">4096 × 14336</td><td class="n">58.7 M</td></tr>
+<tr><td>MLP up</td><td class="n">4096 × 14336</td><td class="n">58.7 M</td></tr>
+<tr><td>MLP down</td><td class="n">14336 × 4096</td><td class="n">58.7 M</td></tr>
+<tr><td><strong>Per layer</strong></td><td class="n"></td><td class="n"><strong>218.1 M</strong></td></tr>
+</table></div>
+<p>32 layers × 218.1 M ≈ 6.98 B. The input embedding table and the output head (each 128,256 × 4,096 ≈ 0.53 B) bring the total to about 8.03 B. Small parts such as normalization weights add almost nothing.</p>
+<p>Now the key result. Each parameter takes part in one multiply and one add per token. So:</p>
+<div class="formula"><b>FLOPs per token</b> ≈ 2 × number of parameters</div>
+<p>For Llama 3.1 8B, that is about 16 GFLOPs per token. (The input embedding is a table lookup, not a matmul, and attention adds work that grows with context. Chapter 2.5 refines this. The rule is still the standard first estimate.)</p>
+<div class="box ex">
+  <span class="lbl">What the number means</span>
+  <p>A 1,000-token prompt into Llama 3.1 8B needs about 16 TFLOPs. An NVIDIA H100 does about 989 TFLOP/s of dense BF16 math at its peak. So the prompt needs at least 16 ms of pure math, and in practice somewhat more. You just estimated a latency from a shape table.</p>
+</div>
+
+<h2 id="expert">8. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Why matmul order and layout matter</span>
+  <p>A matmul's FLOP count does not depend on how you loop, but its speed does. A GPU splits the output into tiles and loads each tile of A and B into fast on-chip memory once, then reuses it many times. Tiling raises the effective work per byte read from main memory. Chapter 5.4 teaches this. The fact to keep now: shapes that are multiples of 64 or 128 usually run faster, because they fill the tiles exactly.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Low-rank structure</span>
+  <p>A [k, n] matrix can be approximated as the product of [k, r] and [r, n] with a small r. This cuts parameters from k × n to r × (k + n). LoRA fine-tuning (chapter 7.3) and the compressed KV cache of multi-head latent attention (expert layer of chapter 2.4) both use this idea.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Matrix-vector vs matrix-matrix</span>
+  <p>When m = 1, a matmul is a matrix-vector product (GEMV). It reads the full weight matrix to do only 2 FLOPs per weight. Generating one token for one user is a chain of GEMVs, which is why it is limited by memory speed, not math speed. Many users at once turn GEMVs back into matrix-matrix products (GEMM). This is the core reason LLM servers batch requests (chapter 3.2).</p>
+</div>
+
+<h2 id="mistakes">9. Common mistakes</h2>
+<ul>
+  <li>Counting a matmul as m × n × k FLOPs. Each multiply has an add: use 2 × m × n × k.</li>
+  <li>Forgetting the leading dimensions. For [B, T, D] inputs, m = B × T.</li>
+  <li>Confusing FLOPs (an amount of work) with FLOP/s (a speed).</li>
+  <li>Reading a shape from the left when broadcasting. Broadcasting aligns dimensions from the right.</li>
+  <li>Assuming a bigger FLOP count always means slower. At small m, reading the weights takes longer than the math.</li>
+</ul>
+
+<h2 id="lab">10. Lab</h2>
+<p><strong>Goal:</strong> count FLOPs by hand, then measure them, and see that small matmuls waste the hardware.</p>
+<p><strong>Setup:</strong> open a new Google Colab notebook. A CPU runtime is enough for Parts A to C. Part D needs a GPU: choose Runtime, then Change runtime type, then T4 GPU.</p>
+
+<h3>Part A: dot product and cosine by hand, then in code</h3>
+<p>Predict first: for a = [1, 2, 3] and b = [4, −5, 6], what are a · b and the cosine similarity? Then run:</p>
+<pre>import numpy as np
+a = np.array([1., 2., 3.]); b = np.array([4., -5., 6.])
+dot = sum(x * y for x, y in zip(a, b))          # your own loop
+print(dot, a @ b)                               # both should be 12.0
+cos = dot / (np.linalg.norm(a) * np.linalg.norm(b))
+print(round(cos, 3))</pre>
+<details><summary>Expected output</summary><p>12.0 twice, then 0.366. The vectors point in a broadly similar direction (angle about 68 degrees).</p></details>
+
+<h3>Part B: write a matmul with loops</h3>
+<p>Write <code>matmul(A, B)</code> with three nested loops. Do not use <code>@</code>. Count the multiply-adds as you go.</p>
+<pre>def matmul(A, B):
+    m, k = A.shape; k2, n = B.shape
+    assert k == k2, "inner sizes must match"
+    C = np.zeros((m, n)); flops = 0
+    # TODO: fill C[i, j] with the dot product of row i of A and column j of B
+    # and add 2 to flops for every multiply-add
+    return C, flops
+
+A = np.random.randn(3, 4); B = np.random.randn(4, 2)
+C, f = matmul(A, B)
+print(np.allclose(C, A @ B), f, 2 * 3 * 2 * 4)   # True 48 48</pre>
+<details><summary>Solution</summary>
+<pre>    for i in range(m):
+        for j in range(n):
+            s = 0.0
+            for p in range(k):
+                s += A[i, p] * B[p, j]
+                flops += 2
+            C[i, j] = s</pre>
+</details>
+
+<h3>Part C: measure FLOP/s and the effect of shape</h3>
+<p>Predict first: the three shapes below have very different FLOP counts. Write down the FLOPs of each. Which will reach the highest GFLOP/s, and why?</p>
+<pre>import time
+def bench(m, k, n, reps=5):
+    A = np.random.randn(m, k).astype(np.float32)
+    B = np.random.randn(k, n).astype(np.float32)
+    A @ B                                         # warm-up
+    t = time.perf_counter()
+    for _ in range(reps): A @ B
+    dt = (time.perf_counter() - t) / reps
+    flops = 2 * m * n * k
+    print(f"[{m}x{k}] @ [{k}x{n}]  {flops/1e9:8.3f} GFLOP  {dt*1e3:8.2f} ms  {flops/dt/1e9:7.1f} GFLOP/s")
+
+bench(1, 4096, 4096)      # one token through a 4096x4096 layer
+bench(32, 4096, 4096)     # 32 tokens
+bench(2048, 4096, 4096)   # 2048 tokens</pre>
+<details><summary>What you should see</summary>
+<p>The FLOPs are 0.034, 1.07 and 68.7 GFLOP. Time grows much more slowly than FLOPs from m = 1 to m = 32, because the cost at m = 1 is mostly reading the 64 MB weight matrix (FP32) and loop overhead. GFLOP/s rises with m. This is the "work per byte" effect from section 5, measured on your own machine. Exact numbers depend on the CPU Colab gives you.</p>
+</details>
+
+<h3>Part D: the same on a GPU</h3>
+<pre>import torch
+dev = "cuda"
+def gbench(m, k, n, dtype=torch.float16, reps=20):
+    A = torch.randn(m, k, device=dev, dtype=dtype); B = torch.randn(k, n, device=dev, dtype=dtype)
+    for _ in range(3): A @ B
+    torch.cuda.synchronize(); t = time.perf_counter()
+    for _ in range(reps): A @ B
+    torch.cuda.synchronize(); dt = (time.perf_counter() - t) / reps
+    print(f"m={m:5d}  {2*m*n*k/dt/1e12:6.2f} TFLOP/s  {dt*1e6:8.1f} us")
+
+for m in [1, 8, 32, 128, 512, 2048, 8192]:
+    gbench(m, 4096, 4096)</pre>
+<p>A T4's data sheet lists 65 TFLOP/s of FP16 tensor math. Find the m where you get closest to it. Plot TFLOP/s against m. Keep this plot: it is the shape of every batching curve in this book.</p>
+<div class="box watch">
+  <span class="lbl">Watch out</span>
+  <p>GPU work runs asynchronously. Without <code>torch.cuda.synchronize()</code> the timer stops before the GPU finishes, and you will report impossible speeds.</p>
+</div>
+
+<h3>Part E: count a real model</h3>
+<p>Load the config of an open model and recompute its parameter count from shapes. Compare with the official number.</p>
+<pre>from transformers import AutoConfig
+c = AutoConfig.from_pretrained("Qwen/Qwen2.5-0.5B")       # no login needed
+D, F, L, V = c.hidden_size, c.intermediate_size, c.num_hidden_layers, c.vocab_size
+hd = D // c.num_attention_heads; kv = c.num_key_value_heads * hd
+per_layer = D*D + 2*D*kv + D*D + 3*D*F                     # q, k, v, o, gate, up, down
+emb = V * D * (1 if c.tie_word_embeddings else 2)
+print(D, F, L, V, kv)
+print(f"{(L*per_layer + emb)/1e9:.3f} B parameters (official: 0.49 B)")</pre>
+<details><summary>Notes</summary><p>Your estimate should land within a few percent of 0.49 B. The small gap is biases on the Q, K and V projections and the normalization weights, which this formula skips. Qwen2.5-0.5B ties its input and output embeddings, so the table is counted once.</p></details>
+
+<h2 id="realworld">11. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Where these counts are used</span>
+  <ul>
+    <li><strong>Capacity planning:</strong> teams estimate GPUs needed from 2 × parameters × tokens per second, then divide by the GPU's real (not peak) FLOP/s.</li>
+    <li><strong>Model choice:</strong> a model with half the parameters needs about half the FLOPs per token, so it can serve about twice the traffic on the same hardware, all else equal.</li>
+    <li><strong>Libraries:</strong> every linear layer in PyTorch calls a vendor matmul library (cuBLAS on NVIDIA). Engine teams tune shapes and batch sizes so these calls hit the fast tile sizes.</li>
+    <li><strong>Embeddings and search:</strong> vector databases rank documents by dot product or cosine similarity, at millions of comparisons per query.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">12. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz11"></div>
+<script type="application/json" id="qz11">[
+{"q":"A is [64, 512] and B is [512, 256]. What is the shape of A @ B?","o":["[512, 512]","[64, 256]","[256, 64]","It is not allowed"],"a":1,"e":"The inner sizes (512) match and disappear. The result takes the outer sizes: [64, 256]."},
+{"q":"How many FLOPs does [64, 512] @ [512, 256] take?","o":["8.4 million","16.8 million","33.6 million","64 × 256"],"a":1,"e":"2 × 64 × 256 × 512 = 16,777,216, about 16.8 million."},
+{"q":"Cosine similarity of two vectors is −1. They are:","o":["Perpendicular","The same direction","Opposite directions","Of equal length"],"a":2,"e":"Cosine −1 means an angle of 180 degrees."},
+{"q":"A PyTorch linear layer gets input [2, 10, 768] and has weight [768, 3072]. The output shape is:","o":["[2, 3072]","[20, 3072]","[2, 10, 3072]","[2, 10, 768]"],"a":2,"e":"Linear layers act on the last dimension and keep the leading ones."},
+{"q":"About how many FLOPs does a 7B-parameter model need per generated token?","o":["7 billion","14 billion","49 billion","It depends only on the GPU"],"a":1,"e":"About 2 FLOPs per parameter per token: one multiply and one add."},
+{"q":"Why does a batch of 32 tokens run much more efficiently per token than 1 token through the same layer?","o":["The GPU clock is faster at large batch","The weights are read once and reused for all 32 tokens","Each token needs fewer FLOPs in a batch","The output is smaller"],"a":1,"e":"FLOPs grow 32 times but the weight read stays almost the same, so work per byte rises about 32 times."},
+{"q":"Which statement about FLOPs and FLOP/s is correct?","o":["They are the same thing","FLOPs is work; FLOP/s is speed","FLOP/s is work; FLOPs is speed","Both measure memory"],"a":1,"e":"Divide work (FLOPs) by speed (FLOP/s) to get a time."}
+]</script>
+
+<h2 id="summary">13. Summary</h2>
+<ul>
+  <li>A vector is a list of numbers. In an LLM, every token becomes one vector of the hidden size.</li>
+  <li>The dot product multiplies matching elements and adds them. It measures how much two vectors agree. Cosine similarity is the same, divided by the lengths.</li>
+  <li>A matmul [m, k] @ [k, n] gives [m, n] and costs 2 × m × n × k FLOPs.</li>
+  <li>Bytes moved ≈ (mk + kn + mn) × bytes per number. Work per byte rises with m because the weights are shared.</li>
+  <li>For [B, T, D] inputs, m = B × T.</li>
+  <li>A transformer's FLOPs per token ≈ 2 × parameters. Llama 3.1 8B ≈ 16 GFLOPs per token.</li>
+</ul>
+
+<h2 id="refs">14. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://www.3blue1brown.com/topics/linear-algebra">3Blue1Brown: Essence of Linear Algebra</a>, chapters 1 to 4 and 9</td><td>The best visual intuition for vectors, matrices as transformations and the dot product. Watch these if any section felt abstract.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 2.1.1 to 2.1.2</td><td>Linear layers as the basic matmul, and why activations stop stacked layers from collapsing into one.</td></tr>
+<tr><td>Sebastian Raschka, <em>Build a Large Language Model (From Scratch)</em>, appendix A</td><td>A short PyTorch tensor primer with shapes and matmul in code.</td></tr>
+<tr><td>Hwu, Kirk and El Hajj, <em>Programming Massively Parallel Processors</em> (4th ed.), chapters 3 and 5</td><td>How a matmul maps onto GPU threads, and how tiling cuts memory traffic. Read later with chapter 5.4.</td></tr>
+<tr><td><a href="https://jax-ml.github.io/scaling-book/roofline/">How to Scale Your Model: rooflines</a> (Google DeepMind)</td><td>The FLOP and byte counting of matmuls, with arithmetic intensity. Bridges to chapter 2.5.</td></tr>
+<tr><td><a href="https://huggingface.co/meta-llama/Llama-3.1-8B/blob/main/config.json">Llama 3.1 8B config.json</a> and <a href="https://huggingface.co/Qwen/Qwen2.5-0.5B/blob/main/config.json">Qwen2.5-0.5B config.json</a></td><td>The real layer sizes used in the tables and the lab.</td></tr>
+<tr><td><a href="https://www.nvidia.com/en-us/data-center/tesla-t4/">NVIDIA T4 data sheet</a> and <a href="https://www.nvidia.com/en-us/data-center/h100/">H100 data sheet</a></td><td>Peak FLOP/s figures used in the examples (T4: 65 TFLOP/s FP16 tensor; H100 SXM: about 989 TFLOP/s dense BF16).</td></tr>
+</table></div>
+<p class="note">Facts checked on 6 November 2026.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+/* dot product drag widget */
+const ds=$('dotSvg'); const O={x:210,y:170}, S=40;
+let va={x:3,y:1}, vb={x:1,y:2.5}, drag=null;
+function drawDot(){
+  ds.innerHTML='';
+  for(let i=-5;i<=5;i++){el('line',{x1:O.x+i*S,y1:10,x2:O.x+i*S,y2:310,stroke:css('--line'),'stroke-width':i?0.5:1.2},ds);}
+  for(let j=-3;j<=3;j++){el('line',{x1:10,y1:O.y-j*S,x2:410,y2:O.y-j*S,stroke:css('--line'),'stroke-width':j?0.5:1.2},ds);}
+  const P=v=>({x:O.x+v.x*S,y:O.y-v.y*S});
+  const la=Math.hypot(va.x,va.y), lb=Math.hypot(vb.x,vb.y);
+  const dot=va.x*vb.x+va.y*vb.y;
+  if(la>0.01){const t=dot/(la*la);const pr=P({x:va.x*t,y:va.y*t});const pb=P(vb);
+    el('line',{x1:pb.x,y1:pb.y,x2:pr.x,y2:pr.y,stroke:css('--ink2'),'stroke-dasharray':'4 3'},ds);
+    el('line',{x1:O.x,y1:O.y,x2:pr.x,y2:pr.y,stroke:css('--kv'),'stroke-width':6,opacity:.45},ds);}
+  [[va,'--pre','a'],[vb,'--dec','b']].forEach(([v,c,n])=>{const p=P(v);
+    el('line',{x1:O.x,y1:O.y,x2:p.x,y2:p.y,stroke:css(c),'stroke-width':3},ds);
+    el('circle',{cx:p.x,cy:p.y,r:10,fill:css(c),'data-v':n,style:'cursor:grab'},ds);
+    el('text',{x:p.x+12,y:p.y-10,fill:css(c),'font-size':14,'font-weight':700},ds,n);});
+  const cos=la&&lb?dot/(la*lb):0, ang=Math.acos(Math.max(-1,Math.min(1,cos)))*180/Math.PI;
+  const f=v=>v.toFixed(1);
+  $('dotStats').innerHTML=[['a',`[${f(va.x)}, ${f(va.y)}]`],['b',`[${f(vb.x)}, ${f(vb.y)}]`],['a · b',dot.toFixed(2)],['Cosine',cos.toFixed(3)],['Angle',ang.toFixed(0)+'°']]
+    .map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');
+}
+function pt(e){const r=ds.getBoundingClientRect();const sx=420/r.width;return{x:((e.clientX-r.left)*sx-O.x)/S,y:(O.y-(e.clientY-r.top)*sx)/S};}
+ds.addEventListener('pointerdown',e=>{const n=e.target.getAttribute&&e.target.getAttribute('data-v');if(n){drag=n;ds.setPointerCapture(e.pointerId);}});
+ds.addEventListener('pointermove',e=>{if(!drag)return;const p=pt(e);const q={x:Math.round(Math.max(-5,Math.min(5,p.x))*10)/10,y:Math.round(Math.max(-3.5,Math.min(3.5,p.y))*10)/10};if(drag==='a')va=q;else vb=q;drawDot();});
+ds.addEventListener('pointerup',()=>drag=null);
+IE.onTheme(drawDot);
+
+/* matmul stepper */
+const M={m:3,k:4,n:3,step:0,A:[],B:[]};
+function mmInit(){M.m=+$('mmM').value;M.k=+$('mmK').value;M.n=+$('mmN').value;M.step=0;
+  const r=()=>Math.floor(Math.random()*7)-3;
+  M.A=[...Array(M.m)].map(()=>[...Array(M.k)].map(r));M.B=[...Array(M.k)].map(()=>[...Array(M.n)].map(r));drawMM();}
+function drawMM(){
+  const s=$('mmSvg'),c=30,g=24,{m,k,n}=M;
+  const ax=10,ay=10+k*c+g, bx=10+k*c+g, by=10, cx=bx, cy=ay;
+  const W=bx+n*c+10,H=ay+m*c+30; s.setAttribute('viewBox',`0 0 ${W} ${H}`);s.setAttribute('width',W);s.style.maxWidth='100%';s.style.height='auto';s.innerHTML='';
+  const cur=M.step>0&&M.step<=m*n?M.step-1:-1, ci=cur>=0?Math.floor(cur/n):-1, cj=cur>=0?cur%n:-1;
+  const cell=(x,y,v,fill,stroke)=>{el('rect',{x:x+1,y:y+1,width:c-2,height:c-2,rx:4,fill,stroke},s);if(v!==null)el('text',{x:x+c/2,y:y+c/2+4,'text-anchor':'middle','font-size':11,fill:css('--ink')},s,v);};
+  for(let i=0;i<m;i++)for(let p=0;p<k;p++)cell(ax+p*c,ay+i*c,M.A[i][p],i===ci?css('--pre-s'):css('--panel2'),i===ci?css('--pre'):css('--line'));
+  for(let p=0;p<k;p++)for(let j=0;j<n;j++)cell(bx+j*c,by+p*c,M.B[p][j],j===cj?css('--dec-s'):css('--panel2'),j===cj?css('--dec'):css('--line'));
+  for(let i=0;i<m;i++)for(let j=0;j<n;j++){const idx=i*n+j;const done=idx<M.step;let v=null;if(done){v=0;for(let p=0;p<k;p++)v+=M.A[i][p]*M.B[p][j];}
+    cell(cx+j*c,cy+i*c,v,idx===cur?css('--kv-s'):done?css('--panel'):css('--bg'),idx===cur?css('--kv'):css('--line'));}
+  el('text',{x:ax,y:ay-8,'font-size':11,fill:css('--pre')},s,`A [${m}, ${k}]`);
+  el('text',{x:bx,y:H-8,'font-size':11,fill:css('--kv')},s,`C [${m}, ${n}]`);
+  el('text',{x:bx+n*c+4,y:by+12,'font-size':11,fill:css('--dec')},s,'');
+  el('text',{x:ax,y:by+12,'font-size':11,fill:css('--dec')},s,`B [${k}, ${n}] →`);
+  const fl=Math.min(M.step,m*n)*2*k;
+  $('mmStats').innerHTML=[['Cells done',`${Math.min(M.step,m*n)} / ${m*n}`],['FLOPs so far',fl],['Formula 2mnk',2*m*n*k]].map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');
+  if(cur>=0){const terms=[...Array(k)].map((_,p)=>`(${M.A[ci][p]})(${M.B[p][cj]})`).join(' + ');let v=0;for(let p=0;p<k;p++)v+=M.A[ci][p]*M.B[p][cj];$('mmMsg').textContent=`C[${ci}][${cj}] = ${terms} = ${v}`;}
+  else $('mmMsg').textContent=M.step?'All cells done. Every cell cost one dot product of length k.':'Press "Next cell".';
+}
+$('mmStep').onclick=()=>{if(M.step<M.m*M.n){M.step++;drawMM();}};
+$('mmAll').onclick=()=>{M.step=M.m*M.n;drawMM();};
+$('mmReset').onclick=()=>{M.step=0;drawMM();};
+['mmM','mmK','mmN'].forEach(id=>$(id).onchange=mmInit);
+mmInit(); IE.onTheme(drawMM);
+
+/* FLOPs and bytes */
+const MS=[1,2,4,8,16,32,64,128,256,512,1024,2048,4096];
+function fb(){
+  const L=$('fbLayer').value;
+  if(L!=='custom'){const [k,n]=L.split(',');$('fbK').value=k;$('fbN').value=n;}
+  const k=+$('fbK').value||1,n=+$('fbN').value||1,m=MS[+$('fbM').value],b=+$('fbB').value;
+  $('fbMV').textContent=m;
+  const fl=2*m*n*k, by=(m*k+k*n+m*n)*b, wb=k*n*b;
+  const fmt=x=>x>=1e12?(x/1e12).toFixed(2)+' T':x>=1e9?(x/1e9).toFixed(2)+' G':x>=1e6?(x/1e6).toFixed(1)+' M':IE.int(x);
+  $('fbStats').innerHTML=[['Output shape',`[${m}, ${IE.int(n)}]`],['FLOPs',fmt(fl)],['Weight bytes',fmt(wb)+'B'],['Total bytes',fmt(by)+'B'],['FLOPs per byte',(fl/by).toFixed(1)],['H100 time if math-bound',(fl/989e12*1e6).toFixed(2)+' µs'],['H100 time if memory-bound',(by/3.35e12*1e6).toFixed(2)+' µs']]
+    .map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');
+  const s=$('fbSvg');s.innerHTML='';const l=50,r=20,t=14,bt=36,W=640,H=220;
+  const pts=MS.map(mm=>({m:mm,v:2*mm*n*k/((mm*k+k*n+mm*n)*b)}));const ymax=Math.max(...pts.map(p=>p.v))*1.1;
+  const X=i=>l+i/(MS.length-1)*(W-l-r), Y=v=>H-bt-v/ymax*(H-t-bt);
+  for(let i=0;i<=4;i++){const v=ymax*i/4;el('line',{x1:l,x2:W-r,y1:Y(v),y2:Y(v),class:'axis'},s);el('text',{x:l-6,y:Y(v)+4,'text-anchor':'end',class:'tick'},s,v.toFixed(0));}
+  MS.forEach((mm,i)=>{if(i%2===0)el('text',{x:X(i),y:H-bt+16,'text-anchor':'middle',class:'tick'},s,mm);});
+  el('text',{x:l+(W-l-r)/2,y:H-4,'text-anchor':'middle',class:'tick'},s,'tokens m (log scale)');
+  el('path',{d:pts.map((p,i)=>(i?'L':'M')+X(i)+' '+Y(p.v)).join(' '),fill:'none',stroke:css('--kv'),'stroke-width':2.5},s);
+  const ci=+$('fbM').value;el('circle',{cx:X(ci),cy:Y(pts[ci].v),r:5,fill:css('--dec')},s);
+}
+['fbLayer','fbK','fbN','fbM','fbB'].forEach(id=>$(id).addEventListener('input',()=>{if(id==='fbK'||id==='fbN')$('fbLayer').value='custom';fb();}));
+IE.onTheme(fb);
+})();
+</script>
