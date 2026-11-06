@@ -1,0 +1,389 @@
+<div class="kicker">Part 3 · Inference engines and serving · Chapter 3.1</div>
+<h1>Model formats and runtimes</h1>
+<p class="lede">A trained model is a folder of files. Turning it into a fast, shared service takes two decisions: how the weights are stored and loaded, and what program runs the forward pass. This chapter covers the file formats (safetensors, ONNX, engine files), the ways to execute a model (eager PyTorch, compiled graphs, TensorRT), why a plain PyTorch server collapses under many users, and how to read an inference engine's metrics.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 4 to 5 hours with the lab</span>
+  <span class="chip">Needs: Part 1 and Part 2, especially 1.6 and 2.4</span>
+  <span class="chip">Compute: Colab T4</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why is loading a <code>.bin</code> (pickle) checkpoint from an unknown source a security risk, and why is safetensors not?</li>
+    <li>What does "compiling" a model mean, in one sentence?</li>
+    <li>Sixteen users send requests at once to a server that calls <code>model.generate</code> for each request in turn. What happens to the 16th user's time to first token?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Pickle can run arbitrary Python code while it loads. Safetensors stores only a JSON header and raw tensor bytes, so loading cannot execute code.</li>
+    <li>Capturing the model's computation as a graph, optimizing it for one target (fusing operations, choosing kernels, planning memory) and producing code that runs it with less overhead.</li>
+    <li>It waits for the 15 requests in front of it to finish completely, so its TTFT becomes about 15 full generation times.</li>
+  </ol></details>
+</div>
+
+<h2 id="folder">1. What a model release contains</h2>
+<p>Open any model repository on Hugging Face and you find the same set of files:</p>
+<div class="tbl"><table>
+<tr><th>File</th><th>What it holds</th><th>Who reads it</th></tr>
+<tr><td><code>config.json</code></td><td>Architecture: layers, hidden size, heads, KV heads, RoPE settings, vocabulary size, data type</td><td>The engine, to build the model and size the KV cache</td></tr>
+<tr><td><code>model-00001-of-00004.safetensors</code> …</td><td>The weights, split into shards of a few GB</td><td>The weight loader</td></tr>
+<tr><td><code>model.safetensors.index.json</code></td><td>Which tensor lives in which shard</td><td>The weight loader</td></tr>
+<tr><td><code>tokenizer.json</code>, <code>tokenizer_config.json</code></td><td>Vocabulary, merges, special tokens, often the chat template (chapter 2.1)</td><td>The API server</td></tr>
+<tr><td><code>generation_config.json</code></td><td>Default sampling settings and stop tokens (chapter 1.2)</td><td>The API server</td></tr>
+</table></div>
+<p>The config and weights describe <em>what</em> the model is. They say nothing about <em>how fast</em> it runs. That depends on the program that executes it.</p>
+
+<h2 id="safetensors">2. Weight files: pickle vs safetensors</h2>
+<p>PyTorch's own format (<code>torch.save</code>, files ending in <code>.bin</code> or <code>.pt</code>) uses Python's <strong>pickle</strong>. Pickle stores Python objects, and loading a pickle can run any Python code the file contains. A malicious checkpoint can therefore run commands on your server. Recent PyTorch versions default to a restricted "weights only" mode, but the format itself remains unsafe.</p>
+<p><strong>Safetensors</strong> was designed to remove this risk and to load fast. Its layout is simple:</p>
+<div class="svgwrap"><svg viewBox="0 0 700 120" width="700" style="max-width:100%;height:auto" role="img" aria-label="Safetensors file layout: 8-byte header length, JSON header, raw tensor bytes">
+  <g font-size="12">
+    <rect x="10" y="30" width="110" height="50" rx="6" fill="var(--dec-s)" stroke="var(--dec)"/><text x="65" y="52" text-anchor="middle" fill="var(--ink)">1. 8 bytes</text><text x="65" y="68" text-anchor="middle" fill="var(--ink2)">header length N</text>
+    <rect x="130" y="30" width="230" height="50" rx="6" fill="var(--pre-s)" stroke="var(--pre)"/><text x="245" y="52" text-anchor="middle" fill="var(--ink)">2. N bytes of JSON</text><text x="245" y="68" text-anchor="middle" fill="var(--ink2)">name → dtype, shape, byte offsets</text>
+    <rect x="370" y="30" width="320" height="50" rx="6" fill="var(--kv-s)" stroke="var(--kv)"/><text x="530" y="52" text-anchor="middle" fill="var(--ink)">3. raw tensor bytes, back to back</text><text x="530" y="68" text-anchor="middle" fill="var(--ink2)">no code, no Python objects</text>
+    <text x="350" y="108" text-anchor="middle" fill="var(--ink2)">A loader reads the header, then maps each tensor's byte range directly from the file.</text>
+  </g>
+</svg></div>
+<ul>
+  <li><strong>Safe:</strong> the loader only parses JSON and copies bytes.</li>
+  <li><strong>Fast:</strong> the file can be <strong>memory-mapped</strong>: the operating system maps it into the process's address space and reads pages only when they are touched. A tensor can be read without loading the whole file, and without an extra copy in CPU memory.</li>
+  <li><strong>Lazy and partial:</strong> a loader can read just the tensors one GPU needs, which matters when a model is split across GPUs (chapter 4.5).</li>
+</ul>
+<p>Safetensors is now the default for open model releases. The data still has to travel from disk to CPU memory to the GPU. For large models, disk and network speed usually set the load time (section 8).</p>
+
+<h2 id="execution">3. How the forward pass is executed</h2>
+<p>The same weights can be run in very different ways:</p>
+<div class="tbl"><table>
+<tr><th>Mode</th><th>How it works</th><th>Strength</th><th>Weakness</th></tr>
+<tr><td>PyTorch eager</td><td>Python runs each operation in turn; each launches one or more GPU kernels</td><td>Flexible, easy to debug, any model</td><td>Python and launch overhead per operation; no cross-operation fusion</td></tr>
+<tr><td><code>torch.compile</code></td><td>Captures the Python code as a graph, fuses operations, generates kernels (often in Triton); can use CUDA graphs</td><td>Large speed-ups with little code change</td><td>Compile time; some Python features force "graph breaks"; custom kernels stay opaque calls</td></tr>
+<tr><td>ONNX + ONNX Runtime</td><td>Export a graph of standard operators plus weights; a runtime executes it on many hardware types</td><td>Portable across vendors and languages</td><td>Not every PyTorch operation exports; LLM-specific features (paged KV, continuous batching) are not built in</td></tr>
+<tr><td>TensorRT</td><td>Compile a graph into an "engine" for one GPU type: fuse layers, pick precisions, benchmark kernels for each shape</td><td>Very fast on NVIDIA GPUs</td><td>Engine is tied to the GPU architecture and TensorRT version; build step required</td></tr>
+<tr><td>LLM inference engines (vLLM, SGLang, TensorRT-LLM)</td><td>Hand-written model code plus fused kernels, plus a scheduler and KV cache manager</td><td>Built for many concurrent users</td><td>Model must be supported by the engine</td></tr>
+</table></div>
+
+<h2 id="compile">4. What "compiling" a model means</h2>
+<p>Compiling has three steps, whatever the tool:</p>
+<ol>
+  <li><strong>Capture.</strong> Record the sequence of tensor operations as a graph, with shapes and data types.</li>
+  <li><strong>Optimize.</strong> Rewrite the graph: fuse chains of element-wise operations into one kernel (chapter 5.4), remove unused work, pick the fastest kernel for each shape, choose precisions, and plan where every intermediate tensor lives in memory.</li>
+  <li><strong>Lower.</strong> Generate code for the target hardware and package it so it can be launched with little overhead, for example as a CUDA graph: a recorded sequence of kernel launches replayed with a single call (chapter 5.7).</li>
+</ol>
+<p>Why it helps LLMs: decode at small batch runs hundreds of small kernels per token. Eager mode pays a CPU launch cost for each, and the GPU waits between them (the overhead-bound regime of chapter 2.5). Fusion reduces the number of kernels and memory round trips; CUDA graphs remove most of the launch cost.</p>
+<div class="box watch">
+  <span class="lbl">Watch out: "compiling cannot help with custom kernels"</span>
+  <p>You may read that <code>torch.compile</code> is of limited use for LLMs because it cannot fuse custom kernels such as FlashAttention. It is true that a custom kernel stays an opaque call inside the graph. But the compiler still fuses everything around it (normalization, RoPE, activation, residual adds) and can capture the whole step in CUDA graphs. vLLM, for example, uses <code>torch.compile</code> on its model code alongside its custom attention kernels.</p>
+</div>
+
+<h2 id="naive">5. Why a plain PyTorch server breaks under load</h2>
+<p>The quickest way to serve a model is a web endpoint that calls <code>model.generate()</code>. It works for one user. With many, it fails in four ways:</p>
+<ol>
+  <li><strong>Queueing.</strong> If requests run one at a time, the n-th user waits for every request ahead of it to finish. Time to first token grows linearly with the queue.</li>
+  <li><strong>Wasted batching.</strong> If you batch requests together the simple way, every request in the batch waits for the longest one, and short prompts are padded to the longest prompt. GPU work is wasted on padding, and finished requests hold their slot (chapter 3.2).</li>
+  <li><strong>Memory.</strong> Each request's KV cache is allocated separately and grows by copying. Memory fragments and is reserved for the worst case (chapter 2.4, section 7), so far fewer requests fit.</li>
+  <li><strong>Overhead.</strong> Eager Python decode at small batch leaves the GPU idle between kernels.</li>
+</ol>
+
+<div class="widget" id="qW">
+  <div class="wt">Interactive: one-at-a-time vs an engine that batches</div>
+  <div class="ws">A simple model of a burst of requests arriving together. "Sequential" serves them one at a time. "Batched" runs all of them in every decode step (continuous batching, chapter 3.2), with a step time that grows slowly with batch (chapter 2.5). Prefill is ignored to keep the picture clear.</div>
+  <div class="ctrls">
+    <label>Concurrent users: <span class="mono" id="qUv"></span><input type="range" id="qU" min="1" max="64" value="16"></label>
+    <label>Output tokens each <select id="qN"><option>100</option><option selected>300</option><option>1000</option></select></label>
+    <label>Step time at batch 1 (ms) <select id="qS"><option>5</option><option selected>20</option><option>40</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="qSvg" viewBox="0 0 680 260" width="680" style="max-width:100%;height:auto" role="img" aria-label="Timeline of requests served sequentially and batched"></svg></div>
+  <div class="stats" id="qStats"></div>
+</div>
+
+<h2 id="engine">6. What an inference engine adds</h2>
+<p>An LLM inference engine is the answer to all four problems. Chapters 3.2 to 3.4 open each part; here is the map:</p>
+<div class="svgwrap"><svg viewBox="0 0 700 230" width="700" style="max-width:100%;height:auto" role="img" aria-label="Inference engine architecture: API server, engine core with scheduler and KV manager, model runner on GPUs">
+  <defs><marker id="ar31" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--ink2)"/></marker></defs>
+  <g font-size="12">
+    <rect x="10" y="80" width="90" height="60" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="55" y="106" text-anchor="middle" fill="var(--ink)">1. clients</text><text x="55" y="122" text-anchor="middle" fill="var(--ink2)">HTTP</text>
+    <rect x="130" y="60" width="140" height="100" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="200" y="84" text-anchor="middle" fill="var(--ink)">2. API server</text><text x="200" y="104" text-anchor="middle" fill="var(--ink2)">OpenAI endpoints</text><text x="200" y="120" text-anchor="middle" fill="var(--ink2)">chat template, tokenize</text><text x="200" y="136" text-anchor="middle" fill="var(--ink2)">stream, detokenize</text>
+    <rect x="300" y="20" width="220" height="180" rx="10" fill="var(--kv-s)" stroke="var(--kv)"/><text x="410" y="42" text-anchor="middle" fill="var(--ink)" font-weight="700">3. engine core (loop)</text>
+    <rect x="316" y="56" width="188" height="36" rx="6" fill="var(--panel)" stroke="var(--line)"/><text x="410" y="79" text-anchor="middle" fill="var(--ink)">scheduler: who runs this step</text>
+    <rect x="316" y="100" width="188" height="36" rx="6" fill="var(--panel)" stroke="var(--line)"/><text x="410" y="123" text-anchor="middle" fill="var(--ink)">KV cache manager: blocks</text>
+    <rect x="316" y="144" width="188" height="36" rx="6" fill="var(--panel)" stroke="var(--line)"/><text x="410" y="167" text-anchor="middle" fill="var(--ink)">output processing, stop rules</text>
+    <rect x="550" y="60" width="140" height="100" rx="8" fill="var(--pre-s)" stroke="var(--pre)"/><text x="620" y="84" text-anchor="middle" fill="var(--ink)">4. model runner</text><text x="620" y="104" text-anchor="middle" fill="var(--ink2)">GPU workers</text><text x="620" y="120" text-anchor="middle" fill="var(--ink2)">fused kernels</text><text x="620" y="136" text-anchor="middle" fill="var(--ink2)">CUDA graphs, sampler</text>
+    <path d="M100 110H128M270 110H298M520 110H548" stroke="var(--ink2)" marker-end="url(#ar31)"/>
+  </g>
+</svg></div>
+<ul>
+  <li>The <strong>API server</strong> handles HTTP, the chat template, tokenization and streaming, often in a separate process so the GPU loop is never blocked by networking.</li>
+  <li>The <strong>scheduler</strong> decides, at every step, which requests run and how many tokens each processes (chapter 3.2).</li>
+  <li>The <strong>KV cache manager</strong> hands out fixed-size memory blocks to requests as they grow (chapter 3.3).</li>
+  <li>The <strong>model runner</strong> executes one forward pass for the whole batch with fused, compiled kernels, then samples the next tokens.</li>
+</ul>
+
+<h2 id="api">7. The OpenAI-compatible server</h2>
+<p>vLLM, SGLang and TensorRT-LLM all offer the same HTTP interface as OpenAI's API, so any OpenAI client library works by changing the base URL. The endpoints you will use:</p>
+<div class="tbl"><table>
+<tr><th>Endpoint</th><th>Use</th></tr>
+<tr><td><code>POST /v1/chat/completions</code></td><td>Chat: messages in, the engine applies the chat template</td></tr>
+<tr><td><code>POST /v1/completions</code></td><td>Raw text prompt in, no template</td></tr>
+<tr><td><code>GET /v1/models</code></td><td>Which models the server holds; a quick readiness check</td></tr>
+<tr><td><code>GET /health</code></td><td>Liveness for load balancers and orchestrators</td></tr>
+<tr><td><code>GET /metrics</code></td><td>Prometheus metrics (section 9)</td></tr>
+</table></div>
+<pre>from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+r = client.chat.completions.create(model="Qwen/Qwen2.5-0.5B-Instruct",
+        messages=[{"role": "user", "content": "One fact about GPUs."}], max_tokens=60)
+print(r.choices[0].message.content, r.usage)</pre>
+<p>Engines add their own parameters on top (for example vLLM accepts <code>top_k</code>, <code>min_p</code> and structured-output options in the request body). Their exact names differ between engines, which matters if you switch engines behind one API.</p>
+
+<h2 id="loading">8. Load time and cold start</h2>
+<p>When an engine starts, it must:</p>
+<ol>
+  <li>Download the weights if they are not on local disk (often the slowest step).</li>
+  <li>Read the safetensors shards and copy weights to the GPU.</li>
+  <li>Measure memory with a test forward pass, then reserve the KV cache pool (chapter 2.4).</li>
+  <li>Compile and capture CUDA graphs for common batch sizes.</li>
+</ol>
+<p>Steps 3 and 4 explain why a vLLM server takes noticeably longer to become ready than a plain <code>from_pretrained</code>. In production this <strong>cold start</strong> time decides how fast you can add capacity (chapter 6.3). Teams cut it with local model caches, faster loaders that stream shards in parallel, and caching compiled artifacts between starts.</p>
+
+<h2 id="metrics">9. Reading engine metrics and request state</h2>
+<p>Inside an engine, each request moves through a few states:</p>
+<div class="svgwrap"><svg viewBox="0 0 700 120" width="700" style="max-width:100%;height:auto" role="img" aria-label="Request states: waiting, running, preempted, finished">
+  <defs><marker id="ar31b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--ink2)"/></marker></defs>
+  <g font-size="12">
+    <rect x="20" y="40" width="120" height="44" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="80" y="67" text-anchor="middle" fill="var(--ink)">1. WAITING</text>
+    <rect x="200" y="40" width="160" height="44" rx="8" fill="var(--kv-s)" stroke="var(--kv)"/><text x="280" y="60" text-anchor="middle" fill="var(--ink)">2. RUNNING</text><text x="280" y="76" text-anchor="middle" fill="var(--ink2)">prefill, then decode</text>
+    <rect x="420" y="40" width="120" height="44" rx="8" fill="var(--good-s)" stroke="var(--good)"/><text x="480" y="67" text-anchor="middle" fill="var(--ink)">3. FINISHED</text>
+    <rect x="200" y="96" width="160" height="22" rx="6" fill="var(--bad-s)" stroke="var(--bad)"/><text x="280" y="111" text-anchor="middle" fill="var(--ink)">PREEMPTED (memory full)</text>
+    <path d="M140 62H198M360 62H418" stroke="var(--ink2)" marker-end="url(#ar31b)"/>
+    <path d="M200 107 H100 V86" stroke="var(--bad)" fill="none" stroke-dasharray="4 3" marker-end="url(#ar31b)"/>
+    <text x="560" y="58" fill="var(--ink2)">stop token, stop string,</text><text x="560" y="74" fill="var(--ink2)">max_tokens or abort</text>
+  </g>
+</svg></div>
+<p>A request waits until the scheduler admits it, runs (prefill then decode), and finishes. If KV memory runs out, the engine can <strong>preempt</strong> a running request: free its blocks and put it back in the queue to recompute later (chapter 3.3).</p>
+<p>The <code>/metrics</code> endpoint exposes these states and timings in Prometheus format. The most useful vLLM metrics:</p>
+<div class="tbl"><table>
+<tr><th>Metric</th><th>Meaning</th><th>What to watch for</th></tr>
+<tr><td><code>vllm:num_requests_running</code></td><td>Requests in the current batch</td><td>Stuck at a low value under heavy load: a limit such as <code>max-num-seqs</code> or memory</td></tr>
+<tr><td><code>vllm:num_requests_waiting</code></td><td>Requests queued, not yet admitted</td><td>Growing steadily: the server is over capacity</td></tr>
+<tr><td><code>vllm:kv_cache_usage_perc</code></td><td>Share of KV blocks in use</td><td>Near 100% with preemptions: memory-limited</td></tr>
+<tr><td><code>vllm:num_preemptions</code></td><td>Requests evicted for lack of memory</td><td>Any steady rise wastes compute on recomputation</td></tr>
+<tr><td><code>vllm:time_to_first_token_seconds</code></td><td>TTFT histogram</td><td>Long tail: queueing or long prefills</td></tr>
+<tr><td><code>vllm:inter_token_latency_seconds</code></td><td>Time between output tokens</td><td>Spikes when long prefills share steps with decodes (chapter 3.2)</td></tr>
+<tr><td><code>vllm:request_queue_time_seconds</code></td><td>Time spent waiting before running</td><td>The queueing part of TTFT</td></tr>
+<tr><td><code>vllm:prompt_tokens</code>, <code>vllm:generation_tokens</code></td><td>Counters of tokens processed</td><td>Rate of these = input and output throughput</td></tr>
+<tr><td><code>vllm:prefix_cache_queries</code>, <code>vllm:prefix_cache_hits</code></td><td>Prefix cache lookups and hits</td><td>Hit rate = hits ÷ queries (chapter 3.5)</td></tr>
+</table></div>
+<p class="note">Names from the current vLLM metrics documentation. Older versions used <code>gpu_cache_usage_perc</code> for KV usage; check your version.</p>
+
+<h2 id="expert">10. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Transformers v5 and the reference role</span>
+  <p>Hugging Face <code>transformers</code> v5 went PyTorch-only, simplified tokenization to one backend, added packaged optimized kernels, and introduced <code>transformers serve</code>, an OpenAI-compatible server for evaluation-style workloads. Its stated aim is to be the reference model definition that engines such as vLLM and SGLang stay compatible with, not to replace them. Some engines can even run a transformers model definition directly as a fallback for architectures they do not implement natively.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">TensorRT engine portability</span>
+  <p>A TensorRT engine is built for one GPU architecture and TensorRT version. Newer TensorRT versions offer a hardware-compatibility mode that builds engines able to run across several recent architectures, at some speed cost. Plan engine builds into your deployment pipeline, one per GPU type.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Graph capture and dynamic shapes</span>
+  <p>LLM serving has shapes that change every step: the number of sequences and tokens in the batch. Engines capture CUDA graphs for a set of batch sizes and pad to the nearest one, and keep the parts that vary most (attention over paged KV) outside or in "piecewise" graphs. This is the main reason compiled serving is an engineering problem, not just a compiler flag.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Exporters and other runtimes</span>
+  <p>Hugging Face Optimum exports models to ONNX and other backends (for example <code>optimum-cli export onnx --model gpt2 gpt2_onnx/</code>) and runs them with ONNX Runtime and vendor runtimes. Modular's MAX is another graph compiler and runtime aimed at portable performance across GPU vendors. For LLM serving at scale, these are less common than the engines of this Part, but they matter for edge, CPU and non-NVIDIA deployments.</p>
+</div>
+
+<h2 id="mistakes">11. Common mistakes</h2>
+<ul>
+  <li>Loading <code>.bin</code> checkpoints from untrusted sources.</li>
+  <li>Benchmarking a plain <code>generate()</code> server and concluding the GPU is too slow.</li>
+  <li>Reading GPU-Util or memory use as load. An engine reserves memory at start; use <code>num_requests_running</code>, <code>num_requests_waiting</code> and KV usage instead.</li>
+  <li>Forgetting compile and CUDA-graph capture time when planning how fast new replicas can start.</li>
+  <li>Assuming request parameters are portable between engines. Check each engine's extras.</li>
+</ul>
+
+<h2 id="lab">12. Lab</h2>
+<p><strong>Goal:</strong> look inside a weight file, compare execution modes, and watch an engine beat a naive server under concurrent load.</p>
+<p><strong>Setup:</strong> Colab with a T4. Parts A and B run on CPU.</p>
+<h3>Part A: the 100 Days notebook</h3>
+<p>Run day 08 (PyTorch model formats, ONNX and TensorRT) of <em>100 Days of Inference</em>. Record the load times and file sizes it reports for each format.</p>
+<h3>Part B: read a safetensors header by hand</h3>
+<pre>import json, struct
+from huggingface_hub import hf_hub_download
+path = hf_hub_download("Qwen/Qwen2.5-0.5B-Instruct", "model.safetensors")
+with open(path, "rb") as f:
+    n = struct.unpack("&lt;Q", f.read(8))[0]            # 8-byte little-endian header length
+    header = json.loads(f.read(n))
+print("header bytes:", n, " tensors:", len(header) - ("__metadata__" in header))
+for name in list(header)[:6]:
+    print(name, header[name] if name == "__metadata__" else (header[name]["dtype"], header[name]["shape"], header[name]["data_offsets"]))
+
+from safetensors import safe_open
+with safe_open(path, framework="pt") as f:              # read ONE tensor without loading the file
+    t = f.get_tensor("model.embed_tokens.weight")
+print(t.shape, t.dtype)</pre>
+<p>Then see why pickle is unsafe, with a harmless payload:</p>
+<pre>import pickle, os
+class Payload:
+    def __reduce__(self):
+        return (print, ("This code ran during load. It could have been anything.",))
+data = pickle.dumps(Payload())
+pickle.loads(data)          # prints the message: loading executed code</pre>
+<h3>Part C: eager vs compiled decode</h3>
+<pre>import torch, time
+from transformers import AutoModelForCausalLM, AutoTokenizer
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(name)
+m = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16).cuda().eval()
+ids = tok("Write a haiku about memory bandwidth.", return_tensors="pt").to("cuda")
+
+def run(label, **kw):
+    m.generate(**ids, max_new_tokens=16, do_sample=False, **kw)       # warm-up (and compile)
+    torch.cuda.synchronize(); t = time.perf_counter()
+    out = m.generate(**ids, max_new_tokens=128, min_new_tokens=128, do_sample=False, **kw)
+    torch.cuda.synchronize(); dt = time.perf_counter() - t
+    print(f"{label:10s} {128/dt:6.1f} tok/s")
+
+run("eager")
+m.generation_config.cache_implementation = "static"    # fixed-shape cache, needed for compiling
+m.forward = torch.compile(m.forward, mode="reduce-overhead", fullgraph=True)
+run("compiled")</pre>
+<p>Predict first: from chapter 2.5, the bandwidth ceiling for this model on a T4 is about 320 tokens per second. Where will eager and compiled land? If compilation fails on your library versions, note the error; the static-cache and compile options change between <code>transformers</code> releases.</p>
+<h3>Part D: 16 users, naive server vs vLLM</h3>
+<p>First a deliberately naive server that runs one request at a time:</p>
+<pre>%%writefile naive_server.py
+import json, threading, torch
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(name)
+m = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16).cuda().eval()
+lock = threading.Lock()                                    # one generate() at a time
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        ids = tok(body["prompt"], return_tensors="pt").to("cuda")
+        with lock, torch.inference_mode():
+            out = m.generate(**ids, max_new_tokens=body["max_tokens"], min_new_tokens=body["max_tokens"], do_sample=False)
+        n = out.shape[1] - ids.input_ids.shape[1]
+        self.send_response(200); self.end_headers()
+        self.wfile.write(json.dumps({"usage": {"completion_tokens": n}}).encode())
+    def log_message(self, *a): pass
+ThreadingHTTPServer(("0.0.0.0", 8001), H).serve_forever()</pre>
+<p>A load script that works against both servers:</p>
+<pre>%%writefile load.py
+import sys, time, requests, concurrent.futures as cf
+url, users = sys.argv[1], int(sys.argv[2])
+def one(i):
+    t = time.perf_counter()
+    r = requests.post(url, json={"model": "Qwen/Qwen2.5-0.5B-Instruct", "prompt": f"Story number {i}:",
+                                 "max_tokens": 128, "min_tokens": 128, "ignore_eos": True}).json()
+    return time.perf_counter() - t, r["usage"]["completion_tokens"]
+t0 = time.perf_counter()
+with cf.ThreadPoolExecutor(users) as ex:
+    res = list(ex.map(one, range(users)))
+wall = time.perf_counter() - t0
+lat = sorted(r[0] for r in res)
+print(f"{users} users: {sum(r[1] for r in res)/wall:7.0f} tok/s total, latency p50 {lat[len(lat)//2]:.1f}s  max {lat[-1]:.1f}s")</pre>
+<pre>import subprocess, time, requests
+srv = subprocess.Popen(["python", "naive_server.py"]); time.sleep(60)
+!python load.py http://localhost:8001 1
+!python load.py http://localhost:8001 16
+srv.kill(); time.sleep(5)
+
+srv = subprocess.Popen(["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct", "--port", "8000", "--dtype", "half",
+                        "--max-model-len", "2048", "--gpu-memory-utilization", "0.8"])
+for _ in range(120):
+    try:
+        if requests.get("http://localhost:8000/health").ok: break
+    except Exception: pass
+    time.sleep(5)
+!python load.py http://localhost:8000/v1/completions 1
+!python load.py http://localhost:8000/v1/completions 16</pre>
+<p>Predict first: how will total tokens per second and the worst-case latency change from 1 to 16 users for each server? Then explain the gap using sections 5 and 6.</p>
+<h3>Part E: read the metrics while it runs</h3>
+<pre>import threading
+threading.Thread(target=lambda: subprocess.run(["python", "load.py", "http://localhost:8000/v1/completions", "64"])).start()
+for _ in range(6):
+    m_ = requests.get("http://localhost:8000/metrics").text
+    keep = [l for l in m_.splitlines() if l.startswith(("vllm:num_requests_running", "vllm:num_requests_waiting", "vllm:kv_cache_usage_perc"))]
+    print(keep); time.sleep(2)</pre>
+<p>With 64 users, are any requests waiting? Is KV usage high? Change <code>--max-num-seqs</code> to 8 on a restart and repeat: what happens to "waiting"?</p>
+
+<h2 id="realworld">13. In the real world</h2>
+<div class="box real">
+  <span class="lbl">How teams choose</span>
+  <ul>
+    <li><strong>Most LLM deployments</strong> ship safetensors weights straight into an engine (vLLM, SGLang or TensorRT-LLM) and skip ONNX entirely.</li>
+    <li><strong>TensorRT and ONNX Runtime</strong> remain common for image, video, speech and smaller non-LLM models, and for non-NVIDIA or edge targets.</li>
+    <li><strong>Monitoring</strong> scrapes <code>/metrics</code> into Prometheus and Grafana. Alerts use queue length, KV usage, preemptions and TTFT percentiles, not GPU-Util.</li>
+    <li><strong>Security reviews</strong> require safetensors and pinned model revisions for any third-party model.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">14. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz31"></div>
+<script type="application/json" id="qz31">[
+{"q":"Which file tells the engine how many KV heads the model has?","o":["tokenizer.json","config.json","generation_config.json","The safetensors index"],"a":1,"e":"config.json holds the architecture, including num_key_value_heads."},
+{"q":"Why can safetensors be read one tensor at a time?","o":["It compresses each tensor","Its JSON header gives each tensor's byte offsets, and the file can be memory-mapped","It stores Python objects","It is always one file per tensor"],"a":1,"e":"The header maps names to byte ranges; the loader reads just those ranges."},
+{"q":"What does CUDA graph capture mainly remove?","o":["FLOPs","Per-kernel CPU launch overhead","KV cache memory","Weight bytes"],"a":1,"e":"A captured graph replays many kernel launches with one call."},
+{"q":"A server runs generate() for one request at a time. With 20 users arriving together, the last user's TTFT is about:","o":["One prefill","19 full generation times plus its own prefill","The same as the first user","Zero"],"a":1,"e":"Sequential serving makes everyone wait for the requests in front."},
+{"q":"vllm:num_requests_waiting keeps rising while num_requests_running is flat. Most likely:","o":["The server is idle","The server is over capacity or limited by max-num-seqs or memory","The tokenizer is broken","Prefix caching is off"],"a":1,"e":"Requests arrive faster than they can be admitted."},
+{"q":"A TensorRT engine built on an A100 is moved to an H100. Normally:","o":["It runs at full speed","It must be rebuilt for the new architecture unless built in a hardware-compatibility mode","It converts automatically","It runs on the CPU instead"],"a":1,"e":"Engines are tied to the GPU architecture and TensorRT version."}
+]</script>
+
+<h2 id="summary">15. Summary</h2>
+<ul>
+  <li>A model release is config, sharded safetensors weights, tokenizer and generation defaults.</li>
+  <li>Safetensors is a JSON header plus raw bytes: safe, memory-mappable and partially loadable. Pickle can execute code.</li>
+  <li>Execution modes range from eager PyTorch to compiled graphs, ONNX Runtime, TensorRT and LLM engines.</li>
+  <li>Compiling means capture, optimize, lower; for LLM decode the big wins are fusion and CUDA graphs.</li>
+  <li>Plain <code>generate()</code> servers fail under load through queueing, padded batches, fragmented KV memory and overhead. Engines fix all four.</li>
+  <li>Watch running, waiting, KV usage, preemptions, TTFT and ITL in <code>/metrics</code>.</li>
+</ul>
+
+<h2 id="refs">16. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 4.2</td><td>PyTorch, compilation, safetensors, ONNX Runtime vs TensorRT, and the role of transformers and diffusers.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html">vLLM: OpenAI-compatible server</a></td><td>Endpoints, request parameters and server flags.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/usage/metrics.html">vLLM: Production metrics</a></td><td>The full list of metrics in section 9.</td></tr>
+<tr><td><a href="https://huggingface.co/docs/safetensors/index">Hugging Face: Safetensors</a></td><td>The format, its safety and zero-copy loading.</td></tr>
+<tr><td><a href="https://huggingface.co/blog/transformers-v5">Hugging Face: Transformers v5</a></td><td>Kept from triage: PyTorch-only, packaged kernels, <code>transformers serve</code> and interoperability with engines.</td></tr>
+<tr><td><a href="https://github.com/huggingface/optimum">Hugging Face Optimum</a></td><td>Kept from triage: exporting models to ONNX and other runtimes.</td></tr>
+<tr><td>Chi Wang and Peiheng Hu, <em>Hands-On LLM Serving and Optimization</em>, chapters 3 and 8</td><td>Building a serving system from scratch, and a survey of serving frameworks.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, chapters 13 and 14</td><td>The PyTorch compiler stack (TorchDynamo, Inductor) and Triton.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 08</td><td>A notebook comparing formats, ONNX export and <code>torch.compile</code>.</td></tr>
+</table></div>
+<h3>Triaged out</h3>
+<div class="tbl"><table>
+<tr><th>Source</th><th>Reason</th></tr>
+<tr><td>Inside the MAX Framework (Modular meetup video)</td><td>Video only, no transcript reachable; MAX is mentioned in the expert layer from its public positioning.</td></tr>
+<tr><td>11 Production LLM Serving Engines (TechLatest)</td><td>A broad listicle; chapter 3.6 builds a sourced engine comparison instead.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The claim that <code>torch.compile</code> "can't fuse plugin kernels ... limits its utility for LLM inference" is in Kiely's <em>Inference Engineering</em>, section 4.2.1. Section 4's watch-out box gives the fuller picture.</li>
+  <li>The day 08 README of <em>100 Days of Inference</em> says safetensors loading maps pages "directly to GPU-accessible memory". Memory mapping maps the file into CPU address space; the bytes are still copied to the GPU.</li>
+</ul>
+<p class="note">Facts checked on 6 November 2026.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+function q(){const U=+$('qU').value,N=+$('qN').value,s1=+$('qS').value;$('qUv').textContent=U;
+  const stepB=b=>s1*(1+0.02*(b-1));                       // slow growth with batch
+  const seqEach=N*s1/1000;const seqEnd=[...Array(U)].map((_,i)=>(i+1)*seqEach);const seqStart=[...Array(U)].map((_,i)=>i*seqEach);
+  const batEnd=N*stepB(U)/1000;
+  const svg=$('qSvg');svg.innerHTML='';const W=680,H=260,l=70,r=20,t=24,bt=30;const T=Math.max(seqEnd[U-1],batEnd)*1.05;
+  const X=v=>l+v/T*(W-l-r);const rows=Math.min(U,8);const rh=((H-t-bt)/2-14)/rows;
+  el('text',{x:l,y:16,'font-size':12,fill:css('--ink')},svg,'Sequential: one request at a time');
+  for(let i=0;i<rows;i++){const idx=Math.round(i*(U-1)/Math.max(1,rows-1));el('rect',{x:X(seqStart[idx]),y:t+i*rh,width:Math.max(1,X(seqEnd[idx])-X(seqStart[idx])),height:rh-2,fill:css('--dec')},svg);el('rect',{x:X(0),y:t+i*rh,width:X(seqStart[idx])-X(0),height:rh-2,fill:css('--panel2')},svg);el('text',{x:l-6,y:t+i*rh+rh-4,'text-anchor':'end','font-size':10,fill:css('--ink2')},svg,'user '+(idx+1));}
+  const y2=t+(H-t-bt)/2+18;el('text',{x:l,y:y2-4,'font-size':12,fill:css('--ink')},svg,'Batched: all requests in every step');
+  for(let i=0;i<rows;i++){el('rect',{x:X(0),y:y2+i*rh,width:X(batEnd)-X(0),height:rh-2,fill:css('--kv')},svg);}
+  [0,0.25,0.5,0.75,1].forEach(f=>el('text',{x:X(T*f),y:H-10,'text-anchor':f===1?'end':f===0?'start':'middle',class:'tick'},svg,(T*f).toFixed(1)+' s'));
+  $('qStats').innerHTML=[['Sequential: last user done',seqEnd[U-1].toFixed(1)+' s'],['Sequential: last user waits before starting',seqStart[U-1].toFixed(1)+' s'],['Batched: everyone done',batEnd.toFixed(1)+' s'],['Throughput gain',(seqEnd[U-1]/batEnd).toFixed(1)+'×']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['qU','qN','qS'].forEach(id=>$(id).addEventListener('input',q));IE.onTheme(q);
+})();
+</script>

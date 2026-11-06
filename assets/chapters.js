@@ -95,7 +95,7 @@ window.IE_CHAPTERS = [
 "title": "Model formats and runtimes",
 "slug": "3-1-formats-runtimes",
 "part": 3,
-"ready": false
+"ready": true
 },
 {
 "n": "3.2",
