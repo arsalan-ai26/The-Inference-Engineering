@@ -327,7 +327,7 @@ function rt(){const E=+$('rtE').value,k=+$('rtK').value,B=+$('rtB').value,sk=+$(
   el('rect',{x:ox,y:oy,width:E*c,height:B*rh,fill:'none',stroke:css('--line')},s);
   const mx=Math.max(...cnt,1);cnt.forEach((v,j)=>el('rect',{x:ox+j*c,y:oy+B*rh+6+(1-v/mx)*24,width:c-1,height:v/mx*24,fill:v?css('--kv'):css('--panel2')},s));
   const used=cnt.filter(v=>v>0).length,exp=E*(1-Math.pow(1-k/E,B));const busiest=Math.max(...cnt),avg=B*k/E;
-  $('rtStats').innerHTML=[['Experts used',`${used} / ${E}`],['Formula (uniform)',exp.toFixed(1)],['Average tokens per used expert',(B*k/Math.max(used,1)).toFixed(1)],['Busiest expert load vs average',(busiest/avg).toFixed(1)+'×']].map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');}
+  $('rtStats').innerHTML=[['Experts used',`${used} / ${E}`],['Formula (uniform)',exp.toFixed(1)],['Average tokens per used expert',(B*k/Math.max(used,1)).toFixed(1)],['Busiest expert vs an even split',(busiest/avg).toFixed(1)+'×']].map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');}
 ['rtE','rtK','rtB','rtS'].forEach(id=>$(id).addEventListener('input',rt));$('rtNew').onclick=()=>{newScores();rt();};IE.onTheme(rt);
 function md(){const [T,A,E,k,fix]=$('mdM').value.split(',').map(Number);const bw=+$('mdBW').value*1e12;
   const routedTotal=T*(1-fix),perExpert=routedTotal/E,fixed=T*fix;

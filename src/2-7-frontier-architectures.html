@@ -1,0 +1,290 @@
+<div class="kicker">Part 2 · Transformers and LLM inference mechanics · Chapter 2.7 · Expert depth</div>
+<h1>Frontier architectures and research</h1>
+<p class="lede">The standard transformer has two costs that grow with use: the KV cache grows with every token, and decode makes one serial pass per token. A wave of new designs attacks these costs: state-space and linear-attention layers, hybrids, diffusion language models, and new ways to spend compute at test time. This chapter explains each one by the single question an inference engineer must ask: what does it change in memory, compute and latency?</p>
+<div class="meta">
+  <span class="chip">Level: expert</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 2.2, 2.4, 2.5, 2.6</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: what you should already know</span>
+  <p>This is an expert-depth chapter. You need the KV cache formula (chapter 2.4), the memory-bound nature of decode (chapter 2.5) and MoE (chapter 2.6). Every section ends with an "inference impact" line so you can skim.</p>
+</div>
+
+<h2 id="why">1. Why architectures keep changing</h2>
+<p>From chapters 2.2 to 2.5, a standard decoder-only transformer has three scaling problems for serving:</p>
+<ol>
+  <li><strong>Memory grows with context.</strong> The KV cache is linear in tokens. At 1M tokens, even an efficient model needs tens of GB per sequence.</li>
+  <li><strong>Prefill attention is quadratic.</strong> Doubling a long prompt quadruples attention work.</li>
+  <li><strong>Decode is serial and memory-bound.</strong> One token per pass, each pass reading all the weights.</li>
+</ol>
+<p>Problems 1 and 2 grow worse as agents and reasoning models use longer and longer contexts. Problem 3 sets a floor on time per token. Each design in this chapter attacks one or more of them, and each pays for it somewhere else.</p>
+
+<h2 id="ssm">2. State-space models and linear attention</h2>
+<p>Recall the RNN of chapter 1.5: a fixed-size state updated once per token. It was abandoned because it forgot, and because training could not run in parallel over the sequence. Two ideas brought it back:</p>
+<ul>
+  <li><strong>Linear recurrences can be computed in parallel.</strong> If the update is linear in the state (h_t = A_t h_{t−1} + B_t x_t), the whole sequence can be computed with a parallel scan or in chunks, like attention. So training and prefill are fast.</li>
+  <li><strong>The update can depend on the input.</strong> "Selective" state-space models (Mamba) and gated linear attention (Gated DeltaNet, Kimi Delta Attention) let each token decide what to write into the state and what to forget. This fixed much of the old forgetting problem.</li>
+</ul>
+<p><strong>Linear attention</strong> arrives at the same place from the attention side. Remove the softmax from attention and the sum Σ v_j k_jᵀ can be kept as a running matrix: a fixed-size state of shape [d_k, d_v] per head. Each new token adds its own outer product. Reading is one matrix-vector product with the query.</p>
+<div class="formula">state_t = decay_t ⊙ state_{t−1} + v_t k_tᵀ        output_t = state_t q_t</div>
+<div class="box def">
+  <span class="lbl">Inference impact</span>
+  <p><strong>Memory per sequence is constant</strong>, whatever the context: a few MB per sequence instead of a cache that grows. <strong>Decode cost per token is constant</strong> too: no attention over n past tokens. The price is <strong>recall</strong>: a fixed-size state cannot store every detail of a million tokens, so pure linear models are weaker at exact retrieval ("what was the number on page 3?").</p>
+</div>
+
+<h2 id="hybrid">3. Hybrids: mostly linear, some full attention</h2>
+<p>The current answer is to mix both. Most layers are linear (cheap, constant state), and every few layers is a full-attention layer (exact recall, growing KV cache). Several 2025 open models use a 3:1 pattern:</p>
+<div class="tbl"><table>
+<tr><th>Model</th><th>Layer pattern</th><th>Other features</th></tr>
+<tr><td>Qwen3-Next-80B-A3B</td><td>48 layers: 3 Gated DeltaNet layers, then 1 gated full-attention layer, repeated (36 linear, 12 full)</td><td>MoE with 512 experts, 10 active; about 3B active parameters</td></tr>
+<tr><td>Kimi Linear 48B-A3B</td><td>27 layers: 3 Kimi Delta Attention layers, then 1 MLA layer, repeated</td><td>MoE; the paper reports up to 75% less KV cache and up to 6 times decode throughput at 1M context</td></tr>
+<tr><td>NVIDIA Nemotron 3 Nano 30B-A3B</td><td>Mamba-2 layers mixed with a few attention layers</td><td>MoE</td></tr>
+<tr><td>Jamba (AI21)</td><td>Mamba and attention layers interleaved</td><td>MoE; an early large hybrid</td></tr>
+</table></div>
+<p class="note">Layer patterns read from the models' config.json files on Hugging Face.</p>
+
+<div class="widget" id="hyW">
+  <div class="wt">Interactive: cache memory per sequence vs context</div>
+  <div class="ws">Memory one sequence needs for its attention cache and recurrent state, in BF16. "Full" assumes every layer is a full-attention layer with the same KV heads; "hybrid" uses the real 3:1 pattern; "linear only" keeps only fixed state. Based on the Qwen3-Next-80B-A3B config.</div>
+  <div class="ctrls">
+    <label>Context: <span class="mono" id="hyCv"></span><input type="range" id="hyC" min="0" max="12" value="8"></label>
+    <label>Sequences: <span class="mono" id="hyBv"></span><input type="range" id="hyB" min="0" max="7" value="0"></label>
+  </div>
+  <div class="svgwrap"><svg id="hySvg" viewBox="0 0 680 260" width="680" style="max-width:100%;height:auto" role="img" aria-label="Memory per sequence for full, hybrid and linear designs"></svg></div>
+  <div class="legend"><span><i style="background:var(--bad)"></i>All 48 layers full attention</span><span><i style="background:var(--kv)"></i>Hybrid 3:1 (real config)</span><span><i style="background:var(--pre)"></i>Linear layers only</span></div>
+  <div class="stats" id="hyStats"></div>
+</div>
+<div class="box def">
+  <span class="lbl">Inference impact</span>
+  <p>A 3:1 hybrid cuts the KV cache about 4 times and keeps exact recall through its attention layers. Engines must now manage <strong>two kinds of per-sequence memory</strong>: a paged KV cache for the attention layers and a fixed state slot for the linear layers. Two features get harder: <strong>prefix caching</strong> (chapter 4.4), because you cannot slice a recurrent state at an arbitrary earlier token unless you saved a checkpoint there, and <strong>speculative decoding</strong> (chapter 4.3), because rejected tokens have already been folded into the state and must be undone. Engines such as vLLM added a hybrid cache manager for this (chapter 3.3).</p>
+</div>
+
+<h2 id="diffusion">4. Diffusion language models</h2>
+<p>All models so far generate left to right, one token per pass. A <strong>diffusion language model</strong> generates differently:</p>
+<ol>
+  <li>Start with a block of N positions, all masked (unknown).</li>
+  <li>Run the model on the whole block. It predicts a token for every masked position at once.</li>
+  <li>Keep the most confident predictions; leave the rest masked.</li>
+  <li>Repeat for a fixed number of steps until no masks remain.</li>
+</ol>
+<p>The attention is bidirectional within the block, so each pass sees the whole draft. Research models such as LLaDA (8B) and commercial systems such as Inception's Mercury use this approach. <strong>Block diffusion</strong> mixes both worlds: blocks are produced left to right (so earlier blocks can be cached), and tokens inside each block are produced by diffusion.</p>
+
+<div class="widget" id="dfW">
+  <div class="wt">Interactive: serial passes, autoregressive vs diffusion</div>
+  <div class="ws">How many forward passes it takes to write N tokens, and a rough time estimate. An autoregressive pass is memory-bound (reads all weights for one token per sequence). A diffusion pass processes a whole block, so it does far more math per weight read.</div>
+  <div class="ctrls">
+    <label>Output tokens N <select id="dfN"><option>256</option><option selected>1024</option><option>4096</option></select></label>
+    <label>Block size <select id="dfBl"><option>32</option><option selected>64</option><option>256</option></select></label>
+    <label>Denoising steps per block <select id="dfS"><option>4</option><option selected>16</option><option>64</option></select></label>
+  </div>
+  <div class="stats" id="dfStats"></div>
+  <p class="note">Assumes an 8B BF16 model on one H100: an autoregressive pass ≈ 4.8 ms (memory-bound, chapter 2.5); a diffusion pass over a block of B tokens ≈ max(4.8 ms, compute time of 2 × 8 B × B FLOPs at 50% MFU). Illustrative; real systems add caching and other tricks.</p>
+</div>
+<div class="box def">
+  <span class="lbl">Inference impact</span>
+  <p>Diffusion trades <strong>many cheap serial passes</strong> for <strong>fewer, heavier parallel passes</strong>. Each pass is compute-bound rather than memory-bound, which uses the GPU better at small batch and can cut latency. The costs: quality depends on the number of denoising steps, the KV cache does not work inside a block that keeps changing, and serving engines and sampling controls are much less mature. Support is starting to appear (for example, an SGLang design proposal for block-diffusion serving).</p>
+</div>
+
+<h2 id="testtime">5. Spending compute at test time</h2>
+<p>Reasoning models "think" before answering: they generate long chains of thought, often thousands of tokens. This changes the workload more than any architecture change:</p>
+<ul>
+  <li><strong>Output tokens dominate.</strong> A request may be 500 input tokens and 10,000 output tokens. Decode, which is memory-bound, becomes nearly all the cost.</li>
+  <li><strong>The KV cache grows during the answer.</strong> Long outputs fill memory just like long prompts.</li>
+  <li><strong>Energy and cost per query rise.</strong> One 2025 study estimates a median of about 0.31 Wh per query for frontier-scale models on H100 nodes, rising about 13 times to 3.9 Wh when outputs are 15 times longer.</li>
+</ul>
+<p>Research now looks for better ways to spend the same compute:</p>
+<ul>
+  <li><strong>Parallel sampling.</strong> Generate several answers from one prompt and pick or vote. The prompt's KV cache is shared (chapter 3.3), so this uses batching well.</li>
+  <li><strong>Parallel-Distill-Refine.</strong> Generate drafts in parallel, distill them into a short bounded workspace, refine, and repeat. Context stays short, so latency and memory stay bounded while accuracy rises.</li>
+  <li><strong>Recursive language models.</strong> Instead of reading a huge context directly, the model works in a code environment (a Python REPL) holding the data, inspects pieces of it, and calls sub-models on small pieces. One giant request becomes many short ones.</li>
+</ul>
+<div class="box def">
+  <span class="lbl">Inference impact</span>
+  <p>Workloads become <strong>decode-heavy, long-horizon and multi-call</strong>. That favours systems with fast decode (high bandwidth, speculative decoding), good prefix reuse across many related calls, and schedulers built for agents (chapter 6.8). It also changes pricing: when an agent re-sends a growing context on every step, the cost of cached input tokens can grow with the square of the number of steps.</p>
+</div>
+
+<h2 id="other">6. Other research directions, and what they change</h2>
+<div class="tbl"><table>
+<tr><th>Direction</th><th>Idea</th><th>What it changes for inference</th></tr>
+<tr><td>Capability density ("densing law")</td><td>Measured capability per parameter of open models has doubled about every 3.5 months</td><td>The model size needed for a given quality keeps falling. Plan for smaller models replacing larger ones, not only for bigger hardware.</td></tr>
+<tr><td>Cost trends</td><td>Per-token prices at constant quality fell about 1,000 times in three years; one analysis argues for another 1,000 times, driven by new workload patterns</td><td>Optimizations that seem small compound. Agent workloads shift cost from output tokens to cached context.</td></tr>
+<tr><td>Hyper-connections (mHC)</td><td>A wider, multi-stream residual connection, constrained to keep training stable</td><td>More memory traffic per layer for the residual streams; kernels must be fused to keep it cheap.</td></tr>
+<tr><td>Recurrent depth (universal transformers, URM)</td><td>Reuse the same layers several times per token</td><td>Fewer parameters to read, more passes per token; compute per token can be adjusted at run time.</td></tr>
+<tr><td>Very sparse MoE</td><td>Hundreds of experts with very few active (for example, a 400B model with 13B active and 4 of 256 experts per token)</td><td>Memory follows total size; decode needs very large batches to be efficient (chapter 2.6).</td></tr>
+</table></div>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">State precision</span>
+  <p>Recurrent states accumulate updates over millions of steps, so small rounding errors can build up. Some hybrid models keep the SSM state in FP32 even when the weights are BF16 (Nemotron 3 Nano's config sets <code>mamba_ssm_cache_dtype</code> to float32). Engines must honour this, or long outputs degrade.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Chunked algorithms</span>
+  <p>Linear attention and SSM layers in prefill run in chunks: inside a chunk, a small attention-like matmul (good for tensor cores); between chunks, the state is passed along. Choosing the chunk size balances parallel work against state traffic, the same trade-off as tiling in FlashAttention.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">How to evaluate a new architecture as a serving engineer</span>
+  <ol>
+    <li>Write the per-token state: what grows with context, what stays fixed, in which precision.</li>
+    <li>Write the serial steps per output token.</li>
+    <li>Estimate decode bytes per step and prefill FLOPs per token (chapter 2.5).</li>
+    <li>Check engine support: kernels, prefix caching, speculative decoding, quantization, parallelism.</li>
+    <li>Check quality where your users need it: long-context recall, reasoning, tool use.</li>
+  </ol>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Assuming linear-attention models are free at long context. Their state is fixed, but recall is limited, which is why hybrids keep some full attention.</li>
+  <li>Expecting prefix caching and speculative decoding to work the same on hybrid models.</li>
+  <li>Comparing diffusion and autoregressive models by "tokens per second" without matching quality and step counts.</li>
+  <li>Ignoring reasoning length when sizing a deployment. A reasoning model's average output can be 10 times a chat model's.</li>
+  <li>Treating a research result as production-ready before engines and quantization tools support it.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p><strong>Goal:</strong> see that a linear recurrence has a parallel form, compare state and cache memory on real configs, and simulate a diffusion decoder.</p>
+<h3>Part A: one recurrence, two ways to compute it</h3>
+<pre>import torch
+torch.manual_seed(0)
+T, dk, dv = 64, 16, 16
+q, k, v = torch.randn(T, dk), torch.randn(T, dk) / dk**0.5, torch.randn(T, dv)
+decay = torch.sigmoid(torch.randn(T)) * 0.2 + 0.8          # per-token forget gate in (0.8, 1.0)
+
+# 1. Recurrent form (how decode runs): constant-size state
+S = torch.zeros(dv, dk); out_rec = []
+for t in range(T):
+    S = decay[t] * S + torch.outer(v[t], k[t])
+    out_rec.append(S @ q[t])
+out_rec = torch.stack(out_rec)
+
+# 2. Parallel form (how prefill can run): an attention-like matmul with a decay mask
+logd = torch.log(decay).cumsum(0)
+mask = torch.tril(torch.exp(logd[:, None] - logd[None, :]))   # product of decays between j and t
+out_par = (mask * (q @ k.T)) @ v
+print(torch.allclose(out_rec, out_par, atol=1e-4))
+print("state size:", S.numel(), "values, whatever T is")</pre>
+<p>Change T to 4,096. The state is still 256 values; a KV cache for the same layer would hold 2 × 4,096 × 16 values. Then explain why the parallel form is used for prefill and the recurrent form for decode.</p>
+<h3>Part B: read real hybrid configs</h3>
+<pre>from transformers import AutoConfig
+c = AutoConfig.from_pretrained("Qwen/Qwen3-Next-80B-A3B-Instruct")
+lt = c.layer_types
+full = lt.count("full_attention"); lin = lt.count("linear_attention")
+kv_per_tok = 2 * full * c.num_key_value_heads * c.head_dim * 2
+state = lin * c.linear_num_value_heads * c.linear_key_head_dim * c.linear_value_head_dim * 2
+print(f"{full} full + {lin} linear layers")
+print(f"KV bytes per token (full layers only): {kv_per_tok:,}")
+print(f"fixed recurrent state per sequence: {state/1e6:.1f} MB (BF16)")
+for n in [8_192, 131_072, 1_048_576]:
+    print(f"{n:>9,} tokens: KV {kv_per_tok*n/1e9:6.2f} GB  + state {state/1e9:.3f} GB")</pre>
+<p>Compare with the widget. At what context does the fixed state become negligible next to the KV cache of the full-attention layers?</p>
+<h3>Part C: a toy diffusion decoder</h3>
+<pre>import random
+target = "the quick brown fox jumps over the lazy dog".split()
+def toy_model(draft):            # pretend model: knows the answer, confidence is random
+    return [(w, random.random()) for w in target]
+def diffusion_decode(n_steps):
+    draft = ["[M]"] * len(target)
+    per_step = -(-len(target) // n_steps)      # ceil: tokens to unmask per step
+    for step in range(n_steps):
+        preds = toy_model(draft)
+        masked = [i for i, w in enumerate(draft) if w == "[M]"]
+        masked.sort(key=lambda i: -preds[i][1])  # most confident first
+        for i in masked[:per_step]:
+            draft[i] = preds[i][0]
+        print(f"step {step+1}: {' '.join(draft)}")
+diffusion_decode(3)</pre>
+<p>This toy shows only the control flow: several positions are filled per pass, in confidence order, not left to right. With 3 steps it needs 3 passes for 9 tokens; an autoregressive model needs 9. Real models make mistakes when too many tokens are unmasked per step, which is the quality-versus-steps trade-off.</p>
+<h3>Part D: reasoning cost on paper</h3>
+<p>Your chat service averages 600 input and 400 output tokens per request. You switch to a reasoning model that averages 600 input and 6,000 output tokens. Using chapter 2.5, estimate the change in GPU time per request and in KV memory per active request for Llama 3.1 8B-sized compute on an H100 at batch 32. What happens to the number of concurrent users your memory supports?</p>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Where these designs stand</span>
+  <ul>
+    <li><strong>Hybrids</strong> with linear attention or Mamba layers are now shipped by several labs (Qwen, Moonshot, NVIDIA, AI21) and supported in major engines, often with dedicated kernels.</li>
+    <li><strong>Diffusion LMs</strong> are offered commercially for low-latency code and text, but open serving support is early.</li>
+    <li><strong>Reasoning models</strong> are mainstream; their long outputs are the main driver of decode demand.</li>
+    <li><strong>Follow releases</strong> through engine release notes and model-specific serving recipes (chapter 3.7), which say what each new architecture needs.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz27"></div>
+<script type="application/json" id="qz27">[
+{"q":"What does a linear-attention or SSM layer keep per sequence during decode?","o":["A KV cache that grows with every token","A fixed-size state","Nothing at all","The full attention matrix"],"a":1,"e":"The state has a fixed shape, so memory and per-token cost do not grow with context."},
+{"q":"Why do hybrids keep some full-attention layers?","o":["For tokenization","Exact recall of details from far back in the context","To reduce parameters","Because linear layers cannot be trained"],"a":1,"e":"A fixed state cannot store every detail; full attention can look up any earlier token."},
+{"q":"A 3:1 linear-to-full hybrid reduces the KV cache compared with all-full attention by about:","o":["Nothing","4 times","48 times","Half"],"a":1,"e":"Only one in four layers keeps a growing KV cache."},
+{"q":"Why is prefix caching harder for linear layers?","o":["Their weights are larger","A recurrent state cannot be cut back to an arbitrary earlier token unless a checkpoint was saved there","They have no position encoding","They need FP8"],"a":1,"e":"KV caches store one entry per token; a state folds all tokens together."},
+{"q":"A diffusion LM pass over a 64-token block is usually:","o":["More memory-bound than an autoregressive pass","More compute-bound, because one weight read serves many positions","Identical in cost","Free"],"a":1,"e":"Processing many positions per pass raises arithmetic intensity."},
+{"q":"Reasoning models mainly increase which cost?","o":["Prefill of the prompt","Decode of long outputs and the KV memory they fill","Tokenization","Model loading"],"a":1,"e":"Thousands of thinking tokens per request make decode dominant."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Standard transformers have three serving costs that grow: KV memory, quadratic prefill, serial memory-bound decode.</li>
+  <li>SSMs and linear attention keep a fixed-size state: constant memory and per-token cost, weaker exact recall.</li>
+  <li>Hybrids (often 3 linear layers to 1 full) cut the KV cache about 4 times but complicate prefix caching and speculative decoding.</li>
+  <li>Diffusion LMs fill many positions per pass, trading serial memory-bound steps for fewer compute-bound ones.</li>
+  <li>Test-time reasoning makes workloads decode-heavy and long; new methods bound context while spending compute in parallel.</li>
+  <li>Evaluate any new design by its per-token state, serial steps, bytes and FLOPs, and engine support.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2312.00752">Gu and Dao, Mamba: Linear-Time Sequence Modeling with Selective State Spaces</a></td><td>Input-dependent (selective) state-space layers and the hardware-aware scan.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2510.26692">Kimi Team, Kimi Linear</a></td><td>Kimi Delta Attention and a 3:1 hybrid with MLA; reported KV and throughput gains at 1M context.</td></tr>
+<tr><td><a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct">Qwen3-Next-80B-A3B model card and config</a></td><td>The 3:1 Gated DeltaNet hybrid with a very sparse MoE.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2502.09992">Nie et al., Large Language Diffusion Models (LLaDA)</a></td><td>An 8B masked-diffusion language model and its sampling procedure.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2503.09573">Arriola et al., Block Diffusion</a></td><td>Semi-autoregressive block diffusion that keeps KV caching across blocks.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2510.01123">Rethinking Thinking Tokens: LLMs as Improvement Operators</a></td><td>Kept from triage: Parallel-Distill-Refine, which bounds context while spending more compute.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2509.20241">Energy Use of AI Inference: Efficiency Pathways and Test-Time Compute</a></td><td>Kept from triage: per-query energy estimates and the effect of long reasoning outputs.</td></tr>
+<tr><td><a href="https://www.primeintellect.ai/blog/rlm">Prime Intellect: Recursive Language Models</a> and <a href="https://github.com/alexzhang13/rlm">the RLM library</a></td><td>Kept from triage: models that manage their own context through a REPL and sub-model calls.</td></tr>
+<tr><td><a href="https://www.nature.com/articles/s42256-025-01137-0">Densing Law of LLMs (Nature Machine Intelligence)</a></td><td>Kept from triage: capability density doubling about every 3.5 months.</td></tr>
+<tr><td><a href="https://ralphmao.github.io/token-cost/">Huizi Mao: The Next 1000x Cost Saving of LLM</a></td><td>Kept from triage: cost trends and how agent workloads change what costs money.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2512.24880">mHC: Manifold-Constrained Hyper-Connections</a></td><td>Kept from triage: a wider residual stream and its memory-access cost.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2512.14693">Universal Reasoning Model</a></td><td>Kept from triage: recurrent depth for reasoning tasks.</td></tr>
+<tr><td><a href="https://www.arcee.ai/blog/trinity-large">Arcee AI: Trinity Large</a></td><td>Kept from triage: a 400B MoE with 13B active and 4 of 256 experts per token.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, chapter 20</td><td>Trends in AI-assisted optimization and large-scale serving case studies.</td></tr>
+</table></div>
+<h3>Triaged out</h3>
+<div class="tbl"><table>
+<tr><th>Source</th><th>Reason</th></tr>
+<tr><td>Thinking Through How Pretraining vs RL Learn (Dwarkesh Patel)</td><td>About training signal efficiency, not inference cost.</td></tr>
+<tr><td>Wider or Deeper? Adaptive Parallel Reasoning (OpenReview)</td><td>The page did not open from this environment; the idea of parallel reasoning is covered by the Parallel-Distill-Refine paper.</td></tr>
+<tr><td>Souper Model (Meta AI)</td><td>Model weight averaging; the merged model serves like any dense model.</td></tr>
+<tr><td>Five-step inference diffusion schedule (Zenodo)</td><td>Image-diffusion scheduling; covered in chapter 3.7 if needed.</td></tr>
+<tr><td>End-to-End Test-Time Training (link to a social post)</td><td>No paper or code was reachable to verify claims.</td></tr>
+<tr><td>Cuthbert: State-Space Model Inference with JAX</td><td>A library for statistical state-space models (filtering), not the neural SSM layers of this chapter.</td></tr>
+<tr><td>The Spatial Blindspot of Vision-Language Models</td><td>A capability study, no serving impact.</td></tr>
+<tr><td>Deep Sequence Models Tend to Memorize Geometrically</td><td>Theory of memorization; no direct inference impact.</td></tr>
+<tr><td>KerJEPA</td><td>Self-supervised vision training method.</td></tr>
+</table></div>
+<p class="note">Facts checked on 6 November 2026. This field moves fast; check dates on every source.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+const CTX=[1024,2048,4096,8192,16384,32768,65536,131072,262144,524288,1048576,2097152,4194304],BS=[1,2,4,8,16,32,64,128];
+const fullKV=2*48*2*256*2, hyKV=2*12*2*256*2, state=36*32*128*128*2;
+function hy(){const C=CTX[+$('hyC').value],B=BS[+$('hyB').value];$('hyCv').textContent=IE.tok(C);$('hyBv').textContent=B;
+  const s=$('hySvg');s.innerHTML='';const W=680,H=260,l=70,r=20,t=16,bt=40;
+  const f=c=>[fullKV*c*B,(hyKV*c+state)*B,state*B];const maxv=f(4194304)[0];const lo=Math.log10(state*B*0.5),hi=Math.log10(maxv*1.2);
+  const X=i=>l+i/(CTX.length-1)*(W-l-r),Y=v=>H-bt-(Math.log10(v)-lo)/(hi-lo)*(H-t-bt);
+  for(let e=Math.ceil(lo);e<=hi;e++){el('line',{x1:l,x2:W-r,y1:Y(10**e),y2:Y(10**e),class:'axis'},s);el('text',{x:l-6,y:Y(10**e)+4,'text-anchor':'end',class:'tick'},s,IE.gb(10**e)+' GB');}
+  CTX.forEach((c,i)=>{if(i%2===0)el('text',{x:X(i),y:H-bt+16,'text-anchor':'middle',class:'tick'},s,IE.tok(c));});
+  el('text',{x:l+(W-l-r)/2,y:H-6,'text-anchor':'middle',class:'tick'},s,'context (tokens, log)');
+  [['--bad',0],['--kv',1],['--pre',2]].forEach(([c,j])=>el('path',{d:CTX.map((cc,i)=>(i?'L':'M')+X(i)+' '+Y(f(cc)[j])).join(' '),fill:'none',stroke:css(c),'stroke-width':2.5},s));
+  const ci=+$('hyC').value;el('line',{x1:X(ci),x2:X(ci),y1:t,y2:H-bt,stroke:css('--ink2'),'stroke-dasharray':'4 4'},s);
+  const v=f(C);$('hyStats').innerHTML=[['All full attention',IE.gb(v[0])+' GB'],['Hybrid 3:1',IE.gb(v[1])+' GB'],['Linear only',IE.gb(v[2])+' GB'],['Hybrid saving vs full',(v[0]/v[1]).toFixed(1)+'×']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['hyC','hyB'].forEach(id=>$(id).addEventListener('input',hy));IE.onTheme(hy);
+function df(){const N=+$('dfN').value,Bl=+$('dfBl').value,S=+$('dfS').value;const ar=N*4.8;const blocks=Math.ceil(N/Bl);const passes=blocks*S;
+  const pass=Math.max(4.8,2*8.03e9*Bl/(0.5*989e12)*1e3);const dt=passes*pass;
+  $('dfStats').innerHTML=[['Autoregressive passes',IE.int(N)],['Autoregressive time',(ar/1000).toFixed(2)+' s'],['Diffusion passes',IE.int(passes)],['Diffusion time per pass',pass.toFixed(2)+' ms'],['Diffusion time',(dt/1000).toFixed(2)+' s'],['Speed-up',(ar/dt).toFixed(1)+'×']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['dfN','dfBl','dfS'].forEach(id=>$(id).addEventListener('input',df));df();
+})();
+</script>

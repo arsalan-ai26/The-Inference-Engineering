@@ -88,7 +88,7 @@ window.IE_CHAPTERS = [
 "title": "Expert depth: frontier architectures and research",
 "slug": "2-7-frontier-architectures",
 "part": 2,
-"ready": false
+"ready": true
 },
 {
 "n": "3.1",
