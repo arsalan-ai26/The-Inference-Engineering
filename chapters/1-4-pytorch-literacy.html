@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>1.4 PyTorch reading literacy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="1.4">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 1 · Chapter 1.4</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 1 · Foundations · Chapter 1.4</div>
+<h1>PyTorch reading literacy</h1>
+<p class="lede">You do not need to write PyTorch from memory. AI tools write most of it. You do need to read it: look at a model's <code>forward()</code> and say what shape every tensor has, where it lives, what type it is and what it costs. This chapter teaches exactly that reading skill, with the twelve operations that make up almost all model code.</p>
+<div class="meta">
+  <span class="chip">Level: beginner</span>
+  <span class="chip">Time: 4 hours with the lab</span>
+  <span class="chip">Needs: 1.1, 1.3, basic Python</span>
+  <span class="chip">Compute: Colab, T4 for Part E</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li><code>nn.Linear(4096, 1024)</code>: what is the shape of its <code>weight</code>?</li>
+    <li>x is [2, 8, 32, 128]. What is <code>x.transpose(1, 2).shape</code>? Can you call <code>.view(2, 32, -1)</code> on the result directly?</li>
+    <li>Can you add tensors of shape [8, 1, 128] and [32, 128]?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>[1024, 4096]. PyTorch stores [out, in] and computes x @ Wᵀ + b.</li>
+    <li>[2, 32, 8, 128]. No: after a transpose the memory is not contiguous, so <code>.view</code> fails. Use <code>.reshape</code> or call <code>.contiguous()</code> first.</li>
+    <li>Yes. Aligned from the right: 128 = 128, 1 vs 32 broadcasts to 32, and 8 has no partner. The result is [8, 32, 128].</li>
+  </ol></details>
+</div>
+
+<h2 id="tensor">1. The tensor: four facts to read</h2>
+<p>A PyTorch tensor is the tensor of chapter 1.1 with extra facts attached. When you read code, track four of them for every tensor:</p>
+<div class="tbl"><table>
+<tr><th>Fact</th><th>How to read it</th><th>Example</th><th>Why it matters</th></tr>
+<tr><td>Shape</td><td><code>x.shape</code></td><td>[2, 8, 4096]</td><td>Decides FLOPs and memory (chapter 1.1)</td></tr>
+<tr><td>Data type</td><td><code>x.dtype</code></td><td>torch.bfloat16</td><td>Bytes per element and math speed (chapter 1.3)</td></tr>
+<tr><td>Device</td><td><code>x.device</code></td><td>cuda:0</td><td>CPU or which GPU. Two tensors must be on the same device to combine</td></tr>
+<tr><td>Needs gradients</td><td><code>x.requires_grad</code></td><td>False</td><td>If True, PyTorch keeps extra memory for training (section 8)</td></tr>
+</table></div>
+<div class="formula">memory of a tensor = x.numel() × x.element_size()   bytes</div>
+<p><code>numel()</code> is the number of elements: the product of the shape. A [2, 8, 4096] BF16 tensor holds 65,536 elements × 2 bytes = 128 KB.</p>
+
+<h2 id="create">2. Creating and moving tensors</h2>
+<pre>import torch
+x = torch.randn(2, 8, 4096)                     # random normal values, FP32, on CPU
+w = torch.zeros(4096, 1024, dtype=torch.bfloat16)
+ids = torch.tensor([[15496, 11, 995]])         # integer token IDs: shape [1, 3], dtype int64
+x = x.to("cuda")                                # copy to GPU 0
+x = x.to(torch.bfloat16)                        # change the data type
+x = x.to("cuda", torch.bfloat16)                # both at once</pre>
+<p><code>.to()</code> returns a new tensor. It does not change the old one in place. Moving data between CPU and GPU crosses the PCIe bus, which is slow compared with GPU memory. Good inference code moves inputs once and keeps everything on the GPU.</p>
+
+<h2 id="index">3. Indexing and slicing</h2>
+<p>Indexing works like NumPy. A colon keeps a dimension. A single integer removes it.</p>
+<pre>logits.shape                 # [B, T, V], for example [2, 8, 128256]
+logits[:, -1, :]             # last position of every sequence: [2, 128256]
+logits[0]                    # first sequence: [8, 128256]
+logits[:, -1:, :]            # keeps the dimension: [2, 1, 128256]
+x[..., :64]                  # first 64 values of the last dimension; "..." means all leading dims</pre>
+<p>The line <code>logits[:, -1, :]</code> appears in every generation loop. It picks the scores for the next token after the last position.</p>
+
+<h2 id="reshape">4. Reshaping: view, reshape, transpose, permute</h2>
+<p>Attention code changes shapes constantly. Four operations do almost all of it.</p>
+<div class="tbl"><table>
+<tr><th>Operation</th><th>What it does</th><th>Copies data?</th></tr>
+<tr><td><code>x.view(2, 8, 32, 128)</code></td><td>Same elements, new shape. The element count must stay the same. <code>-1</code> means "work this size out"</td><td>Never. Fails if memory is not contiguous</td></tr>
+<tr><td><code>x.reshape(...)</code></td><td>Like view, but copies if it must</td><td>Only if needed</td></tr>
+<tr><td><code>x.transpose(1, 2)</code></td><td>Swaps two dimensions</td><td>No. It changes the strides</td></tr>
+<tr><td><code>x.permute(0, 2, 1, 3)</code></td><td>Reorders all dimensions</td><td>No. It changes the strides</td></tr>
+<tr><td><code>x.unsqueeze(1)</code> / <code>x.squeeze(1)</code></td><td>Adds or removes a size-1 dimension</td><td>No</td></tr>
+<tr><td><code>x.contiguous()</code></td><td>Makes a compact copy in the current dimension order</td><td>Yes, if not already contiguous</td></tr>
+</table></div>
+<p>The attention "head split" uses them in sequence. Learn this pattern; you will see it in every model:</p>
+<pre>B, T, D = x.shape                     # [2, 8, 4096]
+q = q_proj(x)                         # [2, 8, 4096]
+q = q.view(B, T, 32, 128)             # split 4096 into 32 heads of 128: [2, 8, 32, 128]
+q = q.transpose(1, 2)                 # heads before tokens:            [2, 32, 8, 128]
+# ... attention per head ...
+out = out.transpose(1, 2).contiguous().view(B, T, D)   # back to [2, 8, 4096]</pre>
+
+<div class="widget" id="strideW">
+  <div class="wt">Interactive: why transpose breaks view</div>
+  <div class="ws">A tensor is a flat block of memory plus a rule (the <strong>strides</strong>) for finding element [i, j]. Strides say how many places to jump in memory for one step along each dimension. Transpose swaps the strides; it does not move data.</div>
+  <div class="ctrls">
+    <div class="seg" role="group" aria-label="Operation"><button data-op="orig" class="on">x: shape [2, 3]</button><button data-op="t">x.t(): shape [3, 2]</button><button data-op="c">x.t().contiguous()</button></div>
+  </div>
+  <div class="svgwrap"><svg id="strideSvg" viewBox="0 0 640 230" width="640" style="max-width:100%;height:auto" role="img" aria-label="Memory layout and strides of a tensor"></svg></div>
+  <p class="note" id="strideMsg"></p>
+</div>
+
+<h2 id="broadcast">5. Broadcasting</h2>
+<p>Broadcasting lets an operation combine tensors of different shapes without copying data. The rule:</p>
+<ol>
+  <li>Line up the shapes from the right.</li>
+  <li>For each pair, the sizes must be equal, or one of them must be 1, or one must be missing.</li>
+  <li>A size of 1 (or a missing dimension) is stretched to match the other.</li>
+</ol>
+<div class="widget" id="bcW">
+  <div class="wt">Interactive: broadcasting checker</div>
+  <div class="ws">Type two shapes separated by commas. The checker aligns them from the right and gives the result or the error PyTorch would raise.</div>
+  <div class="ctrls">
+    <label>Shape a <input id="bcA" value="8, 1, 128" style="width:160px;font-family:var(--f-mono)"></label>
+    <label>Shape b <input id="bcB" value="32, 128" style="width:160px;font-family:var(--f-mono)"></label>
+    <span class="seg" role="group" aria-label="Examples"><button data-a="2, 8, 4096" data-b="4096">bias</button><button data-a="2, 32, 8, 8" data-b="8, 8">causal mask</button><button data-a="2, 8, 4096" data-b="2, 8, 1">per-token scale</button><button data-a="2, 8, 4096" data-b="8, 4096, 1">error</button></span>
+  </div>
+  <div class="svgwrap"><svg id="bcSvg" viewBox="0 0 640 150" width="640" style="max-width:100%;height:auto" role="img" aria-label="Aligned shapes and result"></svg></div>
+  <p class="note" id="bcMsg"></p>
+</div>
+<div class="box watch">
+  <span class="lbl">Watch out: silent broadcasting bugs</span>
+  <p>Broadcasting never complains when shapes happen to fit. Adding a [T] tensor where you meant [T, 1] gives a [T, T] result with no error. When a result has an unexpected extra dimension, suspect broadcasting first.</p>
+</div>
+
+<h2 id="math">6. Math and reductions</h2>
+<pre>a @ b                        # matmul on the last two dims; leading dims broadcast
+torch.matmul(a, b)           # the same
+a * b                        # element-wise multiply (with broadcasting), NOT matmul
+x.sum(dim=-1)                # sum over the last dim: [B, T, D] becomes [B, T]
+x.mean(dim=-1, keepdim=True) # keep the reduced dim as size 1: [B, T, 1]
+torch.softmax(s, dim=-1)     # softmax along the last dim (chapter 1.2)
+x.max(dim=-1)                # returns (values, indices)
+x.argmax(dim=-1)             # indices only: greedy decoding uses this
+torch.cat([a, b], dim=2)     # join along an existing dim (KV cache appends this way)
+torch.stack([a, b], dim=0)   # join along a NEW dim
+torch.einsum("bhqd,bhkd->bhqk", q, k)   # named-index matmul: the attention scores</pre>
+<p><code>keepdim=True</code> is common before broadcasting. Normalization layers compute a mean of shape [B, T, 1] so that it can be subtracted from x of shape [B, T, D].</p>
+<p><strong>einsum</strong> names every dimension with a letter. Letters that appear in the inputs but not the output are summed over. "bhqd,bhkd->bhqk" says: for each batch b and head h, sum over d for every query position q and key position k. That is q @ kᵀ, written so that you cannot get the transpose wrong.</p>
+
+<h2 id="module">7. nn.Module: how a model is organized</h2>
+<p>Every layer and every model in PyTorch is an <code>nn.Module</code>. A module has two parts:</p>
+<ul>
+  <li><code>__init__</code> creates the sub-layers and parameters (the weights).</li>
+  <li><code>forward(x)</code> describes the computation. Calling <code>model(x)</code> runs <code>forward</code>.</li>
+</ul>
+<pre>import torch.nn as nn
+import torch.nn.functional as F
+
+class MLP(nn.Module):                                 # the MLP block of Llama-style models
+    def __init__(self, d=4096, f=14336):
+        super().__init__()
+        self.gate_proj = nn.Linear(d, f, bias=False)  # weight: [f, d]
+        self.up_proj   = nn.Linear(d, f, bias=False)  # weight: [f, d]
+        self.down_proj = nn.Linear(f, d, bias=False)  # weight: [d, f]
+
+    def forward(self, x):                             # x: [B, T, d]
+        g = F.silu(self.gate_proj(x))                 # [B, T, f]
+        u = self.up_proj(x)                           # [B, T, f]
+        return self.down_proj(g * u)                  # [B, T, d]</pre>
+<div class="box watch">
+  <span class="lbl">Watch out: nn.Linear stores [out, in]</span>
+  <p><code>nn.Linear(in_features, out_features)</code> stores its weight with shape [out, in] and computes y = x @ Wᵀ + b. Chapter 1.1 wrote matrices as [in, out]. Both describe the same layer. When you read weight files or count FLOPs, check which order is used.</p>
+</div>
+<p>Useful module tools:</p>
+<pre>model.named_parameters()       # every weight with its name: "layers.0.mlp.up_proj.weight"
+model.state_dict()             # dict of name -> tensor; this is what a checkpoint file stores
+sum(p.numel() for p in model.parameters())   # parameter count
+model.eval()                   # switch off training-only behaviour (dropout)
+model.to("cuda", torch.bfloat16)             # move all weights</pre>
+<p>Real model code (for example in Hugging Face <code>transformers</code>) is a tree of modules: a model contains a list of decoder layers; each layer contains an attention module, an MLP module and two normalization modules. Print a model to see its tree.</p>
+
+<div class="widget" id="trW">
+  <div class="wt">Interactive: read a forward pass</div>
+  <div class="ws">One decoder layer of Llama 3.1 8B, simplified. Before you press "Next line", say the output shape out loud. B = 2 sequences, T = 8 tokens.</div>
+  <div class="ctrls"><button class="pri" id="trNext">Next line</button><button id="trAll">Show all</button><button id="trReset">Reset</button></div>
+  <div id="trList" style="margin-top:14px;font-family:var(--f-mono);font-size:13.5px;overflow-x:auto"></div>
+</div>
+
+<h2 id="autograd">8. Autograd, and why inference turns it off</h2>
+<p>PyTorch can compute gradients automatically. When a tensor has <code>requires_grad=True</code>, PyTorch records every operation on it in a graph. Calling <code>loss.backward()</code> walks the graph backwards and fills <code>.grad</code> for each weight. Chapter 1.5 explains what gradients mean and how training uses them.</p>
+<p>Inference does not need gradients. Recording the graph wastes memory, because PyTorch keeps intermediate results for the backward pass. So inference code always wraps the model call:</p>
+<pre>model.eval()
+with torch.inference_mode():          # or torch.no_grad(); inference_mode is slightly faster
+    logits = model(ids).logits</pre>
+<p>If you forget this, memory grows with every call and you can run out of GPU memory on a model that should fit.</p>
+
+<h2 id="gpu">9. GPU execution is asynchronous</h2>
+<p>When Python calls a GPU operation, PyTorch puts a <strong>kernel</strong> (a small GPU program) in a queue and returns at once. The GPU runs the queue in order while Python continues. This has three consequences you must know:</p>
+<ul>
+  <li><strong>Timing:</strong> use <code>torch.cuda.synchronize()</code> before reading a timer, or you measure only the time to queue work.</li>
+  <li><strong>Hidden syncs:</strong> <code>.item()</code>, <code>.cpu()</code>, <code>print(tensor)</code> and Python <code>if</code> on a GPU value force Python to wait for the GPU. In a generation loop these can cost a lot.</li>
+  <li><strong>Launch overhead:</strong> each kernel launch costs a few microseconds of CPU time. A small model runs hundreds of tiny kernels per token, so Python can become the bottleneck. Chapter 5.7 shows how CUDA graphs and <code>torch.compile</code> remove this.</li>
+</ul>
+<pre>torch.cuda.memory_allocated() / 1e9      # GB held by tensors right now
+torch.cuda.max_memory_allocated() / 1e9  # peak since start (or since reset_peak_memory_stats)</pre>
+
+<h2 id="expert">10. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Fused kernels hide behind simple calls</span>
+  <p><code>F.scaled_dot_product_attention(q, k, v, is_causal=True)</code> looks like one line of math. Underneath, PyTorch picks a fused attention kernel (such as a FlashAttention implementation) that never writes the full attention matrix to memory. Reading code, you see the math; profiling (chapter 5.6), you see which kernel ran.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Meta device and lazy loading</span>
+  <p>Large models are created on the "meta" device, which stores shapes and types but no data. The real weights are then loaded straight to the GPU from safetensors files (chapter 3.1). This is how a 70B model loads without first filling CPU memory.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Hooks for inspection</span>
+  <p><code>module.register_forward_hook(fn)</code> calls <code>fn</code> with each module's inputs and outputs. It is the standard way to print shapes, capture activations for quantization calibration (chapter 4.1) or find which layer produces NaNs. The lab uses it.</p>
+</div>
+
+<h2 id="mistakes">11. Common mistakes</h2>
+<ul>
+  <li>Using <code>*</code> when you mean matrix multiplication.</li>
+  <li>Calling <code>.view</code> after <code>.transpose</code> without <code>.contiguous()</code>.</li>
+  <li>Reducing over the wrong <code>dim</code>. Softmax over dim 0 in attention normalizes across the batch, not across positions.</li>
+  <li>Forgetting <code>torch.inference_mode()</code> in serving code.</li>
+  <li>Mixing devices: "Expected all tensors to be on the same device" means one input is still on the CPU.</li>
+  <li>Timing GPU code without synchronizing.</li>
+</ul>
+
+<h2 id="lab">12. Lab</h2>
+<p><strong>Goal:</strong> read real model code and state every shape before PyTorch prints it.</p>
+<h3>Part A: shape drills (CPU)</h3>
+<p>For each line, write the shape in a comment first. Then run the cell and compare.</p>
+<pre>import torch, torch.nn.functional as F
+B, T, D, H = 2, 8, 64, 4
+x = torch.randn(B, T, D)
+a = x[:, -1, :]                          # ?
+b = x.view(B, T, H, D // H)              # ?
+c = b.transpose(1, 2)                    # ?
+d = c @ c.transpose(-2, -1)              # ?
+e = torch.softmax(d, dim=-1).sum(-1)     # ? and what value is in every element?
+f = x.mean(-1, keepdim=True)             # ?
+g = x - f                                # ?
+h = torch.cat([c, c], dim=2)             # ?
+for name, t in dict(a=a, b=b, c=c, d=d, e=e, f=f, g=g, h=h).items():
+    print(name, tuple(t.shape))
+print(e[0, 0])                           # softmax rows sum to 1
+try:
+    c.view(B, H, -1)
+except RuntimeError as err:
+    print("view failed:", str(err)[:60])
+print(c.reshape(B, H, -1).shape, c.is_contiguous(), c.contiguous().is_contiguous())</pre>
+
+<h3>Part B: annotate a tiny MLP</h3>
+<p>The AI may write the model. You add a shape comment after every line, then prove each comment with an <code>assert</code>.</p>
+<pre>import torch.nn as nn
+class TinyMLP(nn.Module):
+    def __init__(self, vocab=1000, d=64, f=256):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, d)
+        self.up = nn.Linear(d, f)
+        self.down = nn.Linear(f, d)
+        self.head = nn.Linear(d, vocab, bias=False)
+    def forward(self, ids):              # ids: [B, T]
+        x = self.emb(ids)                # TODO shape?
+        h = torch.relu(self.up(x))       # TODO shape?
+        x = x + self.down(h)             # TODO shape?
+        return self.head(x)              # TODO shape?
+
+m = TinyMLP()
+ids = torch.randint(0, 1000, (3, 5))
+out = m(ids)
+# TODO: assert out.shape == (?, ?, ?)
+for n, p in m.named_parameters():
+    print(f"{n:15s} {tuple(p.shape)}")
+print("parameters:", sum(p.numel() for p in m.parameters()))</pre>
+<details><summary>Answers</summary><p>x [3, 5, 64]; h [3, 5, 256]; x [3, 5, 64]; out [3, 5, 1000]. Parameters: embedding 64,000; up 64 × 256 + 256 = 16,640; down 256 × 64 + 64 = 16,448; head 64,000. Total 161,088. Note that up.weight prints as (256, 64): [out, in].</p></details>
+
+<h3>Part C: read a real model's tree</h3>
+<pre>from transformers import AutoModelForCausalLM, AutoTokenizer
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float32).eval()
+tok = AutoTokenizer.from_pretrained(name)
+print(model)                                     # the module tree
+print(model.model.layers[0].mlp)                 # one MLP block
+for n, p in list(model.named_parameters())[:12]:
+    print(f"{n:50s} {tuple(p.shape)} {p.dtype}")</pre>
+<p>Answer from the printout: how many decoder layers? What are the hidden size and MLP size? Why are k_proj and v_proj smaller than q_proj? (Hint: chapter 2.4 explains grouped-query attention.)</p>
+
+<h3>Part D: trace shapes with hooks</h3>
+<pre>shapes = []
+def hook(mod, inp, out):
+    o = out[0] if isinstance(out, tuple) else out
+    shapes.append((mod.__class__.__name__, tuple(inp[0].shape) if inp else None, tuple(o.shape)))
+
+layer = model.model.layers[0]
+handles = [m.register_forward_hook(hook) for m in [layer.self_attn.q_proj, layer.self_attn.k_proj,
+           layer.self_attn.v_proj, layer.self_attn.o_proj, layer.mlp.gate_proj, layer.mlp.up_proj,
+           layer.mlp.down_proj, layer.mlp]]
+ids = tok("Shapes tell you the cost.", return_tensors="pt").input_ids
+with torch.inference_mode():
+    model(ids)
+for h in handles: h.remove()
+print("input ids:", tuple(ids.shape))
+for s in shapes: print(s)</pre>
+<p>Before running, predict each output shape from the config. Then compute the FLOPs of each projection with the 2 × m × n × k rule from chapter 1.1.</p>
+
+<h3>Part E: GPU, memory and synchronization (T4)</h3>
+<pre>import time
+dev = "cuda"
+model = model.to(dev, torch.float16)
+ids = ids.to(dev)
+print(f"weights on GPU: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+def run(grad):
+    torch.cuda.reset_peak_memory_stats()
+    ctx = torch.enable_grad() if grad else torch.inference_mode()
+    with ctx:
+        out = model(ids.repeat(8, 1)).logits
+    return torch.cuda.max_memory_allocated() / 1e9
+
+print(f"peak with autograd:      {run(True):.2f} GB")
+print(f"peak in inference_mode:  {run(False):.2f} GB")
+
+x = torch.randn(4096, 4096, device=dev, dtype=torch.float16)
+t = time.perf_counter(); y = x @ x; t1 = time.perf_counter() - t
+torch.cuda.synchronize(); t2 = time.perf_counter() - t
+print(f"without sync {t1*1e6:.0f} us, with sync {t2*1e6:.0f} us")</pre>
+<p>Explain both gaps in one sentence each.</p>
+
+<h2 id="realworld">13. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Where you will read PyTorch as an inference engineer</span>
+  <ul>
+    <li><strong>Model files in <code>transformers</code></strong> (for example <code>modeling_llama.py</code>): the reference definition of each architecture. Engines copy their math.</li>
+    <li><strong>Engine model files</strong> (for example vLLM's <code>vllm/model_executor/models/</code>): the same math, rewritten with fused layers, tensor parallelism and paged attention. Reading them is the main exercise of chapter 8.2.</li>
+    <li><strong>Debugging:</strong> shape errors, device errors and NaNs are the three most common failures when bringing up a new model.</li>
+    <li><strong>Performance work:</strong> you read the code to find hidden syncs, unnecessary copies (<code>.contiguous()</code>, <code>.cpu()</code>) and many small operations that could be fused.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">14. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz14"></div>
+<script type="application/json" id="qz14">[
+{"q":"x has shape [4, 16, 768]. What is x[:, -1, :].shape?","o":["[4, 1, 768]","[4, 768]","[16, 768]","[768]"],"a":1,"e":"An integer index removes that dimension."},
+{"q":"nn.Linear(768, 3072) has a weight of shape:","o":["[768, 3072]","[3072, 768]","[3072]","[768]"],"a":1,"e":"PyTorch stores [out_features, in_features]."},
+{"q":"Which operation copies data?","o":["transpose","view","contiguous() on a transposed tensor","unsqueeze"],"a":2,"e":"Transpose and view only change the shape and strides. contiguous() copies when the layout is not already compact."},
+{"q":"Shapes [8, 1, 64] and [5, 64] broadcast to:","o":["An error","[8, 5, 64]","[5, 8, 64]","[8, 64]"],"a":1,"e":"From the right: 64=64, 1 stretches to 5, 8 has no partner."},
+{"q":"x.mean(dim=-1, keepdim=True) for x [2, 8, 4096] has shape:","o":["[2, 8]","[2, 8, 1]","[1, 1, 4096]","[2, 8, 4096]"],"a":1,"e":"keepdim keeps the reduced dimension as size 1, ready for broadcasting."},
+{"q":"Why wrap inference in torch.inference_mode()?","o":["It makes matmuls more accurate","It stops PyTorch from recording the graph and keeping intermediates for backward","It moves the model to the GPU","It enables FP8"],"a":1,"e":"Without it, PyTorch keeps activations for a backward pass that never happens."},
+{"q":"A loop calls logits.argmax().item() every step. What is the hidden cost?","o":["None","It forces the CPU to wait for the GPU each step","It doubles the FLOPs","It moves the model to the CPU"],"a":1,"e":".item() needs the value on the CPU, so Python must wait for all queued GPU work."}
+]</script>
+
+<h2 id="summary">15. Summary</h2>
+<ul>
+  <li>Track four facts per tensor: shape, dtype, device, requires_grad. Memory = numel × element_size.</li>
+  <li>Integer indexing removes a dimension; slicing keeps it.</li>
+  <li>view, transpose and permute change shape and strides without copying. view needs contiguous memory.</li>
+  <li>Broadcasting aligns shapes from the right; sizes must match or be 1.</li>
+  <li>nn.Linear stores weights as [out, in]; a module's forward() is the computation.</li>
+  <li>Use inference_mode for inference. GPU calls are asynchronous: synchronize before timing.</li>
+</ul>
+
+<h2 id="refs">16. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://docs.pytorch.org/tutorials/beginner/basics/intro.html">PyTorch: Learn the Basics</a></td><td>The official tour of tensors, modules, autograd and saving. Skim it after this chapter.</td></tr>
+<tr><td>Sebastian Raschka, <em>Build a Large Language Model (From Scratch)</em>, appendix A</td><td>Tensors, computation graphs, autograd and a multilayer network in compact, runnable form.</td></tr>
+<tr><td><a href="https://docs.pytorch.org/docs/stable/notes/broadcasting.html">PyTorch: Broadcasting semantics</a></td><td>The exact broadcasting rules used by the checker.</td></tr>
+<tr><td><a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Linear.html">PyTorch: nn.Linear</a></td><td>The [out, in] weight layout and the y = xWᵀ + b definition.</td></tr>
+<tr><td><a href="https://docs.pytorch.org/docs/stable/notes/cuda.html">PyTorch: CUDA semantics</a></td><td>Asynchronous execution, synchronization and memory statistics.</td></tr>
+<tr><td><a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py">transformers: modeling_llama.py</a></td><td>The real code behind the forward-pass widget and Part C.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, chapters 13 and 14</td><td>How PyTorch's compiler stack turns this code into fused kernels. Read with chapter 5.7.</td></tr>
+</table></div>
+<p class="note">Facts checked on 6 November 2026.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+/* strides */
+let SOP='orig';
+function sDraw(){
+  const svg=$('strideSvg');svg.innerHTML='';const mem=[1,2,3,4,5,6];
+  let shape,stride,data=mem,msg;
+  if(SOP==='orig'){shape=[2,3];stride=[3,1];msg='Contiguous: element [i, j] is at memory position 3i + j. Walking the last dimension moves 1 step in memory.';}
+  else if(SOP==='t'){shape=[3,2];stride=[1,3];msg='Transposed: same memory, strides swapped to (1, 3). Element [i, j] is at i + 3j. The last dimension now jumps 3 places, so the tensor is not contiguous and .view() cannot reinterpret it.';}
+  else{shape=[3,2];stride=[2,1];data=[1,4,2,5,3,6];msg='contiguous() copied the data into a new block in the new order. Strides are (2, 1) again, so .view() works. The copy costs memory traffic.';}
+  el('text',{x:20,y:22,'font-size':12,fill:css('--ink2')},svg,'Memory (flat block)');
+  data.forEach((v,i)=>{el('rect',{x:20+i*56,y:30,width:50,height:36,rx:4,fill:css('--kv-s'),stroke:css('--kv')},svg);el('text',{x:45+i*56,y:53,'text-anchor':'middle','font-size':14,fill:css('--ink')},svg,v);el('text',{x:45+i*56,y:80,'text-anchor':'middle',class:'tick'},svg,i);});
+  el('text',{x:390,y:22,'font-size':12,fill:css('--ink2')},svg,`View: shape [${shape}], strides (${stride})`);
+  for(let i=0;i<shape[0];i++)for(let j=0;j<shape[1];j++){const pos=i*stride[0]+j*stride[1];
+    el('rect',{x:390+j*56,y:100+i*42,width:50,height:36,rx:4,fill:css('--pre-s'),stroke:css('--pre')},svg);
+    el('text',{x:415+j*56,y:123+i*42,'text-anchor':'middle','font-size':14,fill:css('--ink')},svg,data[pos]);
+    el('text',{x:415+j*56,y:112+i*42,'text-anchor':'middle','font-size':9,fill:css('--ink2')},svg,`[${i},${j}]→${pos}`);}
+  $('strideMsg').textContent=msg;
+}
+document.querySelectorAll('#strideW [data-op]').forEach(b=>b.onclick=()=>{SOP=b.dataset.op;document.querySelectorAll('#strideW [data-op]').forEach(x=>x.classList.toggle('on',x===b));sDraw();});
+IE.onTheme(sDraw);
+/* broadcasting */
+function parse(s){return s.split(/[,\s]+/).filter(Boolean).map(Number);}
+function bcDraw(){
+  const a=parse($('bcA').value),b=parse($('bcB').value);const n=Math.max(a.length,b.length);
+  const A=Array(n-a.length).fill(null).concat(a),B=Array(n-b.length).fill(null).concat(b);
+  const R=[];let bad=-1;
+  for(let i=0;i<n;i++){const x=A[i],y=B[i];if(x===null)R.push(y);else if(y===null)R.push(x);else if(x===y)R.push(x);else if(x===1)R.push(y);else if(y===1)R.push(x);else{R.push(NaN);if(bad<0)bad=i;}}
+  const svg=$('bcSvg');svg.innerHTML='';const cw=86,x0=640-20-n*cw;
+  [['a',A,24],['b',B,64],['result',R,112]].forEach(([nm,arr,y])=>{el('text',{x:x0-12,y:y+18,'text-anchor':'end','font-size':12,fill:css('--ink2')},svg,nm);
+    arr.forEach((v,i)=>{const isBad=i===bad;const stretched=nm!=='result'&&(v===null||(v===1&&R[i]!==1));
+      el('rect',{x:x0+i*cw,y,width:cw-8,height:28,rx:4,fill:isBad?css('--bad-s'):v===null?css('--bg'):stretched?css('--dec-s'):nm==='result'?css('--kv-s'):css('--panel2'),stroke:isBad?css('--bad'):css('--line'),'stroke-dasharray':v===null?'4 3':'0'},svg);
+      el('text',{x:x0+i*cw+(cw-8)/2,y:y+19,'text-anchor':'middle','font-size':13,fill:css('--ink')},svg,v===null?'·':isNaN(v)?'✗':v);});});
+  $('bcMsg').textContent=bad>=0?`RuntimeError: size ${A[bad]} and size ${B[bad]} do not match at dimension ${bad} (counted from the left of the result), and neither is 1.`:`Result shape [${R.join(', ')}]. Amber cells are stretched (size 1 or missing).`;
+}
+['bcA','bcB'].forEach(id=>$(id).addEventListener('input',bcDraw));
+document.querySelectorAll('#bcW [data-a]').forEach(b=>b.onclick=()=>{$('bcA').value=b.dataset.a;$('bcB').value=b.dataset.b;bcDraw();});
+IE.onTheme(bcDraw);
+/* forward tracer */
+const LINES=[
+ ['x = hidden_states','[2, 8, 4096]','Input to the layer: B=2, T=8, D=4096.'],
+ ['h = input_layernorm(x)','[2, 8, 4096]','RMSNorm keeps the shape (chapter 1.5).'],
+ ['q = q_proj(h)','[2, 8, 4096]','Linear 4096 → 4096 (32 heads × 128).'],
+ ['k = k_proj(h); v = v_proj(h)','[2, 8, 1024]','Linear 4096 → 1024 (8 KV heads × 128).'],
+ ['q = q.view(2, 8, 32, 128).transpose(1, 2)','[2, 32, 8, 128]','Split into heads, heads before tokens.'],
+ ['k = k.view(2, 8, 8, 128).transpose(1, 2)','[2, 8, 8, 128]','8 KV heads. Each serves a group of 4 query heads.'],
+ ['q, k = apply_rope(q, k, positions)','[2, 32, 8, 128] and [2, 8, 8, 128]','Rotary position (chapter 2.3) keeps shapes.'],
+ ['a = scaled_dot_product_attention(q, k, v, is_causal=True)','[2, 32, 8, 128]','Scores [2, 32, 8, 8] are computed inside; output has the query shape.'],
+ ['a = a.transpose(1, 2).reshape(2, 8, 4096)','[2, 8, 4096]','Join the heads back together.'],
+ ['x = x + o_proj(a)','[2, 8, 4096]','Residual add (chapter 1.5).'],
+ ['h = post_attention_layernorm(x)','[2, 8, 4096]',''],
+ ['g = silu(gate_proj(h)); u = up_proj(h)','[2, 8, 14336]','MLP expands to 14,336.'],
+ ['x = x + down_proj(g * u)','[2, 8, 4096]','Element-wise product, then back to 4096. Output shape = input shape, so layers can be stacked.']];
+let tr=0;
+function trDraw(){$('trList').innerHTML=LINES.map((l,i)=>`<div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 16px;padding:7px 10px;border-radius:6px;margin-bottom:4px;background:${i<tr?'var(--panel2)':'transparent'};border:1px solid var(--line);opacity:${i<=tr?1:.45}"><span style="white-space:pre">${l[0]}</span><span style="color:var(--kv);font-weight:600">${i<tr?l[1]:'?'}</span>${i<tr&&l[2]?`<span style="grid-column:1/-1;font-family:var(--f-body);font-size:14px;color:var(--ink2)">${l[2]}</span>`:''}</div>`).join('');}
+$('trNext').onclick=()=>{if(tr<LINES.length){tr++;trDraw();}};$('trAll').onclick=()=>{tr=LINES.length;trDraw();};$('trReset').onclick=()=>{tr=0;trDraw();};
+trDraw();
+})();
+</script>
+
+</body>
+</html>

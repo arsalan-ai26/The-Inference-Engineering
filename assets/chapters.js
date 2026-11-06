@@ -25,7 +25,7 @@ window.IE_CHAPTERS = [
 "title": "PyTorch reading literacy",
 "slug": "1-4-pytorch-literacy",
 "part": 1,
-"ready": false
+"ready": true
 },
 {
 "n": "1.5",
