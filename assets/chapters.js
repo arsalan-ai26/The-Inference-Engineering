@@ -46,7 +46,7 @@ window.IE_CHAPTERS = [
 "title": "Tokenization and embeddings",
 "slug": "2-1-tokenization",
 "part": 2,
-"ready": false
+"ready": true
 },
 {
 "n": "2.2",

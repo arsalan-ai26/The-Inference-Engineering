@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>2.1 Tokenization and embeddings</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="2.1">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 2 · Chapter 2.1</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 2 · Transformers and LLM inference mechanics · Chapter 2.1</div>
+<h1>Tokenization and embeddings</h1>
+<p class="lede">Models do not read text. They read integers. The tokenizer turns text into a list of token IDs, and the embedding table turns each ID into a vector. Both steps look simple, but they set how many tokens a request costs, how fast it runs, how fair the price is across languages, and a whole class of serving bugs. This chapter covers both.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 1.1, 1.4, 1.5</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why do most LLMs use subword tokens instead of whole words or single characters?</li>
+    <li>The same paragraph is 30 tokens in English and 90 tokens in Hindi for one model. Name two effects on serving.</li>
+    <li>Why can decoding one token at a time print "�" when streaming?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Words give a huge vocabulary and cannot handle new words. Characters give very long sequences. Subwords keep the vocabulary manageable and sequences short, and any text can still be encoded.</li>
+    <li>Any two: 3 times the prefill compute, 3 times the KV cache memory, slower time to first token, a higher price for the same content, less room in the context window.</li>
+    <li>Byte-level tokenizers can split one multi-byte character across tokens. A single token may hold only part of a UTF-8 character, which cannot be shown until the rest arrives.</li>
+  </ol></details>
+</div>
+
+<h2 id="why">1. The problem: text is not numbers</h2>
+<p>A neural network works on vectors (chapter 1.5). Text is a string of characters. We need a fixed, reversible way to cut text into pieces and give each piece a number. This is <strong>tokenization</strong>.</p>
+<p>There are three ways to cut:</p>
+<div class="tbl"><table>
+<tr><th>Unit</th><th>Vocabulary size</th><th>Sequence length</th><th>Problem</th></tr>
+<tr><td>Whole words</td><td>Millions (every word form, name, typo)</td><td>Short</td><td>Unknown words cannot be encoded</td></tr>
+<tr><td>Characters or bytes</td><td>256 bytes, or about 150,000 Unicode characters</td><td>Very long (4 to 5 times words)</td><td>Long sequences cost more compute and memory</td></tr>
+<tr><td>Subwords</td><td>About 30,000 to 260,000</td><td>Medium</td><td>Splits depend on the training data</td></tr>
+</table></div>
+<p>All current LLMs use subwords. Common words become one token. Rare words are split into pieces: GPT-2's tokenizer splits "Kubernetes" into <code>K</code>, <code>uber</code>, <code>net</code>, <code>es</code>. Any text can still be encoded, because the smallest pieces are single bytes.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Token:</strong> one piece of text in the tokenizer's vocabulary.</p>
+  <p><strong>Token ID:</strong> the integer for a token. The model only ever sees IDs.</p>
+  <p><strong>Vocabulary:</strong> the full table of tokens and their IDs.</p>
+  <p><strong>Encode / decode:</strong> text to IDs, and IDs back to text.</p>
+</div>
+
+<h2 id="bpe">2. Byte pair encoding (BPE)</h2>
+<p>The most common method is <strong>byte pair encoding</strong>. Training a BPE tokenizer is a simple loop:</p>
+<ol>
+  <li>Start with every text split into single bytes (or characters).</li>
+  <li>Count every pair of neighbouring pieces in the training text.</li>
+  <li>Merge the most frequent pair into one new token. Record the merge.</li>
+  <li>Repeat until the vocabulary reaches the target size.</li>
+</ol>
+<p>To encode new text, apply the recorded merges in the same order. No neural network is involved, and the result is deterministic.</p>
+
+<div class="widget" id="bpeW">
+  <div class="wt">Interactive: train a BPE tokenizer</div>
+  <div class="ws">A toy corpus with word counts. "_" marks the end of a word. Each step merges the most frequent neighbouring pair. Watch the number of tokens needed for the corpus fall as the vocabulary grows.</div>
+  <div class="ctrls">
+    <label>Corpus <select id="bpeC">
+      <option value="low:5,lower:2,newest:6,widest:3">low ×5, lower ×2, newest ×6, widest ×3</option>
+      <option value="the:12,then:4,there:5,these:3,other:4,another:2">the, then, there, these, other, another</option>
+      <option value="inference:6,infer:3,reference:4,prefer:5,preference:2">inference, infer, reference, prefer, preference</option>
+    </select></label>
+    <button class="pri" id="bpeStep">Merge next pair</button><button id="bpeAll">Merge 10</button><button id="bpeReset">Reset</button>
+  </div>
+  <div id="bpeOut" style="margin-top:14px"></div>
+  <div class="stats" id="bpeStats"></div>
+</div>
+
+<p>Real tokenizers add three refinements:</p>
+<ul>
+  <li><strong>Byte-level base:</strong> GPT-2, Llama 3 and Qwen start from the 256 possible bytes, so any input, even emoji or binary noise, can be encoded.</li>
+  <li><strong>Pre-tokenization:</strong> before BPE runs, a regular expression splits text into chunks such as words, numbers and punctuation, so merges never cross those boundaries. A leading space usually stays attached to the word that follows it. GPT-2's tokens show it as "Ġ": <code>Ġhello</code> is " hello".</li>
+  <li><strong>Special tokens:</strong> reserved tokens that are never produced from normal text, such as end-of-text, chat role markers and tool-call markers (section 5).</li>
+</ul>
+<p>Other methods exist. <strong>WordPiece</strong> (BERT) is similar to BPE but picks merges by a likelihood score. <strong>SentencePiece</strong> is a library that treats text as a raw stream, including spaces, and supports BPE and a "unigram" method. For serving, the differences matter less than the vocabulary each model ends up with.</p>
+
+<h2 id="compare">3. Same text, different token counts</h2>
+<p>Each model family has its own tokenizer. The same text can need very different numbers of tokens. These counts were measured with the real tokenizers:</p>
+<div class="tbl"><table>
+<tr><th>Text</th><th class="n">GPT-2 (50,257)</th><th class="n">BERT uncased (30,522)</th><th class="n">Qwen2.5 (151,665)</th><th class="n">o200k (200,019)</th></tr>
+<tr><td>"The quick brown fox jumps over the lazy dog."</td><td class="n">10</td><td class="n">10</td><td class="n">10</td><td class="n">10</td></tr>
+<tr><td>Python: <code>def add(a, b):</code> + indented <code>return a + b</code></td><td class="n">15</td><td class="n">12</td><td class="n">11</td><td class="n">11</td></tr>
+<tr><td>Hindi: "नमस्ते, आप कैसे हैं?"</td><td class="n">32</td><td class="n">11*</td><td class="n">20</td><td class="n">9</td></tr>
+<tr><td>"12345678 + 87654321"</td><td class="n">8</td><td class="n">10</td><td class="n">18</td><td class="n">n/a</td></tr>
+</table></div>
+<p class="note">Counts exclude special tokens. *BERT uncased strips accents and diacritics during normalization, so its low count loses information. o200k is the tokenizer used by recent OpenAI models, measured with the tiktoken library.</p>
+<p>Three lessons:</p>
+<ol>
+  <li><strong>Language matters.</strong> GPT-2 needs over 3 times more tokens for the Hindi sentence than a large multilingual vocabulary does. More tokens means more compute, more KV cache, a higher price and less usable context for the same meaning.</li>
+  <li><strong>Code and whitespace matter.</strong> Older tokenizers waste tokens on runs of spaces in indented code. Newer ones have tokens for common indentation.</li>
+  <li><strong>Numbers are a design choice.</strong> Qwen splits every digit into its own token, which helps arithmetic but makes numbers longer. GPT-2 groups digits in irregular chunks.</li>
+</ol>
+<div class="box watch">
+  <span class="lbl">Watch out: tokens per second is not comparable across models</span>
+  <p>A model with a larger vocabulary may need 20% fewer tokens for the same text. Its "tokens per second" can look lower while it delivers words just as fast. Compare throughput in tokens of the same tokenizer, or in characters or words, when models differ.</p>
+</div>
+
+<h2 id="vocab">4. Vocabulary size: a trade-off</h2>
+<p>Why not use a huge vocabulary? Because the vocabulary size V appears twice in the model:</p>
+<ul>
+  <li>The <strong>embedding table</strong> has V rows of hidden size D.</li>
+  <li>The <strong>output head</strong> (chapter 1.2) is a [D, V] matmul run for every generated token, followed by a softmax over V values.</li>
+</ul>
+<div class="widget" id="vsW">
+  <div class="wt">Interactive: the cost of the vocabulary</div>
+  <div class="ws">Embedding and output-head parameters, and the output head's share of the FLOPs per token. Assumes the rest of the model is fixed. "Tied" means the embedding table and output head share one matrix.</div>
+  <div class="ctrls">
+    <label>Model body <select id="vsM"><option value="896,0.36">Qwen2.5-0.5B body (D = 896, 0.36 B)</option><option value="4096,6.98" selected>Llama 3.1 8B body (D = 4,096, 6.98 B)</option><option value="8192,68.5">Llama 3.1 70B body (D = 8,192, 68.5 B)</option></select></label>
+    <label>Vocabulary: <span class="mono" id="vsVv"></span><input type="range" id="vsV" min="0" max="5" step="1" value="3"></label>
+    <label><span>Tied embeddings</span><input type="checkbox" id="vsT"></label>
+  </div>
+  <div class="stats" id="vsStats"></div>
+</div>
+<p>For a small model, the vocabulary can be a large share of all parameters. Qwen2.5-0.5B has 151,936 × 896 ≈ 136 M embedding parameters: over a quarter of the model. That is why small models often tie their embedding and output weights. For large models, the share is small, and a larger vocabulary pays for itself by shortening sequences.</p>
+<div class="box ex">
+  <span class="lbl">A detail you will notice in configs</span>
+  <p>Qwen2.5's tokenizer has 151,665 entries, but its config says <code>vocab_size: 151936</code>. The embedding table is padded with unused rows to a size that divides nicely, so that matmul shapes fit GPU tiles (chapter 1.1, expert layer). Engines must handle these extra rows: they can never be sampled, because no real token maps to them.</p>
+</div>
+
+<h2 id="special">5. Special tokens and chat templates</h2>
+<p>A chat model does not see "messages". It sees one long token sequence. A <strong>chat template</strong> turns a list of messages into that sequence, using special tokens to mark roles. For Qwen2.5, a single user message "Hi" becomes:</p>
+<pre class="out">&lt;|im_start|&gt;system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+Hi&lt;|im_end|&gt;
+&lt;|im_start|&gt;assistant</pre>
+<p>Note that the template added a default system prompt the user never typed. The model was trained with this exact format, so it expects it. Llama 3, Mistral, DeepSeek and others each use different markers.</p>
+<p>The template is stored with the tokenizer (in <code>tokenizer_config.json</code> or a separate template file) as a small Jinja program. Serving engines apply it when you call the chat API. Getting it wrong is one of the most common causes of "the model is worse on our server than in the demo":</p>
+<ul>
+  <li>A missing or wrong template: the model sees plain text and rambles.</li>
+  <li>A wrong end-of-sequence token: generation never stops, or stops too early.</li>
+  <li>Tool-calling markers that the engine does not parse back into structured calls (chapter 3.5).</li>
+</ul>
+
+<h2 id="serving">6. Tokenization inside a server</h2>
+<p>Tokenization runs on the CPU, before and after the GPU work:</p>
+<div class="svgwrap"><svg viewBox="0 0 700 150" width="700" style="max-width:100%;height:auto" role="img" aria-label="Request flow: text, chat template, tokenizer, GPU model, detokenizer, streamed text">
+  <defs><marker id="ar21" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--ink2)"/></marker></defs>
+  <g font-size="12">
+    <rect x="10" y="40" width="100" height="56" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="60" y="64" text-anchor="middle" fill="var(--ink)">1. messages</text><text x="60" y="80" text-anchor="middle" fill="var(--ink2)">(JSON)</text>
+    <rect x="130" y="40" width="100" height="56" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="180" y="64" text-anchor="middle" fill="var(--ink)">2. chat</text><text x="180" y="80" text-anchor="middle" fill="var(--ink)">template</text>
+    <rect x="250" y="40" width="100" height="56" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="300" y="64" text-anchor="middle" fill="var(--ink)">3. tokenize</text><text x="300" y="80" text-anchor="middle" fill="var(--ink2)">CPU</text>
+    <rect x="370" y="40" width="100" height="56" rx="8" fill="var(--pre-s)" stroke="var(--pre)"/><text x="420" y="64" text-anchor="middle" fill="var(--ink)">4. model</text><text x="420" y="80" text-anchor="middle" fill="var(--ink2)">GPU, token IDs</text>
+    <rect x="490" y="40" width="100" height="56" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="540" y="64" text-anchor="middle" fill="var(--ink)">5. detokenize</text><text x="540" y="80" text-anchor="middle" fill="var(--ink2)">incremental</text>
+    <rect x="610" y="40" width="80" height="56" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="650" y="64" text-anchor="middle" fill="var(--ink)">6. stream</text><text x="650" y="80" text-anchor="middle" fill="var(--ink2)">to client</text>
+    <path d="M110 68H128M230 68H248M350 68H368M470 68H488M590 68H608" stroke="var(--ink2)" marker-end="url(#ar21)"/>
+    <path d="M540 96 V120 H420 V98" stroke="var(--dec)" fill="none" stroke-dasharray="4 3" marker-end="url(#ar21)"/><text x="480" y="136" text-anchor="middle" fill="var(--dec)">each new token ID goes back in (decode loop)</text>
+  </g>
+</svg></div>
+<ul>
+  <li><strong>Cost.</strong> Fast tokenizers (written in Rust) encode millions of characters per second. Usually this is small next to GPU time, but for very long prompts or very high request rates it can become noticeable. Some engines run tokenization in separate processes so it does not block the GPU loop.</li>
+  <li><strong>Incremental detokenization.</strong> When streaming, the server turns each new token ID into text. Two problems: a token may hold only part of a multi-byte UTF-8 character, and some tokenizers change how a token prints depending on its neighbours (for example the leading space). Engines keep a small window of recent tokens and emit only text that is complete and stable.</li>
+  <li><strong>Stop strings.</strong> A stop string such as "\n\nUser:" may arrive spread over several tokens, so the server checks the decoded text, not single tokens.</li>
+</ul>
+
+<h2 id="embed">7. Embeddings: from ID to vector</h2>
+<p>After tokenization, each ID selects one row of the <strong>embedding table</strong>, a [V, D] matrix of learned numbers (chapter 1.5). For token IDs of shape [B, T], the result is [B, T, D].</p>
+<div class="formula">embeddings = E[ids]      shape [B, T] → [B, T, D]</div>
+<p>Mathematically this equals multiplying a one-hot vector (all zeros except a 1 at the token's ID) by E. In practice, engines do a direct row lookup: no multiplication, just a memory read of T × D values. It is one of the cheapest steps in the model.</p>
+<p>During training, tokens that appear in similar contexts get similar rows. So the embedding space has structure: related tokens point in similar directions, and cosine similarity (chapter 1.1) measures it. This is only the starting point. Every transformer layer adds information from the context, so the vector for "bank" in "river bank" ends up very different from "bank" in "bank loan" after a few layers. Those context-aware vectors are what embedding models for search return.</p>
+<div class="widget" id="emW">
+  <div class="wt">Interactive: the lookup</div>
+  <div class="ws">A tiny embedding table: 8 tokens, 6 dimensions. Type a sentence using these words. Each token ID picks one row; the rows stack into the [T, D] input of the first layer.</div>
+  <div class="ctrls"><label>Text <input id="emIn" value="the cat sat on the mat" style="width:280px;font-family:var(--f-mono)"></label></div>
+  <div class="svgwrap"><svg id="emSvg" viewBox="0 0 700 260" width="700" style="max-width:100%;height:auto" role="img" aria-label="Embedding table lookup"></svg></div>
+  <p class="note" id="emMsg"></p>
+</div>
+
+<h2 id="positions">8. One thing embeddings lack: position</h2>
+<p>The same token ID always gives the same embedding row, wherever it appears. "dog bites man" and "man bites dog" give the same set of vectors. Something must add order. GPT-2 adds a second learned table indexed by position. Modern models instead rotate the query and key vectors inside attention (RoPE). Chapter 2.3 covers both. Chapter 2.2 first explains attention itself.</p>
+
+<h2 id="expert">9. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Tokenizer fertility and fair pricing</span>
+  <p>"Fertility" is the average number of tokens per word for a language. High-fertility languages pay more per sentence on token-priced APIs, see slower responses and fit less text in the context window. Multilingual model builders grow the vocabulary partly to reduce this gap.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Token healing and prompt boundaries</span>
+  <p>If a prompt ends in the middle of what would normally be one token (for example, it ends with "http:" and the model usually sees "://" as one token), the model sees an unusual split and may continue badly. Some libraries "heal" this by backing up one token and constraining the next token to start with the removed text.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Glitch tokens</span>
+  <p>Some tokens exist in the vocabulary but were almost never seen in training, because the tokenizer was trained on different data from the model. Their embeddings stay close to random, and prompts containing them can make a model behave strangely. They are a reminder that the tokenizer and the model are trained separately.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Tokenizer-free and byte-level models</span>
+  <p>Research models that read raw bytes avoid tokenizer problems, but sequences become several times longer. Some designs group bytes into dynamic "patches" inside the model to win back the length. These are not yet common in production serving.</p>
+</div>
+
+<h2 id="mistakes">10. Common mistakes</h2>
+<ul>
+  <li>Estimating cost from word count. Measure tokens with the model's own tokenizer.</li>
+  <li>Using one model's tokenizer to count tokens for another model.</li>
+  <li>Forgetting the chat template and special tokens when counting prompt length. The default system prompt alone can add dozens of tokens.</li>
+  <li>Decoding streamed tokens one at a time and printing "�" for non-English text.</li>
+  <li>Assuming <code>len(tokenizer)</code> equals <code>config.vocab_size</code>. The embedding table is often padded.</li>
+</ul>
+
+<h2 id="lab">11. Lab</h2>
+<p><strong>Goal:</strong> build BPE yourself, compare real tokenizers, and see the serving pitfalls with your own eyes.</p>
+<h3>Part A: the 100 Days notebooks</h3>
+<p>Run day 02 (what is inside a model file; tokenization from scratch) and day 03 (embeddings) from the <em>100 Days of Inference</em> repository. While you read day 02, check its parameter split for GPT-2 against your own count in Part E.</p>
+<h3>Part B: BPE from scratch</h3>
+<pre>from collections import Counter
+corpus = {"low": 5, "lower": 2, "newest": 6, "widest": 3}
+words = {tuple(w) + ("_",): c for w, c in corpus.items()}      # "_" marks the end of a word
+
+def pair_counts(words):
+    pc = Counter()
+    for w, c in words.items():
+        for a, b in zip(w, w[1:]):
+            pc[a, b] += c
+    return pc
+
+def merge(words, pair):
+    out = {}
+    for w, c in words.items():
+        new, i = [], 0
+        while i &lt; len(w):
+            # TODO: if w[i], w[i+1] equals pair, append the joined token and skip 2; else append w[i]
+            ...
+        out[tuple(new)] = c
+    return out
+
+merges = []
+for step in range(10):
+    pc = pair_counts(words)
+    best = max(pc, key=pc.get)
+    merges.append(best)
+    words = merge(words, best)
+    print(step, best, pc[best], sum(len(w) * c for w, c in words.items()), "tokens in corpus")</pre>
+<details><summary>Solution for the TODO</summary>
+<pre>            if i &lt; len(w) - 1 and (w[i], w[i + 1]) == pair:
+                new.append(w[i] + w[i + 1]); i += 2
+            else:
+                new.append(w[i]); i += 1</pre>
+<p>Compare your merge order with the widget above (same corpus). Ties between equal counts may be broken differently.</p>
+</details>
+<h3>Part C: compare real tokenizers</h3>
+<pre>from transformers import AutoTokenizer
+texts = {
+    "english": "The quick brown fox jumps over the lazy dog.",
+    "code": "def add(a, b):\n    return a + b",
+    "hindi": "नमस्ते, आप कैसे हैं?",
+    "numbers": "12345678 + 87654321",
+    "your language": "...",          # TODO: add a sentence in a language you speak
+}
+for name in ["openai-community/gpt2", "Qwen/Qwen2.5-0.5B-Instruct", "google-bert/bert-base-uncased"]:
+    tok = AutoTokenizer.from_pretrained(name)
+    print(f"\n{name}  vocab={len(tok)}")
+    for k, t in texts.items():
+        ids = tok(t, add_special_tokens=False).input_ids
+        print(f"  {k:14s} {len(ids):3d}  {tok.convert_ids_to_tokens(ids)[:12]}")</pre>
+<p>Predict first: which tokenizer needs the most tokens for Hindi? Check your counts against the table in section 3.</p>
+<h3>Part D: the chat template and the streaming pitfall</h3>
+<pre>q = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+msgs = [{"role": "user", "content": "Hi"}]
+text = q.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+print(text)
+print(len(q(text).input_ids), "tokens for a 1-word message")   # 30 for Qwen2.5
+
+g = AutoTokenizer.from_pretrained("openai-community/gpt2")
+ids = g("नमस्ते", add_special_tokens=False).input_ids
+print([g.decode([i]) for i in ids])        # one token at a time: broken characters
+print(g.decode(ids))                       # all together: correct
+
+# A minimal incremental detokenizer: print only text that has become stable
+shown = ""
+for n in range(1, len(ids) + 1):
+    full = g.decode(ids[:n])
+    if not full.endswith("�"):        # do not emit an incomplete character
+        print(repr(full[len(shown):])); shown = full</pre>
+<h3>Part E: embeddings are a lookup</h3>
+<pre>import torch
+from transformers import AutoModelForCausalLM
+m = AutoModelForCausalLM.from_pretrained("openai-community/gpt2")
+E = m.transformer.wte.weight                     # [50257, 768]
+ids = torch.tensor(g("king queen man woman apple").input_ids)
+rows = E[ids]                                    # lookup
+onehot = torch.nn.functional.one_hot(ids, E.shape[0]).float()
+print(torch.allclose(rows, onehot @ E, atol=1e-6))   # same result, far more work
+
+cos = torch.nn.functional.cosine_similarity
+for a, b in [(0, 1), (2, 3), (0, 4)]:
+    print(g.decode(ids[a]), g.decode(ids[b]), round(cos(rows[a], rows[b], dim=0).item(), 3))
+
+n = lambda mod: sum(p.numel() for p in mod.parameters())
+emb = n(m.transformer.wte) + n(m.transformer.wpe)
+attn = sum(n(b.attn) for b in m.transformer.h); mlp = sum(n(b.mlp) for b in m.transformer.h)
+total = n(m)
+print(f"embeddings {emb/total:.1%}  attention {attn/total:.1%}  mlp {mlp/total:.1%}")</pre>
+<p>Raw input embeddings are noisy, so do not expect perfect analogies. Related pairs should still score higher than unrelated ones. Then check the parameter split.</p>
+<details><summary>What the split should be</summary><p>For GPT-2 small (124 M), embeddings are about 31.6%, attention about 22.8% and the MLP about 45.5%, with layer norms near 0%. (The output head shares the embedding table, so it adds nothing.)</p></details>
+
+<h2 id="realworld">12. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Tokens in production</span>
+  <ul>
+    <li><strong>Pricing:</strong> hosted APIs bill per input and output token. The same request costs different amounts on models with different tokenizers.</li>
+    <li><strong>Context limits</strong> are in tokens, including the chat template and system prompt.</li>
+    <li><strong>Serving engines</strong> ship the tokenizer and chat template with the model and run tokenization in CPU worker processes. vLLM and SGLang both apply the model's chat template on their chat endpoints and let you override it.</li>
+    <li><strong>Debugging:</strong> when a self-hosted model behaves differently from its hosted version, compare the exact token IDs sent to the model first.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">13. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz21"></div>
+<script type="application/json" id="qz21">[
+{"q":"What does one BPE training step do?","o":["Splits the rarest token","Merges the most frequent neighbouring pair into a new token","Trains a neural network","Removes punctuation"],"a":1,"e":"BPE repeatedly merges the most frequent adjacent pair."},
+{"q":"Why does a byte-level BPE tokenizer never meet an unknown character?","o":["It has every Unicode character","It can always fall back to single bytes, and any text is a sequence of bytes","It deletes unknown characters","It maps them to [UNK]"],"a":1,"e":"The base vocabulary covers all 256 bytes."},
+{"q":"A model needs 3 times more tokens for language A than language B. What does NOT get worse?","o":["Prefill compute","KV cache memory per request","Price on a token-billed API","The size of the model weights"],"a":3,"e":"Weights are fixed. Per-request compute, memory and price grow with tokens."},
+{"q":"Embedding lookup for ids of shape [4, 100] with a [50257, 768] table gives:","o":["[4, 100]","[4, 100, 768]","[50257, 768]","[4, 768]"],"a":1,"e":"Each ID becomes one 768-element row."},
+{"q":"Why do small models often tie the embedding table and the output head?","o":["It improves speed only","The vocabulary matrices are a large share of a small model's parameters","It is required by BPE","It removes the softmax"],"a":1,"e":"For a 0.5 B model, a 150 K × 896 table is over a quarter of the parameters."},
+{"q":"Your self-hosted chat model never stops generating. The most likely cause:","o":["The GPU is too slow","The chat template or end-of-sequence token is wrong","Temperature is too low","The KV cache is too large"],"a":1,"e":"If the stop token does not match what the model emits, generation runs to max_tokens."},
+{"q":"Model X makes 80 tokens/s and model Y 70 tokens/s on the same text. Y's tokenizer needs 25% fewer tokens. Which delivers text faster?","o":["X","Y","They are equal","Cannot be compared at all"],"a":1,"e":"Y's 70 tokens/s carries as much text as about 93 of X's tokens per second."}
+]</script>
+
+<h2 id="summary">14. Summary</h2>
+<ul>
+  <li>Tokenizers split text into subword tokens; BPE builds the vocabulary by merging frequent pairs, starting from bytes.</li>
+  <li>Token counts differ by tokenizer, language, code style and numbers. Always count with the model's own tokenizer.</li>
+  <li>Vocabulary size trades a bigger embedding table and output head against shorter sequences.</li>
+  <li>Chat templates and special tokens turn messages into one sequence; a wrong template breaks quality and stopping.</li>
+  <li>Servers tokenize on the CPU and detokenize incrementally for streaming.</li>
+  <li>Embedding is a row lookup: [B, T] IDs become [B, T, D] vectors. Position is not in it yet.</li>
+</ul>
+
+<h2 id="refs">15. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 2.2</td><td>Tokenization and embeddings in the inference pipeline.</td></tr>
+<tr><td><a href="https://karpathy.ai/zero-to-hero.html">Andrej Karpathy: Let's build the GPT Tokenizer</a> (Zero to Hero series)</td><td>A full BPE tokenizer built live, with the many quirks real tokenizers have.</td></tr>
+<tr><td>Sebastian Raschka, <em>Build a Large Language Model (From Scratch)</em>, chapter 2</td><td>Tokenizing text, special tokens, BPE with tiktoken, token embeddings and positional embeddings in code.</td></tr>
+<tr><td>Jay Alammar and Maarten Grootendorst, <em>Hands-On Large Language Models</em>, chapter 2</td><td>A side-by-side comparison of real tokenizers (BERT, GPT-2, Flan-T5, GPT-4, StarCoder and others) and their special tokens.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, days 02 and 03</td><td>Runnable notebooks: inside a model file, BPE from scratch, embeddings.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/1508.07909">Sennrich et al., Neural Machine Translation of Rare Words with Subword Units</a></td><td>The paper that brought BPE to neural language models; the toy corpus in the widget comes from it.</td></tr>
+<tr><td><a href="https://huggingface.co/docs/transformers/main/en/chat_templating">Hugging Face: Chat templates</a></td><td>How templates are stored and applied, and common pitfalls.</td></tr>
+<tr><td><a href="https://github.com/openai/tiktoken">tiktoken</a> and <a href="https://github.com/huggingface/tokenizers">Hugging Face tokenizers</a></td><td>The fast tokenizer libraries used in the lab.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The day 02 notebook text of <em>100 Days of Inference</em> gives GPT-2's split as about 41% MLP, 30% attention and 28% embeddings. Counting the real weights gives about 45.5%, 22.8% and 31.6%. Lab Part E lets you check this yourself.</li>
+</ul>
+<p class="note">Facts checked on 6 November 2026. Token counts measured with transformers and tiktoken on that date.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+/* BPE */
+let W={},merges=[];
+function bpeInit(){W={};merges=[];$('bpeC').value.split(',').forEach(p=>{const [w,c]=p.split(':');W[[...w,'_'].join(' ')]=+c;});bpeDraw();}
+function pairs(){const pc=new Map();for(const [w,c] of Object.entries(W)){const t=w.split(' ');for(let i=0;i<t.length-1;i++){const k=t[i]+'\u0001'+t[i+1];pc.set(k,(pc.get(k)||0)+c);}}return pc;}
+function step(){const pc=pairs();if(!pc.size)return false;let best=null,bv=-1;for(const [k,v] of pc){if(v>bv){bv=v;best=k;}}const [a,b]=best.split('\u0001');merges.push([a,b,bv]);
+  const N={};for(const [w,c] of Object.entries(W)){const t=w.split(' '),o=[];for(let i=0;i<t.length;i++){if(i<t.length-1&&t[i]===a&&t[i+1]===b){o.push(a+b);i++;}else o.push(t[i]);}N[o.join(' ')]=c;}W=N;return true;}
+function vocab(){const s=new Set();Object.keys(W).forEach(w=>w.split(' ').forEach(t=>s.add(t)));return s;}
+function bpeDraw(){
+  const pc=pairs();const top=[...pc].sort((x,y)=>y[1]-x[1]).slice(0,5);
+  const base=new Set();$('bpeC').value.split(',').forEach(p=>[...p.split(':')[0],'_'].forEach(ch=>base.add(ch)));
+  const words=Object.entries(W).map(([w,c])=>`<div style="margin:4px 0"><span class="mono" style="color:var(--ink2)">×${c}</span> ${w.split(' ').map(t=>`<span class="pill" style="background:${t.length>1?'var(--kv-s)':'var(--panel2)'};border-color:${t.length>1?'var(--kv)':'var(--line)'}">${t}</span>`).join(' ')}</div>`).join('');
+  const ml=merges.length?merges.map((m,i)=>`<span class="pill">${i+1}. ${m[0]} + ${m[1]} → ${m[0]+m[1]} (${m[2]})</span>`).join(' '):'<span class="note">No merges yet.</span>';
+  const nx=top.length?top.map(([k,v])=>`${k.replace('\u0001',' + ')}: ${v}`).join(' · '):'none (every word is one token)';
+  $('bpeOut').innerHTML=`<div class="grid2"><div><div class="k" style="font-family:var(--f-disp);font-size:13px;color:var(--ink2)">Corpus as tokens</div>${words}</div><div><div style="font-family:var(--f-disp);font-size:13px;color:var(--ink2)">Merges so far</div><div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">${ml}</div><div style="font-family:var(--f-disp);font-size:13px;color:var(--ink2);margin-top:12px">Most frequent pairs now</div><div class="mono" style="font-size:13px">${nx}</div></div></div>`;
+  const tot=Object.entries(W).reduce((a,[w,c])=>a+w.split(' ').length*c,0);
+  $('bpeStats').innerHTML=[['Merges',merges.length],['Vocabulary (base + merges)',base.size+merges.length],['Tokens to encode corpus',tot]].map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');}
+$('bpeStep').onclick=()=>{step();bpeDraw();};$('bpeAll').onclick=()=>{for(let i=0;i<10;i++)if(!step())break;bpeDraw();};$('bpeReset').onclick=bpeInit;$('bpeC').onchange=bpeInit;bpeInit();
+/* vocab cost */
+const VS=[32000,50257,100277,128256,151936,262144];
+function vs(){const [D,body]=$('vsM').value.split(',').map(Number);const V=VS[+$('vsV').value];$('vsVv').textContent=V.toLocaleString('en-US');const tied=$('vsT').checked;
+  const emb=V*D,head=tied?0:V*D,total=body*1e9+emb+head;const headFl=2*V*D,totalFl=2*(body*1e9+V*D);
+  $('vsStats').innerHTML=[['Embedding params',(emb/1e6).toFixed(0)+' M'],['Output head params',tied?'shared':(head/1e6).toFixed(0)+' M'],['Vocab share of all params',((emb+head)/total*100).toFixed(1)+'%'],['Output head share of FLOPs/token',(headFl/totalFl*100).toFixed(1)+'%']].map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');}
+['vsM','vsV','vsT'].forEach(id=>$(id).addEventListener('input',vs));vs();
+/* embedding lookup */
+const VOC=['the','cat','sat','on','mat','dog','ran','a'];
+const E=VOC.map((w,i)=>[...Array(6)].map((_,j)=>Math.round(Math.sin((i+1)*(j+2)*1.7)*90)/100));
+function em(){const s=$('emSvg');s.innerHTML='';const words=$('emIn').value.toLowerCase().split(/\s+/).filter(Boolean);const ids=words.map(w=>VOC.indexOf(w));
+  const cw=44,ch=24,tx=20,ty=30;
+  el('text',{x:tx,y:20,'font-size':12,fill:css('--ink2')},s,'Embedding table E [8, 6]');
+  VOC.forEach((w,i)=>{const used=ids.includes(i);el('text',{x:tx,y:ty+i*ch+16,'font-size':11,fill:css(used?'--ink':'--mute')},s,`${i} ${w}`);
+    E[i].forEach((v,j)=>{el('rect',{x:tx+60+j*cw,y:ty+i*ch,width:cw-3,height:ch-3,rx:3,fill:used?css('--kv-s'):css('--panel2'),stroke:css(used?'--kv':'--line')},s);el('text',{x:tx+60+j*cw+(cw-3)/2,y:ty+i*ch+15,'text-anchor':'middle','font-size':10,fill:css('--ink')},s,v.toFixed(2));});});
+  const ox=400;el('text',{x:ox,y:20,'font-size':12,fill:css('--ink2')},s,`Output [${ids.length}, 6]`);
+  ids.slice(0,9).forEach((id,r)=>{el('text',{x:ox,y:ty+r*ch+16,'font-size':11,fill:css(id<0?'--bad':'--ink')},s,id<0?`? ${words[r]}`:`${id} ${VOC[id]}`);
+    if(id>=0){E[id].forEach((v,j)=>{el('rect',{x:ox+60+j*38,y:ty+r*ch,width:35,height:ch-3,rx:3,fill:css('--pre-s'),stroke:css('--pre')},s);el('text',{x:ox+60+j*38+17,y:ty+r*ch+15,'text-anchor':'middle','font-size':9,fill:css('--ink')},s,v.toFixed(2));});
+      el('line',{x1:tx+60+6*cw,y1:ty+id*ch+10,x2:ox-4,y2:ty+r*ch+10,stroke:css('--kv'),opacity:0.35},s);}});
+  const unk=words.filter(w=>!VOC.includes(w));const dup=words.length!==new Set(words).size;
+  $('emMsg').textContent=(unk.length?`Not in this tiny vocabulary: ${unk.join(', ')}. A real byte-level tokenizer would split them into smaller tokens instead. `:'')+(dup?'A repeated word gets the identical row both times: the embedding does not know position.':'');}
+$('emIn').addEventListener('input',em);IE.onTheme(em);
+})();
+</script>
+
+</body>
+</html>
