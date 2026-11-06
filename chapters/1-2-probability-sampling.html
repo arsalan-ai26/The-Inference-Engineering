@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>1.2 Probability and sampling</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="1.2">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 1 · Chapter 1.2</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 1 · Foundations · Chapter 1.2</div>
+<h1>Probability and sampling</h1>
+<p class="lede">A model does not output a word. It outputs a score for every token in its vocabulary. A small piece of code then picks one token from those scores. That code, the sampler, decides whether a reply is creative or repetitive, and whether two runs give the same text. This chapter shows exactly how it works.</p>
+<div class="meta">
+  <span class="chip">Level: beginner</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 1.1 vectors</span>
+  <span class="chip">Compute: Colab CPU, T4 optional</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Logits are [2, 1, 0]. What are the softmax probabilities?</li>
+    <li>Probabilities are [0.5, 0.3, 0.1, 0.1]. Which tokens can top-p = 0.75 pick?</li>
+    <li>Why can temperature 0 still give different outputs on a busy server?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>[0.665, 0.245, 0.090].</li>
+    <li>The first two. 0.5 alone is below 0.75; 0.5 + 0.3 = 0.8 reaches it.</li>
+    <li>The numbers inside the model can change slightly with the batch size, because the GPU adds them in a different order. A tiny change can flip which token is largest.</li>
+  </ol></details>
+</div>
+
+<h2 id="logits">1. From the model to a list of scores</h2>
+<p>The last layer of an LLM is a matmul (chapter 1.1) from the hidden size to the vocabulary size. For Llama 3.1 8B that is [4096] → [128256]. The output is one number per token in the vocabulary.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Vocabulary:</strong> the full list of tokens the model knows. Chapter 2.1 explains how text becomes tokens.</p>
+  <p><strong>Logit:</strong> the raw score the model gives one token. It can be any real number. A higher logit means "more likely next".</p>
+  <p><strong>Probability distribution:</strong> a list of non-negative numbers that add up to 1. Each number is the chance of one outcome.</p>
+</div>
+<p>Logits are not probabilities. They can be negative, and they do not add up to 1. We need a function that turns them into a distribution but keeps their order.</p>
+
+<h2 id="softmax">2. Softmax: scores to probabilities</h2>
+<p>Softmax does two steps:</p>
+<ol>
+  <li>Apply the exponential function to each logit: eᶻ. This makes every value positive, and it makes big logits much bigger than small ones.</li>
+  <li>Divide each result by the sum of all results. Now they add up to 1.</li>
+</ol>
+<div class="formula">pᵢ = e^(zᵢ) ÷ Σⱼ e^(zⱼ)</div>
+<div class="box ex">
+  <span class="lbl">Worked example</span>
+  <p>Logits [2, 1, 0]. Exponentials: e² = 7.389, e¹ = 2.718, e⁰ = 1. Sum = 11.107.</p>
+  <p>Probabilities: 7.389 ÷ 11.107 = 0.665, 2.718 ÷ 11.107 = 0.245, 1 ÷ 11.107 = 0.090.</p>
+  <p>A gap of 1 in logits means a ratio of e ≈ 2.72 in probability. A gap of 5 means a ratio of about 148. This is why the top few tokens usually hold almost all the probability.</p>
+</div>
+<p><strong>Only differences matter.</strong> Adding the same number to every logit does not change the result. Code uses this to avoid overflow: it subtracts the largest logit first, so the biggest exponent is e⁰ = 1. Every real softmax implementation does this.</p>
+<p>The <strong>log-probability</strong> (logprob) of a token is the natural log of its probability. Logprobs are always 0 or negative. APIs can return them, and evaluation code adds them up, because adding logs is safer than multiplying many small probabilities.</p>
+
+<h2 id="strategies">3. Choosing a token: greedy, beam and sampling</h2>
+<p>With a distribution in hand, the generator must pick one token. Then it appends that token and runs the model again (the loop in chapter 2.4). Three families of strategy exist.</p>
+<div class="tbl"><table>
+<tr><th>Strategy</th><th>What it does</th><th>Good for</th><th>Problem</th></tr>
+<tr><td>Greedy</td><td>Always pick the highest-probability token</td><td>Short factual answers, tests, extraction</td><td>Often loops and repeats itself in long text</td></tr>
+<tr><td>Beam search</td><td>Keep the best N partial sequences, extend each, keep the best N again</td><td>Translation, summarization with fixed length</td><td>N times the compute; text is often bland; rarely used for chat</td></tr>
+<tr><td>Sampling</td><td>Draw a token at random, with each token's chance equal to its probability</td><td>Chat, creative writing, almost all assistant use</td><td>Can pick a strange low-probability token unless you filter</td></tr>
+</table></div>
+<p>Sampling is the default for chat models. The rest of this chapter is about controlling it with four knobs: temperature, top-k, top-p and min-p.</p>
+
+<h2 id="temperature">4. Temperature: sharpen or flatten</h2>
+<p>Temperature T divides every logit before the softmax:</p>
+<div class="formula">pᵢ = softmax(z / T)ᵢ</div>
+<ul>
+  <li><strong>T = 1:</strong> no change. You sample from the model's own distribution.</li>
+  <li><strong>T &lt; 1:</strong> gaps between logits grow, so the top token gets more probability. Output becomes more predictable.</li>
+  <li><strong>T &gt; 1:</strong> gaps shrink, so the distribution flattens. Output becomes more varied, and at high T it becomes nonsense.</li>
+  <li><strong>T → 0:</strong> the top token gets all the probability. This is greedy decoding. APIs treat temperature 0 as greedy, because dividing by zero is not defined.</li>
+</ul>
+<p>Analogy: the logits are the heights of hills. Low temperature is like cold weather: everything freezes into the deepest valley. High temperature shakes the landscape so a ball can land anywhere.</p>
+
+<h2 id="filters">5. Truncation filters: top-k, top-p, min-p</h2>
+<p>Even at T = 1, the long tail of the vocabulary holds real probability. With 128,000 tokens, many tiny chances add up, and one bad pick can derail a reply. Filters cut the tail, then renormalize the survivors so they add up to 1 again.</p>
+<div class="tbl"><table>
+<tr><th>Filter</th><th>Rule</th><th>Weakness</th></tr>
+<tr><td>Top-k</td><td>Keep the k highest-probability tokens</td><td>k is fixed. When the model is sure, k = 50 still keeps 49 bad options. When it is unsure, 50 may be too few.</td></tr>
+<tr><td>Top-p (nucleus)</td><td>Sort by probability. Keep the smallest set whose probabilities add up to at least p</td><td>Adapts to confidence, but at high temperature the flat distribution lets many weak tokens in.</td></tr>
+<tr><td>Min-p</td><td>Keep tokens whose probability is at least p × (probability of the top token)</td><td>Newer; not available in every API.</td></tr>
+</table></div>
+<p>Top-p adapts to the shape of the distribution. If the model is confident (top token 0.95), top-p 0.9 keeps one token. If it is unsure, it keeps many. Min-p also adapts, by tying the cut-off to the top token's probability.</p>
+<div class="box watch">
+  <span class="lbl">Watch out: order matters</span>
+  <p>Libraries apply temperature, filters and penalties in a fixed order, and that order is not the same in every library. The same settings on two engines can give different distributions. When you compare engines, compare their sampling code too.</p>
+</div>
+
+<div class="widget" id="smpW">
+  <div class="wt">Interactive: the sampler, step by step</div>
+  <div class="ws">Prompt: "The cat sat on the". These eight logits are illustrative, not from a real model. Light bars are the original probabilities at T = 1. Solid bars are what the sampler actually uses. Grey means removed.</div>
+  <div class="ctrls">
+    <label>Temperature: <span class="mono" id="sTv"></span><input type="range" id="sT" min="0.05" max="2.5" step="0.05" value="1"></label>
+    <label>Top-k: <span class="mono" id="sKv"></span><input type="range" id="sK" min="1" max="8" step="1" value="8"></label>
+    <label>Top-p: <span class="mono" id="sPv"></span><input type="range" id="sP" min="0.05" max="1" step="0.01" value="1"></label>
+    <label>Min-p: <span class="mono" id="sMv"></span><input type="range" id="sM" min="0" max="0.6" step="0.01" value="0"></label>
+    <button class="pri" id="sDraw">Sample 500 times</button>
+    <button id="sReset">Reset</button>
+  </div>
+  <div class="svgwrap"><svg id="sSvg" viewBox="0 0 680 300" width="680" style="max-width:100%;height:auto" role="img" aria-label="Bar chart of token probabilities before and after the sampler"></svg></div>
+  <div class="stats" id="sStats"></div>
+</div>
+<div class="box try">
+  <span class="lbl">Try it</span>
+  <ol>
+    <li>Set T = 2. Count the tokens with more than 5% probability. Now add top-p = 0.8. How many remain?</li>
+    <li>With T = 1, find the smallest top-p that still allows "sofa".</li>
+    <li>Set min-p = 0.3. Raise T to 2. Does the number of kept tokens grow less than with top-p alone?</li>
+  </ol>
+</div>
+
+<h2 id="penalties">6. Penalties, biases and stop rules</h2>
+<p>A sampler has more controls than the four above. You will meet these in every API and engine:</p>
+<ul>
+  <li><strong>Repetition penalty:</strong> divides the positive logits (and multiplies the negative ones) of tokens that already appeared, by a factor such as 1.1. Values above 1 discourage repeats.</li>
+  <li><strong>Presence penalty:</strong> subtracts a fixed amount from the logit of any token that has appeared at least once.</li>
+  <li><strong>Frequency penalty:</strong> subtracts an amount for each time a token has appeared, so frequent tokens get pushed down more.</li>
+  <li><strong>Logit bias:</strong> adds a chosen value to specific tokens. A large negative value bans a token. Structured output (chapter 3.5) extends this idea: it masks every token that would break a JSON schema.</li>
+  <li><strong>Stop conditions:</strong> generation ends at the end-of-sequence (EOS) token, at a stop string, or at <code>max_tokens</code>.</li>
+  <li><strong>Seed:</strong> the start value of the random number generator. With the same seed, the same model and the same numbers, sampling picks the same tokens.</li>
+  <li><strong>n:</strong> the number of separate completions for one prompt. The prompt is processed once and shared (chapter 3.3 shows how).</li>
+</ul>
+
+<h2 id="determinism">7. Why the same prompt can give different answers</h2>
+<p>Sampling is random by design, so different outputs at T &gt; 0 are normal. The surprise is temperature 0. Many people see different outputs at T = 0 on a hosted API. The cause is not the sampler.</p>
+<p>GPU floating-point addition is not perfectly associative: (a + b) + c can differ from a + (b + c) in the last bit. A matmul or normalization kernel can choose a different way to split and add its sums depending on the batch size. The batch size on a server depends on how many other users send requests at the same moment. So the logits of your request can change slightly with server load. If two top tokens are almost tied, the argmax can flip, and from that token on the text is different.</p>
+<p>The fix is to make every kernel "batch-invariant": it must add numbers in the same order whatever the batch size. This is possible but costs some speed. Some engines now offer it as an option for work such as reinforcement learning, where exact repeats matter.</p>
+
+<h2 id="cost">8. What sampling costs</h2>
+<p>Sampling runs once per generated token, for every sequence in the batch. Its cost is small next to the model, but not zero:</p>
+<ul>
+  <li>The output head matmul (hidden size × vocabulary size) is one of the largest single matmuls in the model. For Llama 3.1 8B it is 0.53 B parameters, about 6.5% of the model.</li>
+  <li>Softmax over 128,256 values is cheap. Top-p and top-k usually need the tokens in sorted order, and sorting 128,256 values per sequence per step takes real time at large batch.</li>
+  <li>Each request in a batch can have different settings. Engines apply all of them in one batched GPU operation.</li>
+</ul>
+
+<h2 id="expert">9. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Sorting-free sampling kernels</span>
+  <p>Sorting the vocabulary for top-p is slow on a GPU. Some kernel libraries avoid it with rejection sampling: draw a candidate, test it against a threshold, and repeat with an updated threshold until a candidate passes. The result has the same distribution as sort-then-sample, with much less work at large batch.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">The Gumbel-max trick</span>
+  <p>Adding independent Gumbel noise to each logit and taking the argmax gives an exact sample from the softmax distribution. This turns sampling into "add noise, then take a max", which is easy to run in parallel.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Sampling and speculative decoding</span>
+  <p>Speculative decoding (chapter 4.3) lets a small model guess several tokens, and the large model checks them. A careful accept-or-reject rule makes the final output follow exactly the large model's sampling distribution. So you can speed up decoding without changing the output distribution.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Reasoning models and long outputs</span>
+  <p>Model makers often publish recommended sampling settings for each model, for example a specific temperature and top-p for "thinking" mode. Greedy decoding on some reasoning models leads to endless loops. Always read the model card before you choose settings.</p>
+</div>
+
+<h2 id="mistakes">10. Common mistakes</h2>
+<ul>
+  <li>Thinking logits are probabilities. Apply softmax first.</li>
+  <li>Applying softmax without subtracting the max logit. Large logits overflow to infinity.</li>
+  <li>Expecting temperature 0 to be exactly repeatable on a shared server.</li>
+  <li>Setting both a low top-p and a low temperature, then wondering why output is repetitive. Each one already narrows the choice.</li>
+  <li>Forgetting to renormalize after a filter. The kept probabilities must add up to 1.</li>
+  <li>Comparing two engines with the "same" settings when their filter order or defaults differ.</li>
+</ul>
+
+<h2 id="lab">11. Lab</h2>
+<p><strong>Goal:</strong> write the full sampler yourself, then watch the settings change a real model's output.</p>
+<p><strong>Rule for Part A:</strong> write it yourself. Do not ask an AI. The solution is hidden below if you are stuck.</p>
+<h3>Part A: softmax and a top-p sampler in NumPy</h3>
+<pre>import numpy as np
+rng = np.random.default_rng(0)
+
+def softmax(z, T=1.0):
+    # TODO: divide by T, subtract the max, exponentiate, normalize
+    ...
+
+def top_p_filter(p, top_p):
+    # TODO: keep the smallest set of tokens whose probabilities sum to >= top_p,
+    # set the rest to 0, and renormalize. Return the new probabilities.
+    ...
+
+def sample(z, T=1.0, top_p=1.0):
+    if T == 0:
+        return int(np.argmax(z))
+    p = top_p_filter(softmax(z, T), top_p)
+    return int(rng.choice(len(p), p=p))
+
+z = np.array([3.2, 2.6, 2.3, 1.9, 1.5, 0.6, -0.5, -1.4])
+print(np.round(softmax(z), 3))               # check: sums to 1
+print(np.round(top_p_filter(softmax(z), 0.8), 3))</pre>
+<details><summary>Solution</summary>
+<pre>def softmax(z, T=1.0):
+    z = np.asarray(z, dtype=np.float64) / T
+    e = np.exp(z - z.max())
+    return e / e.sum()
+
+def top_p_filter(p, top_p):
+    order = np.argsort(-p)                      # largest first
+    csum = np.cumsum(p[order])
+    keep_n = int(np.searchsorted(csum, top_p) + 1)   # first index where csum >= top_p, plus 1
+    keep = order[:keep_n]
+    q = np.zeros_like(p); q[keep] = p[keep]
+    return q / q.sum()</pre>
+<p>Check: <code>softmax(z)</code> gives about [0.397, 0.218, 0.161, 0.108, 0.073, 0.029, 0.010, 0.004]. With top-p 0.8 the first four survive: the first three sum to 0.776, which is below 0.8, and adding the fourth gives 0.884.</p><p>Part B expected token-0 shares: about 0.83 at T = 0.3, 0.40 at T = 1 and 0.26 at T = 2.</p>
+</details>
+
+<h3>Part B: test three temperatures</h3>
+<p>Predict first: at T = 0.3, about what share of 10,000 samples will be token 0? At T = 1? At T = 2?</p>
+<pre>from collections import Counter
+for T in [0.3, 1.0, 2.0]:
+    c = Counter(sample(z, T) for _ in range(10_000))
+    p = softmax(z, T)
+    ent = -(p * np.log(p)).sum()
+    print(f"T={T}: token0 share={c[0]/1e4:.2f}  expected={p[0]:.2f}  entropy={ent:.2f} nats")</pre>
+<p><strong>Entropy</strong> measures how spread out a distribution is. 0 means one certain choice. ln(8) ≈ 2.08 is the most spread possible for 8 tokens. Watch it rise with T.</p>
+
+<h3>Part C: a real model</h3>
+<p>Use the GPU runtime if you have it; the CPU works but is slower.</p>
+<pre>import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(name)
+dev = "cuda" if torch.cuda.is_available() else "cpu"
+model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16 if dev == "cuda" else torch.float32).to(dev)
+
+msgs = [{"role": "user", "content": "Write one sentence about the ocean."}]
+ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt").to(dev)
+
+# 1. Look at the real next-token distribution
+with torch.no_grad():
+    logits = model(ids).logits[0, -1].float()
+p = torch.softmax(logits, -1)
+top = torch.topk(p, 10)
+for prob, i in zip(top.values, top.indices):
+    print(f"{prob.item():.3f}  {tok.decode(i)!r}")
+print("vocab size:", logits.shape[0])
+
+# 2. Generate with different settings
+for kw in [dict(do_sample=False),
+           dict(do_sample=True, temperature=0.7, top_p=0.9),
+           dict(do_sample=True, temperature=1.5, top_p=1.0, top_k=0)]:
+    for seed in [0, 1]:
+        torch.manual_seed(seed)
+        out = model.generate(ids, max_new_tokens=40, pad_token_id=tok.eos_token_id, **kw)
+        print(kw, seed, "|", tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True))</pre>
+<p>Questions to answer from your output:</p>
+<ol>
+  <li>How much probability do the top 10 tokens hold together?</li>
+  <li>Do the two seeds give the same text for greedy? For T = 0.7?</li>
+  <li>At T = 1.5 with no filter, at which word does the text start to break down?</li>
+</ol>
+
+<h3>Part D: see greedy repetition</h3>
+<pre>ids2 = tok("The best thing about the city is", return_tensors="pt").input_ids.to(dev)
+for kw in [dict(do_sample=False), dict(do_sample=False, repetition_penalty=1.3)]:
+    out = model.generate(ids2, max_new_tokens=120, pad_token_id=tok.eos_token_id, **kw)
+    print(kw, "\n", tok.decode(out[0]), "\n")</pre>
+<p>Base-style prompts (no chat template) often loop under greedy decoding. Find a repeated phrase in the first output. Check whether the penalty removes it, and whether it hurts the text in another way.</p>
+
+<h3>Part E: score text with logprobs</h3>
+<p>Sum of logprobs tells you how likely the model thinks a text is. <strong>Perplexity</strong> is e to the power of minus the mean logprob per token: lower means the text looks more "natural" to the model. Evaluation tools use it.</p>
+<pre>def perplexity(text):
+    x = tok(text, return_tensors="pt").input_ids.to(dev)
+    with torch.no_grad():
+        lp = torch.log_softmax(model(x).logits[0, :-1].float(), -1)
+    tok_lp = lp.gather(1, x[0, 1:, None]).squeeze(1)   # logprob of each actual next token
+    return torch.exp(-tok_lp.mean()).item()
+
+print(perplexity("The capital of France is Paris."))
+print(perplexity("The capital of France is banana."))</pre>
+<p>Predict which is lower before you run it.</p>
+
+<h2 id="realworld">12. In the real world</h2>
+<div class="box real">
+  <span class="lbl">How production systems use this</span>
+  <ul>
+    <li><strong>APIs:</strong> OpenAI-compatible servers (including vLLM and SGLang) accept <code>temperature</code>, <code>top_p</code>, <code>max_tokens</code>, <code>stop</code>, <code>seed</code>, <code>n</code>, <code>logprobs</code>, presence and frequency penalties. vLLM also accepts <code>top_k</code>, <code>min_p</code> and <code>repetition_penalty</code>.</li>
+    <li><strong>Product defaults:</strong> extraction and classification use temperature 0 or near it. Chat often uses about 0.7 with top-p about 0.9. Many model cards publish their own recommended values; use them.</li>
+    <li><strong>Evaluation:</strong> benchmarks that need repeatable scores use greedy decoding, or sample many times and report the average.</li>
+    <li><strong>Confidence signals:</strong> logprobs of the chosen tokens give a cheap confidence score for classification and routing.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">13. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz12"></div>
+<script type="application/json" id="qz12">[
+{"q":"Logits [5, 5, 5]. What are the softmax probabilities?","o":["[1, 1, 1]","[1/3, 1/3, 1/3]","[5/15, 5/15, 5/15] only if T = 1","Undefined"],"a":1,"e":"Equal logits give equal probabilities at any temperature. Only differences between logits matter."},
+{"q":"You add 100 to every logit. The probabilities:","o":["All rise","Stay the same","All fall","Overflow to infinity in any correct implementation"],"a":1,"e":"Softmax depends only on differences. Good implementations subtract the max, so no overflow."},
+{"q":"Temperature 0.5 compared with temperature 1.0:","o":["Flattens the distribution","Sharpens the distribution","Has no effect on the top token","Removes tokens"],"a":1,"e":"Dividing logits by 0.5 doubles the gaps between them, so the top tokens gain probability."},
+{"q":"Probabilities sorted are [0.6, 0.25, 0.1, 0.05]. Which tokens survive top-p = 0.9?","o":["Only the first","The first two","The first three","All four"],"a":2,"e":"0.6 + 0.25 = 0.85 is below 0.9. Adding 0.1 gives 0.95, which reaches it. Three tokens survive."},
+{"q":"Same probabilities, min-p = 0.3. Which survive?","o":["Tokens with p ≥ 0.3","Tokens with p ≥ 0.18","Only the first","All four"],"a":1,"e":"The cut-off is 0.3 × 0.6 = 0.18. The first two (0.6 and 0.25) survive."},
+{"q":"Why does top-p adapt better than top-k?","o":["It is faster","It keeps fewer tokens when the model is confident and more when it is unsure","It never changes the output","It does not need sorting"],"a":1,"e":"Top-k keeps a fixed count. Top-p keeps a fixed share of probability mass, so the count follows the model's confidence."},
+{"q":"The most likely cause of different outputs at temperature 0 on a busy API is:","o":["A hidden random seed","Batch-size-dependent floating-point sums inside kernels","The tokenizer","Top-p is still active"],"a":1,"e":"Kernels may add numbers in a different order at different batch sizes. Tiny logit changes can flip a near-tied argmax."},
+{"q":"Which statement about beam search is true for chat models?","o":["It is the standard default","It costs about N times the compute and tends to give bland text","It always gives more creative text","It removes the need for a KV cache"],"a":1,"e":"Beam search tracks N sequences. It suits fixed tasks such as translation, not open chat."}
+]</script>
+
+<h2 id="summary">14. Summary</h2>
+<ul>
+  <li>The model outputs one logit per vocabulary token. Softmax turns logits into probabilities; only differences between logits matter.</li>
+  <li>Greedy picks the top token. Sampling draws at random by probability. Beam search keeps several candidate sequences.</li>
+  <li>Temperature divides logits: low T sharpens, high T flattens, T = 0 means greedy.</li>
+  <li>Top-k keeps a fixed number of tokens; top-p keeps a fixed probability mass; min-p keeps tokens above a share of the top token's probability. Then renormalize.</li>
+  <li>Penalties, logit bias and stop rules give more control. Structured output masks tokens.</li>
+  <li>Temperature 0 is not always repeatable on servers, because kernel sums can depend on batch size.</li>
+</ul>
+
+<h2 id="refs">15. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://huggingface.co/blog/how-to-generate">Hugging Face: How to generate text</a></td><td>Greedy, beam search, top-k and top-p with clear examples and code. The core reading.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 2.2.1</td><td>Logits, normalization, the three main knobs and logit biasing for structured output.</td></tr>
+<tr><td>Sebastian Raschka, <em>Build a Large Language Model (From Scratch)</em>, section 5.3</td><td>Temperature scaling and top-k implemented from scratch in PyTorch, with plots.</td></tr>
+<tr><td>Chi Wang and Peiheng Hu, <em>Hands-On LLM Serving and Optimization</em>, chapter 2</td><td>How serving engines expose sampling parameters (vLLM <code>SamplingParams</code> examples).</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/api/vllm/sampling_params.html">vLLM SamplingParams reference</a></td><td>The full list of sampler controls in a production engine: min_p, penalties, logit_bias, seed, n, logprobs.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2407.01082">Nguyen et al., Min-p sampling</a></td><td>The paper behind min-p and its behaviour at high temperature.</td></tr>
+<tr><td><a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">Thinking Machines: Defeating Nondeterminism in LLM Inference</a></td><td>Why temperature 0 is not repeatable on servers, and batch-invariant kernels as the fix.</td></tr>
+<tr><td><a href="https://flashinfer.ai/2025/03/10/sampling.html">FlashInfer: Sorting-free GPU kernels for LLM sampling</a></td><td>Rejection-sampling kernels for top-k and top-p at scale.</td></tr>
+</table></div>
+<p class="note">Facts checked on 6 November 2026.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+const TOK=['mat','floor','sofa','bed','chair','roof','moon','banana'];
+const Z=[3.2,2.6,2.3,1.9,1.5,0.6,-0.5,-1.4];
+let hist=null;
+const sm=(z,T)=>{const a=z.map(v=>v/T),m=Math.max(...a),e=a.map(v=>Math.exp(v-m)),s=e.reduce((x,y)=>x+y,0);return e.map(v=>v/s);};
+function pipe(){
+  const T=+$('sT').value,K=+$('sK').value,P=+$('sP').value,MP=+$('sM').value;
+  $('sTv').textContent=T.toFixed(2);$('sKv').textContent=K===8?'off (8)':K;$('sPv').textContent=P.toFixed(2);$('sMv').textContent=MP.toFixed(2);
+  const p=sm(Z,T); const order=p.map((v,i)=>i).sort((a,b)=>p[b]-p[a]);
+  const keep=new Set(order.slice(0,K));
+  let cs=0; const kp=new Set(); for(const i of order){if(!keep.has(i))continue;kp.add(i);cs+=p[i];if(cs>=P-1e-12)break;}
+  const top=p[order[0]]; const fin=new Set([...kp].filter(i=>p[i]>=MP*top));
+  const s=[...fin].reduce((a,i)=>a+p[i],0); const q=p.map((v,i)=>fin.has(i)?v/s:0);
+  return {p,q,fin,T};
+}
+function draw(){
+  const {p,q,fin}=pipe(); const p1=sm(Z,1);
+  const svg=$('sSvg');svg.innerHTML='';const W=680,H=300,l=46,b=40,t=14,bw=(W-l-20)/8;
+  const Y=v=>H-b-v*(H-t-b);
+  for(let i=0;i<=4;i++){const v=i/4;el('line',{x1:l,x2:W-20,y1:Y(v),y2:Y(v),class:'axis'},svg);el('text',{x:l-6,y:Y(v)+4,'text-anchor':'end',class:'tick'},svg,v.toFixed(2));}
+  TOK.forEach((n,i)=>{const x=l+i*bw;
+    el('rect',{x:x+bw*0.12,y:Y(p1[i]),width:bw*0.76,height:H-b-Y(p1[i]),fill:css('--panel2'),stroke:css('--line')},svg);
+    const on=fin.has(i);
+    el('rect',{x:x+bw*0.28,y:Y(q[i]),width:bw*0.44,height:Math.max(0,H-b-Y(q[i])),fill:on?css('--dec'):css('--mute')},svg);
+    if(hist){el('circle',{cx:x+bw/2,cy:Y(hist[i]),r:5,fill:css('--kv'),stroke:css('--panel'),'stroke-width':1.5},svg);}
+    el('text',{x:x+bw/2,y:H-b+16,'text-anchor':'middle',class:'tick',fill:on?css('--ink'):css('--mute')},svg,n);
+    el('text',{x:x+bw/2,y:H-b+30,'text-anchor':'middle',class:'tick'},svg,'z='+Z[i]);
+    if(q[i]>0.004)el('text',{x:x+bw/2,y:Y(q[i])-5,'text-anchor':'middle',class:'tick',fill:css('--ink')},svg,(q[i]*100).toFixed(0)+'%');
+  });
+  const ent=-q.reduce((a,v)=>a+(v>0?v*Math.log(v):0),0);
+  $('sStats').innerHTML=[['Tokens kept',fin.size+' of 8'],['Top token chance',(Math.max(...q)*100).toFixed(1)+'%'],['Entropy',ent.toFixed(2)+' <small>nats</small>'],['Teal dots',hist?'share in 500 samples':'press Sample']]
+   .map(r=>`<div class="stat"><div class="k">${r[0]}</div><div class="v">${r[1]}</div></div>`).join('');
+}
+$('sDraw').onclick=()=>{const {q}=pipe();const c=new Array(8).fill(0);for(let n=0;n<500;n++){let r=Math.random(),i=0;while(i<7&&r>q[i]){r-=q[i];i++;}while(q[i]===0&&i>0)i--;c[i]++;}hist=c.map(v=>v/500);draw();};
+$('sReset').onclick=()=>{$('sT').value=1;$('sK').value=8;$('sP').value=1;$('sM').value=0;hist=null;draw();};
+['sT','sK','sP','sM'].forEach(id=>$(id).addEventListener('input',()=>{hist=null;draw();}));
+IE.onTheme(draw);
+})();
+</script>
+
+</body>
+</html>

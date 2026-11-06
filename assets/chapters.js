@@ -11,7 +11,7 @@ window.IE_CHAPTERS = [
 "title": "Probability and sampling",
 "slug": "1-2-probability-sampling",
 "part": 1,
-"ready": false
+"ready": true
 },
 {
 "n": "1.3",
