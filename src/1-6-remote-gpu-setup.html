@@ -1,0 +1,369 @@
+<div class="kicker">Part 1 · Foundations · Chapter 1.6</div>
+<h1>Remote GPU machines and a reproducible setup</h1>
+<p class="lede">Real inference work happens on GPUs you rent by the hour and reach over SSH. This chapter teaches the practical skills: get a machine, connect to it safely, check that the driver, CUDA and PyTorch fit together, serve a model over HTTP, watch the GPU while it works, and record the setup so you can rebuild it exactly.</p>
+<div class="meta">
+  <span class="chip">Level: beginner</span>
+  <span class="chip">Time: 3 hours, plus about 1 hour of rented GPU time</span>
+  <span class="chip">Needs: a terminal and basic shell commands</span>
+  <span class="chip">Compute: free Colab or Kaggle first, then optional paid GPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li><code>nvidia-smi</code> says "CUDA Version: 12.4". Is the CUDA 12.4 toolkit installed?</li>
+    <li>How do you reach a web server on port 8000 of a remote GPU box from your laptop, without opening the port to the internet?</li>
+    <li>Name three things you must record so that someone else can rebuild your exact benchmark setup.</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Not necessarily. That line is the highest CUDA version the installed <em>driver</em> supports. The toolkit may be missing or a different version.</li>
+    <li>An SSH tunnel: <code>ssh -L 8000:localhost:8000 user@host</code>, then open <code>http://localhost:8000</code> on your laptop.</li>
+    <li>Any three of: GPU model and driver version, CUDA version of the PyTorch build, exact package versions, model name and revision, engine flags, container image digest.</li>
+  </ol></details>
+</div>
+
+<h2 id="where">1. Where to get a GPU</h2>
+<p>You need a GPU for most labs in this book. Start free. Rent only when a lab needs more memory or a newer GPU.</p>
+<div class="tbl"><table>
+<tr><th>Option</th><th>What you get</th><th>Good for</th><th>Limits</th></tr>
+<tr><td>Google Colab (free)</td><td>Usually an NVIDIA T4 (16 GB), in a notebook</td><td>Parts 1 to 3 labs with small models</td><td>Not guaranteed; usage limits change; sessions stop when idle</td></tr>
+<tr><td>Kaggle Notebooks (free)</td><td>T4 ×2 or P100, in a notebook</td><td>Longer runs; two GPUs for simple parallel tests</td><td>Weekly GPU quota shown in your account settings</td></tr>
+<tr><td>Rented cloud GPU</td><td>A full Linux machine with root and SSH: L4, A100, H100 and newer</td><td>Serving engines, benchmarks, FP8, multi-GPU</td><td>Costs per hour; you must shut it down</td></tr>
+<tr><td>Your own GPU</td><td>A consumer card (for example 24 GB) in a desktop</td><td>Local inference, llama.cpp, long experiments</td><td>Limited memory; no data-center features such as NVLink</td></tr>
+</table></div>
+<p>Rental providers fall into three groups. <strong>Marketplaces</strong> (for example Vast.ai) list machines from many hosts at low prices with variable quality. <strong>GPU clouds</strong> (for example RunPod, Lambda, Nebius, CoreWeave) offer standard machines by the hour. <strong>Serverless platforms</strong> (for example Modal, Baseten) run your code per request and bill per second. The book's <a href="../guides/compute.html">compute guide</a> lists providers with checked prices.</p>
+<div class="box watch">
+  <span class="lbl">Watch out: the meter keeps running</span>
+  <p>A rented GPU bills while it is on, even when it does nothing. Stop or delete the machine when you finish. Set a spending limit or an auto-shutdown if the provider offers one. Persistent disks may also bill after the machine stops.</p>
+</div>
+
+<h2 id="ssh">2. SSH: your connection to the machine</h2>
+<p>SSH (Secure Shell) opens an encrypted terminal on a remote machine. GPU providers almost always use <strong>key-based login</strong>: you keep a private key on your laptop, and you give the provider the matching public key.</p>
+<pre># 1. Make a key pair once (press Enter to accept the default path; set a passphrase)
+ssh-keygen -t ed25519 -C "gpu-work"
+# 2. Show the PUBLIC key; paste it into the provider's SSH key settings
+cat ~/.ssh/id_ed25519.pub
+# 3. Connect (the provider shows the user, host and port)
+ssh -p 22 ubuntu@203.0.113.10</pre>
+<p>Never share the private key (the file without <code>.pub</code>). Save each machine in <code>~/.ssh/config</code> so you can type a short name:</p>
+<pre>Host gpu
+    HostName 203.0.113.10
+    User ubuntu
+    Port 22
+    IdentityFile ~/.ssh/id_ed25519
+    LocalForward 8000 localhost:8000      # tunnel for the model server (section 5)</pre>
+<p>Now <code>ssh gpu</code> connects and opens the tunnel.</p>
+<h3>Three tools you will use every session</h3>
+<div class="tbl"><table>
+<tr><th>Task</th><th>Command</th><th>Why</th></tr>
+<tr><td>Keep jobs running if the connection drops</td><td><code>tmux new -s work</code>; detach with <kbd>Ctrl</kbd>+<kbd>b</kbd> then <kbd>d</kbd>; reattach with <code>tmux attach -t work</code></td><td>A dropped SSH session kills normal processes. tmux keeps them alive</td></tr>
+<tr><td>Reach a port on the remote machine</td><td><code>ssh -L 8000:localhost:8000 gpu</code></td><td>Safe access to a server without exposing it to the internet</td></tr>
+<tr><td>Copy files</td><td><code>scp results.csv gpu:~/</code> or <code>rsync -avP ./lab/ gpu:~/lab/</code></td><td>rsync resumes and copies only what changed</td></tr>
+</table></div>
+
+<h2 id="stack">3. The software stack: driver, CUDA, PyTorch</h2>
+<p>Four layers sit between your Python code and the GPU. Most setup failures come from a mismatch between them.</p>
+<div class="svgwrap"><svg viewBox="0 0 700 260" width="700" style="max-width:100%;height:auto" role="img" aria-label="Software stack from GPU hardware to Python code">
+  <g font-size="13">
+    <rect x="40" y="14" width="620" height="44" rx="8" fill="var(--panel2)" stroke="var(--line)"/><text x="60" y="42" fill="var(--ink)">4. Your code, vLLM, transformers</text><text x="640" y="42" text-anchor="end" fill="var(--ink2)">pip packages</text>
+    <rect x="40" y="70" width="620" height="44" rx="8" fill="var(--pre-s)" stroke="var(--pre)"/><text x="60" y="98" fill="var(--ink)">3. PyTorch wheel + its bundled CUDA runtime (for example cu128)</text><text x="640" y="98" text-anchor="end" fill="var(--ink2)">torch.version.cuda</text>
+    <rect x="40" y="126" width="620" height="44" rx="8" fill="var(--panel)" stroke="var(--line)" stroke-dasharray="5 4"/><text x="60" y="154" fill="var(--ink)">2. CUDA toolkit (nvcc compiler): optional for most inference work</text><text x="640" y="154" text-anchor="end" fill="var(--ink2)">nvcc --version</text>
+    <rect x="40" y="182" width="620" height="44" rx="8" fill="var(--dec-s)" stroke="var(--dec)"/><text x="60" y="210" fill="var(--ink)">1. NVIDIA driver (kernel module): installed on the host, not in pip</text><text x="640" y="210" text-anchor="end" fill="var(--ink2)">nvidia-smi</text>
+    <text x="350" y="252" text-anchor="middle" fill="var(--ink2)">GPU hardware, with a compute capability such as 7.5 (T4) or 9.0 (H100)</text>
+  </g>
+</svg></div>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Driver:</strong> the low-level software that talks to the GPU. It is installed on the machine by the provider. It sets the highest CUDA version you can use.</p>
+  <p><strong>CUDA runtime:</strong> the libraries that programs call to run work on the GPU. PyTorch wheels bundle their own copy, so you do not need to install CUDA separately to use PyTorch.</p>
+  <p><strong>CUDA toolkit:</strong> the compiler (<code>nvcc</code>) and headers. You need it only to compile CUDA code yourself, for example some custom kernels or packages built from source.</p>
+  <p><strong>Compute capability:</strong> a version number for the GPU's architecture. T4 is 7.5, A100 8.0, L4 8.9, H100 9.0, B200 10.0. Software must include code compiled for your GPU's capability.</p>
+</div>
+<h3>The two rules</h3>
+<ol>
+  <li><strong>Driver must be new enough for the CUDA runtime.</strong> The "CUDA Version" that <code>nvidia-smi</code> prints must be equal to or higher than <code>torch.version.cuda</code>. Within one major version (for example 12.x), CUDA's minor-version compatibility often lets a slightly newer runtime run on an older driver, but some features may fail. A newer major version (for example a 13.x build on a 12.x driver) does not work without NVIDIA's separate forward-compatibility package.</li>
+  <li><strong>The build must support your GPU.</strong> New GPUs need recent builds (Blackwell needs CUDA 12.8 or newer builds). New CUDA releases also drop old GPUs: CUDA 13 removed support for Maxwell, Pascal and Volta (compute capability below 7.5).</li>
+</ol>
+
+<div class="widget" id="vcW">
+  <div class="wt">Interactive: will this combination work?</div>
+  <div class="ws">Pick what <code>nvidia-smi</code> shows, the PyTorch build you plan to install and your GPU. The checker applies the two rules above. It is a guide, not a guarantee: always confirm with the test in section 4.</div>
+  <div class="ctrls">
+    <label>Driver supports up to (nvidia-smi) <select id="vcD"><option>11.8</option><option>12.2</option><option selected>12.4</option><option>12.8</option><option>13.0</option></select></label>
+    <label>PyTorch build (torch.version.cuda) <select id="vcT"><option>11.8</option><option>12.6</option><option selected>12.8</option><option>13.0</option></select></label>
+    <label>GPU <select id="vcG"><option value="7.0">V100 (7.0)</option><option value="7.5" selected>T4 (7.5)</option><option value="8.0">A100 (8.0)</option><option value="8.9">L4 / RTX 4090 (8.9)</option><option value="9.0">H100 (9.0)</option><option value="10.0">B200 (10.0)</option><option value="12.0">RTX 5090 (12.0)</option></select></label>
+  </div>
+  <div class="stats" id="vcStats"></div>
+  <p class="note" id="vcMsg"></p>
+</div>
+
+<h2 id="check">4. Check a new machine in five minutes</h2>
+<p>Run these on every new machine before you install anything else. Save the output; it is the first part of your setup record.</p>
+<pre>nvidia-smi                                   # GPU model, driver version, max CUDA, memory, processes
+nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv
+nvcc --version 2>/dev/null || echo "no CUDA toolkit (fine for most inference)"
+python3 --version
+df -h ~ ; free -g ; nproc                      # disk, RAM, CPU cores: models need disk space
+python3 -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0))"</pre>
+<p>Then prove that the GPU really computes, not just that PyTorch can see it:</p>
+<pre>python3 - &lt;&lt;'EOF'
+import torch, time
+x = torch.randn(8192, 8192, device="cuda", dtype=torch.float16)
+for _ in range(3): x @ x
+torch.cuda.synchronize(); t = time.perf_counter()
+for _ in range(10): x @ x
+torch.cuda.synchronize(); dt = (time.perf_counter() - t) / 10
+print(f"{2 * 8192**3 / dt / 1e12:.1f} TFLOP/s FP16")
+EOF</pre>
+<p>Compare with the GPU's data sheet (chapter 1.1, lab Part D). A result far below it points to a throttled, shared or misconfigured GPU.</p>
+
+<div class="box ex">
+  <span class="lbl">Reading nvidia-smi</span>
+<pre class="out">+-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 550.54.15              Driver Version: 550.54.15      CUDA Version: 12.4     |  (1)
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|=========================================+========================+======================|
+|   0  Tesla T4                       Off |   00000000:00:04.0 Off |                    0 |
+| N/A   45C    P0             27W /   70W |   10813MiB /  15360MiB |     38%      Default |  (2)(3)(4)
++-----------------------------------------+------------------------+----------------------+</pre>
+  <ol>
+    <li>Driver version, and the highest CUDA version it supports. Not the installed toolkit.</li>
+    <li>Power draw against the power limit. A GPU doing heavy math runs near its limit.</li>
+    <li>Memory used against total. A serving engine reserves most of the memory at startup on purpose (chapter 2.4), so a high number here is normal for vLLM.</li>
+    <li>GPU-Util: the share of time in the last sample period during which at least one kernel was running. It is <em>not</em> how busy the math units are. A GPU can show 100% while doing little useful work. Chapter 5.6 shows better measurements.</li>
+  </ol>
+  <p class="note">This output is an illustrative example of the layout, not a measurement.</p>
+</div>
+
+<h2 id="serve">5. Serve a model and stream tokens</h2>
+<p>An inference server loads a model once, then answers many HTTP requests. vLLM and SGLang both offer an <strong>OpenAI-compatible API</strong>: the same request format as OpenAI's API, so standard client libraries work. Chapter 3.1 explains what happens inside. Here you just run one.</p>
+<pre># On the GPU machine, inside tmux
+python3 -m venv ~/venv && source ~/venv/bin/activate
+pip install vllm                      # installs a matching torch build
+vllm serve Qwen/Qwen2.5-0.5B-Instruct --port 8000 --max-model-len 4096
+# On a T4 (no BF16 support), add:  --dtype half</pre>
+<p>When the log says the server is ready, send a streaming request from another terminal (or from your laptop through the SSH tunnel):</p>
+<pre>curl -N http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen2.5-0.5B-Instruct",
+       "messages": [{"role": "user", "content": "Explain a GPU in two sentences."}],
+       "max_tokens": 100, "stream": true}'</pre>
+<p>The reply arrives as <strong>server-sent events</strong>: lines that start with <code>data:</code>, each holding a small JSON piece with the next few characters. The stream ends with <code>data: [DONE]</code>. Streaming is how chat apps show text as it is generated. The time until the first piece is the TTFT you will meet in chapter 2.4.</p>
+<p>The same request in Python, with timing:</p>
+<pre>import time, json, requests
+t0 = time.perf_counter(); first = None; n = 0
+with requests.post("http://localhost:8000/v1/chat/completions", stream=True, json={
+        "model": "Qwen/Qwen2.5-0.5B-Instruct", "stream": True, "max_tokens": 200,
+        "messages": [{"role": "user", "content": "Write a short poem about GPUs."}]}) as r:
+    for line in r.iter_lines():
+        if not line.startswith(b"data: ") or line == b"data: [DONE]":
+            continue
+        delta = json.loads(line[6:])["choices"][0]["delta"].get("content", "")
+        if delta:
+            first = first or time.perf_counter(); n += 1
+total = time.perf_counter() - t0
+print(f"time to first token {1000*(first - t0):.0f} ms, {n} chunks in {total:.2f} s")</pre>
+
+<h2 id="watch">6. Watch the GPU while it works</h2>
+<pre># one line per second: utilization, memory, power, temperature, clocks
+nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw,temperature.gpu,clocks.sm \
+           --format=csv -l 1
+# compact rolling view
+nvidia-smi dmon -s pucm</pre>
+<p>Run the monitor in one tmux pane and send requests from another. Watch three things change: memory jumps when the server starts (it reserves the KV cache pool), utilization and power rise during a request, and both fall back when it ends. Under many parallel requests, power rises much more than under one: that is batching at work (chapter 3.2).</p>
+<div class="widget" id="monW">
+  <div class="wt">Illustration: what the monitor shows during a server's life</div>
+  <div class="ws">A simulated timeline of a small model on one GPU. It is an illustration of the shape to expect, not measured data. Click a phase to read what is happening.</div>
+  <div class="svgwrap"><svg id="monSvg" viewBox="0 0 700 230" width="700" style="max-width:100%;height:auto" role="img" aria-label="Simulated GPU memory, utilization and power over time"></svg></div>
+  <div class="legend"><span><i style="background:var(--kv)"></i>Memory used</span><span><i style="background:var(--dec)"></i>GPU-Util</span><span><i style="background:var(--pre)"></i>Power</span></div>
+  <p class="note" id="monMsg">Click a phase label.</p>
+</div>
+
+<h2 id="containers">7. Containers</h2>
+<p>A container packs an exact set of user-space software (Python, CUDA runtime, PyTorch, the engine) into one image. The <strong>driver stays on the host</strong>. The NVIDIA Container Toolkit connects containers to the host's GPUs and driver.</p>
+<pre># after installing Docker and the NVIDIA Container Toolkit on the host
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi    # test GPU access
+docker run --gpus all -p 8000:8000 --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  vllm/vllm-openai:latest --model Qwen/Qwen2.5-0.5B-Instruct</pre>
+<p><code>--ipc=host</code> (or a large <code>--shm-size</code>) gives the container enough shared memory, which PyTorch uses for communication between processes. Mounting the Hugging Face cache stops every new container from downloading the model again. For reproducible work, replace <code>latest</code> with an exact version tag, and record the image digest.</p>
+
+<h2 id="repro">8. A reproducible setup</h2>
+<p>Performance numbers mean nothing without the setup that produced them. Driver, library and engine versions can each change results by large amounts. Record everything in a file next to your results.</p>
+<pre>cat &gt; setup_record.sh &lt;&lt;'EOF'
+#!/bin/bash
+# Usage: bash setup_record.sh &gt; setup.txt
+echo "date: $(date -u +%FT%TZ)"
+nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version,power.limit --format=csv,noheader
+python3 -c "import torch, sys; print('python', sys.version.split()[0]); print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+python3 -c "import vllm; print('vllm', vllm.__version__)" 2&gt;/dev/null
+pip freeze | grep -i -E "^(torch|vllm|transformers|flashinfer|xformers|triton|sglang)"
+EOF
+bash setup_record.sh</pre>
+<p>Also record, for every experiment:</p>
+<ul>
+  <li>The model name and its <strong>revision</strong> (the commit hash on Hugging Face). Model repositories change; <code>--revision</code> pins one version.</li>
+  <li>The full engine command line, including every flag.</li>
+  <li>The benchmark command and its settings: prompt lengths, output lengths, concurrency.</li>
+  <li>The container image tag and digest, if you used one.</li>
+</ul>
+<p>Pin Python packages with exact versions (<code>pip freeze &gt; requirements.txt</code>, or a lock file from a tool such as uv). Then a new machine can be rebuilt with one command.</p>
+
+<h2 id="expert">9. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Persistence mode and clocks</span>
+  <p>On data-center GPUs, <code>nvidia-smi -pm 1</code> keeps the driver loaded so the first CUDA call is not slow. Benchmarks sometimes lock clocks for stable numbers (<code>nvidia-smi -lgc</code>). Rented machines may not allow these settings. Whatever you do, record it.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Multi-GPU topology</span>
+  <p><code>nvidia-smi topo -m</code> shows how GPUs connect: through NVLink (fast) or only PCIe (slower). Tensor parallelism (chapter 4.5) across GPUs without NVLink can be much slower. Check the topology before you rent a multi-GPU machine for a parallel lab.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Model download and cold start</span>
+  <p>A 16 GB model takes minutes to download and seconds to load. Production systems pre-download models to fast local disks or shared caches, and measure "cold start" time as a first-class metric (chapter 6.2). Set <code>HF_HOME</code> to a large disk on rented machines; the default home directory is often small.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">MIG and GPU sharing</span>
+  <p>A100, H100 and newer data-center GPUs support Multi-Instance GPU (MIG): one physical GPU split into isolated smaller GPUs, each with its own memory and compute. Some cheap rentals are MIG slices. <code>nvidia-smi -L</code> shows whether you have a full GPU or a slice.</p>
+</div>
+
+<h2 id="mistakes">10. Common mistakes</h2>
+<ul>
+  <li>Reading the "CUDA Version" in <code>nvidia-smi</code> as the installed toolkit.</li>
+  <li>Installing the CUDA toolkit to "fix" PyTorch. PyTorch wheels bring their own runtime; the usual fix is a wheel that matches the driver.</li>
+  <li>Running long jobs without tmux, then losing them when Wi-Fi drops.</li>
+  <li>Opening a model server port to the whole internet instead of using an SSH tunnel.</li>
+  <li>Filling the small root disk with model downloads.</li>
+  <li>Reporting benchmark numbers without the versions and flags that produced them.</li>
+  <li>Leaving a rented GPU running overnight.</li>
+</ul>
+
+<h2 id="lab">11. Lab</h2>
+<p><strong>Goal:</strong> do the full workflow once: machine, check, serve, stream, monitor, record.</p>
+<h3>Part A: free path (Colab or Kaggle)</h3>
+<ol>
+  <li>Open a T4 notebook. Run the checks of section 4 in cells (prefix shell commands with <code>!</code>).</li>
+  <li>Predict first: what will <code>torch.version.cuda</code> print, and will it be lower or higher than the CUDA version in <code>nvidia-smi</code>?</li>
+  <li>Run the FP16 matmul test. Write down the TFLOP/s and compare with the T4's 65 TFLOP/s peak.</li>
+  <li>Run <code>setup_record.sh</code> and save the output.</li>
+</ol>
+<h3>Part B: serve and stream (Colab, Kaggle or rented)</h3>
+<p>In a notebook, start the server in the background and poll until it is ready:</p>
+<pre>!pip install -q vllm
+import subprocess, time, requests
+log = open("vllm.log", "w")
+srv = subprocess.Popen(["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct", "--port", "8000",
+                        "--max-model-len", "4096", "--dtype", "half"], stdout=log, stderr=log)
+for _ in range(120):
+    try:
+        if requests.get("http://localhost:8000/v1/models").ok: print("ready"); break
+    except Exception: pass
+    time.sleep(5)
+!tail -n 20 vllm.log</pre>
+<p>In the log, find the line that reports the KV cache size or the maximum concurrency. Write down the number; chapter 2.4 explains it. Then run the streaming Python client from section 5. Record the time to first token.</p>
+<p>If vLLM fails to install or start on the free GPU, note the error and do this part on a rented GPU. Free environments change often, and package versions on them are not under your control.</p>
+<h3>Part C: watch the GPU under load</h3>
+<pre>import concurrent.futures as cf
+def one(i):
+    return requests.post("http://localhost:8000/v1/completions", json={
+        "model": "Qwen/Qwen2.5-0.5B-Instruct", "prompt": f"Story {i}:", "max_tokens": 256}).json()["usage"]
+mon = subprocess.Popen("nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw --format=csv -l 1 > gpu.csv", shell=True)
+for users in [1, 16]:
+    t = time.perf_counter()
+    with cf.ThreadPoolExecutor(users) as ex:
+        usage = list(ex.map(one, range(users)))
+    dt = time.perf_counter() - t
+    toks = sum(u["completion_tokens"] for u in usage)
+    print(f"{users:2d} users: {toks} tokens in {dt:.1f} s = {toks/dt:.0f} tokens/s")
+    time.sleep(3)
+mon.terminate()
+!cat gpu.csv | tail -n 40</pre>
+<p>Predict first: will 16 users get about 16 times the total tokens per second of 1 user, more, or less? Then compare power draw in the two phases in <code>gpu.csv</code>.</p>
+<h3>Part D (optional, paid): a rented GPU over SSH</h3>
+<ol>
+  <li>Rent the cheapest single GPU with at least 24 GB (for example an L4 or A10) for one hour.</li>
+  <li>Add your SSH key, connect with a <code>~/.ssh/config</code> entry that forwards port 8000.</li>
+  <li>Repeat Parts A to C in tmux. Open <code>http://localhost:8000/v1/models</code> in your laptop's browser through the tunnel.</li>
+  <li>Copy <code>gpu.csv</code> and <code>setup.txt</code> back with <code>rsync</code>.</li>
+  <li>Delete the machine. Check the provider's billing page to confirm it stopped.</li>
+</ol>
+
+<h2 id="realworld">12. In the real world</h2>
+<div class="box real">
+  <span class="lbl">How teams run GPUs</span>
+  <ul>
+    <li><strong>Development</strong> happens on a rented single GPU or a shared cluster node, reached over SSH or through remote editors (for example VS Code Remote-SSH).</li>
+    <li><strong>Production</strong> runs engines in containers on Kubernetes or a managed platform, with the driver on the host and the GPU operator managing devices (chapter 6.2).</li>
+    <li><strong>Benchmarks</strong> published by engine teams always list GPU, driver, engine version and flags. Results that omit them cannot be compared.</li>
+    <li><strong>Cost control</strong>: idle GPUs are the most common waste. Teams use auto-shutdown, scale-to-zero and spot instances (chapter 6.5).</li>
+  </ul>
+</div>
+
+<h2 id="quiz">13. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz16"></div>
+<script type="application/json" id="qz16">[
+{"q":"nvidia-smi shows CUDA Version 12.2. torch.version.cuda is 12.8. What is most likely?","o":["It always works","It may work through minor-version compatibility, but some features can fail; a 12.2-or-older build or a newer driver is safer","It can never work","Install the CUDA 12.8 toolkit to fix it"],"a":1,"e":"Same major version: minor-version compatibility often works, with limits. The clean fix is matching the build to the driver or upgrading the driver."},
+{"q":"Do you need the CUDA toolkit (nvcc) to run PyTorch inference?","o":["Yes, always","No; PyTorch wheels bundle the CUDA runtime","Only on Windows","Only for FP16"],"a":1,"e":"The toolkit is for compiling CUDA code. The runtime libraries come with the wheel."},
+{"q":"What does GPU-Util in nvidia-smi measure?","o":["Share of math units busy","Share of time at least one kernel was running","Memory bandwidth used","Power use"],"a":1,"e":"It is a time-based measure. It can read 100% while the GPU does little useful work."},
+{"q":"Safest way to reach a model server on a remote GPU box from your laptop:","o":["Open port 8000 to 0.0.0.0","An SSH tunnel with -L 8000:localhost:8000","Email the results","Disable the firewall"],"a":1,"e":"The tunnel encrypts traffic and keeps the port private."},
+{"q":"Which runs inside the container, and which on the host?","o":["Driver in container, CUDA runtime on host","CUDA runtime and PyTorch in the container, driver on the host","Both on host","Both in container"],"a":1,"e":"Containers carry user-space libraries. The kernel driver belongs to the host."},
+{"q":"Why pin the model revision?","o":["It makes downloads faster","Model repositories can change; a revision fixes the exact weights and files","It reduces GPU memory","vLLM needs it"],"a":1,"e":"A model repo update can change tokenizer files or weights and silently change results."}
+]</script>
+
+<h2 id="summary">14. Summary</h2>
+<ul>
+  <li>Start on free T4 notebooks; rent GPUs by the hour for engines, newer hardware and benchmarks; always shut them down.</li>
+  <li>Use SSH keys, an SSH config, tmux for long jobs, tunnels for ports, rsync for files.</li>
+  <li>Stack: driver (host) → optional toolkit → PyTorch with bundled CUDA runtime → your code. The driver's CUDA version must cover the build, and the build must support the GPU.</li>
+  <li>Check a new machine with nvidia-smi, torch.cuda and a quick matmul benchmark.</li>
+  <li>vLLM serves an OpenAI-compatible API with streaming; watch memory, utilization and power while it runs.</li>
+  <li>Record GPU, driver, versions, model revision and flags with every result.</li>
+</ul>
+
+<h2 id="refs">15. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://missing.csail.mit.edu/2020/command-line/">MIT Missing Semester: Command-line environment</a> (remote machines section)</td><td>SSH keys, config files, port forwarding, tmux and file copying, with exercises.</td></tr>
+<tr><td><a href="https://docs.nvidia.com/deploy/cuda-compatibility/">NVIDIA: CUDA Compatibility</a></td><td>The official rules for driver, minor-version and forward compatibility.</td></tr>
+<tr><td><a href="https://pytorch.org/get-started/locally/">PyTorch: Start Locally</a></td><td>The install selector for each CUDA build. Use it to pick a wheel that matches your driver.</td></tr>
+<tr><td><a href="https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/index.html">NVIDIA Container Toolkit</a></td><td>How containers get GPU access, and the install steps.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/getting_started/installation/gpu.html">vLLM: GPU installation</a> and <a href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html">OpenAI-compatible server</a></td><td>Requirements (compute capability 7.5 or higher), install options and the serving API used in the lab.</td></tr>
+<tr><td><a href="https://docs.nvidia.com/deploy/nvidia-smi/index.html">NVIDIA: nvidia-smi documentation</a></td><td>Every field and query option, including the definition of utilization.</td></tr>
+<tr><td><a href="https://research.google.com/colaboratory/faq.html">Google Colab FAQ</a></td><td>Free-tier limits: resources are not guaranteed and limits fluctuate.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, chapters 3 and 4</td><td>OS, container and Kubernetes settings for GPU machines: pinning, shared memory, persistence mode.</td></tr>
+</table></div>
+<p class="note">Facts checked on 6 November 2026. GPU availability on free tiers and provider prices change often; check them when you start.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+function vc(){
+  const D=+$('vcD').value,T=+$('vcT').value,G=+$('vcG').value;
+  const dM=Math.floor(D),tM=Math.floor(T);let ok='Works',cls='ok',why=[];
+  if(tM>dM){ok='Fails';cls='no';why.push(`The build needs CUDA ${T} but the driver supports only up to ${D}, a lower major version. Install a cu${String(dM)}x build or upgrade the driver.`);}
+  else if(tM===dM&&T>D){ok='Risky';cls='';why.push(`Same major version, newer minor (${T} on a ${D} driver). CUDA minor-version compatibility often makes this run, but some features may fail. Prefer a build at or below ${D}, or upgrade the driver.`);}
+  else why.push(`Driver supports CUDA ${D}, which covers the ${T} build.`);
+  if(G>=10&&T<12.8){ok='Fails';cls='no';why.push('Blackwell GPUs need a build with CUDA 12.8 or newer; older builds have no kernels for this GPU.');}
+  if(G<7.5&&T>=13){ok='Fails';cls='no';why.push('CUDA 13 dropped support for GPUs below compute capability 7.5 (Maxwell, Pascal, Volta). Use a 12.x build.');}
+  if(G<7.5)why.push('Note: current vLLM needs compute capability 7.5 or higher, so a V100 cannot run it even if PyTorch works.');
+  $('vcStats').innerHTML=`<div class="stat ${cls==='ok'?'ok':cls==='no'?'no':''}"><div class="k">Verdict</div><div class="v">${ok}</div></div>`;
+  $('vcMsg').textContent=why.join(' ');
+}
+['vcD','vcT','vcG'].forEach(id=>$(id).addEventListener('input',vc));vc();
+/* monitor illustration */
+const PH=[[0,10,'idle','Nothing loaded. A little memory is used by the driver; power is at idle.'],[10,25,'load','The engine starts: weights load (memory rises), then it profiles and reserves the KV cache pool, so memory jumps to most of the GPU.'],[25,35,'ready','Ready and waiting. Memory stays reserved; utilization and power drop.'],[35,50,'1 user','One request: utilization rises, but power stays moderate. Decode at batch 1 waits on memory reads.'],[50,58,'ready',''],[58,80,'16 users','Sixteen parallel requests: the engine batches them, so the GPU does much more math per step. Power rises close to the limit.'],[80,95,'ready','Load ends. Memory stays reserved until the server stops.']];
+let mi=-1;
+function mon(){const s=$('monSvg');s.innerHTML='';const W=700,H=230,l=40,r=10,t=30,b=30;const X=v=>l+v/95*(W-l-r),Y=v=>H-b-v*(H-t-b);
+  const mem=x=>x<10?0.03:x<15?0.03+(x-10)/5*0.1:x<18?0.13:x<25?0.13+(x-18)/7*0.77:0.9;
+  const util=x=>x<10?0:x<25?0.4*((x%3)<1.5?1:0.2):x<35?0:x<50?0.62:x<58?0:x<80?0.97:0;
+  const pow=x=>x<10?0.14:x<25?0.3:x<35?0.15:x<50?0.42:x<58?0.15:x<80?0.92:0.15;
+  for(let i=0;i<=4;i++){el('line',{x1:l,x2:W-r,y1:Y(i/4),y2:Y(i/4),class:'axis'},s);el('text',{x:l-6,y:Y(i/4)+4,'text-anchor':'end',class:'tick'},s,(i*25)+'%');}
+  PH.forEach(([a,bb,n],i)=>{el('rect',{x:X(a),y:t,width:X(bb)-X(a),height:H-t-b,fill:i===mi?css('--panel2'):'transparent'},s);
+    const tx=el('text',{x:(X(a)+X(bb))/2,y:t-10,'text-anchor':'middle','font-size':11,fill:css(i===mi?'--ink':'--ink2'),style:'cursor:pointer','text-decoration':'underline'},s,n);tx.addEventListener('click',()=>{mi=i;$('monMsg').textContent=PH[i][3]||'Ready and waiting between loads.';mon();});});
+  [[mem,'--kv'],[util,'--dec'],[pow,'--pre']].forEach(([f,c])=>{let d='';for(let i=0;i<=380;i++){const x=95*i/380;d+=(i?'L':'M')+X(x).toFixed(1)+' '+Y(f(x)).toFixed(1);}el('path',{d,fill:'none',stroke:css(c),'stroke-width':2.2},s);});
+  el('text',{x:W-r,y:H-8,'text-anchor':'end',class:'tick'},s,'time →');}
+IE.onTheme(mon);
+})();
+</script>

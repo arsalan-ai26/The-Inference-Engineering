@@ -39,7 +39,7 @@ window.IE_CHAPTERS = [
 "title": "Remote GPU machines and a reproducible setup",
 "slug": "1-6-remote-gpu-setup",
 "part": 1,
-"ready": false
+"ready": true
 },
 {
 "n": "2.1",
