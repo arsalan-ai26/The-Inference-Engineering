@@ -375,7 +375,7 @@ window.IE_CHAPTERS = [
 "title": "Read an inference engine",
 "slug": "8-2-read-an-engine",
 "part": 8,
-"ready": false
+"ready": true
 },
 {
 "n": "8.3",

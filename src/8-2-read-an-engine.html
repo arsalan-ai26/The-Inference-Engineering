@@ -1,0 +1,214 @@
+<div class="kicker">Part 8 · Specialized workloads, engine internals and research · Chapter 8.2</div>
+<h1>Read an inference engine</h1>
+<p class="lede">Chapter 3.4 explained an engine's parts with small reference engines. This chapter goes into the real thing: vLLM's own source, about 213,000 lines in its <code>v1</code> package alone. You will get a map of the codebase by process, directory, file and class; follow one request from the HTTP call to the streamed token with real function names; see where the scheduler, KV cache manager, model runner, attention backends and sampler live; and learn a method for reading and changing a large engine without getting lost.</p>
+<div class="meta">
+  <span class="chip">Level: expert</span>
+  <span class="chip">Time: 4 to 6 hours with the lab</span>
+  <span class="chip">Needs: 3.1 to 3.5, 5.6</span>
+  <span class="chip">Compute: CPU for reading; a GPU to trace and profile</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>In vLLM, which process runs the scheduler, and which processes run the model?</li>
+    <li>Does vLLM's scheduler have a separate prefill phase and decode phase?</li>
+    <li>Where would you add a new per-step metric about preemptions?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>The engine core process (one per data-parallel rank) runs the scheduler and KV cache manager; one GPU worker process per GPU loads weights and runs forward passes. API server processes handle HTTP and tokenization and talk to engine cores over ZMQ sockets.</li>
+    <li>No. Each request has a count of computed tokens and a count of tokens it needs; every step the scheduler assigns tokens so requests catch up, which covers chunked prefill, prefix caching and speculative decoding with one rule.</li>
+    <li>In <code>vllm/v1/core/sched/scheduler.py</code>, where <code>_preempt_request</code> runs inside <code>Scheduler.schedule</code>, recorded through the scheduler's stats into <code>vllm/v1/metrics</code>, behind a configuration flag.</li>
+  </ol></details>
+</div>
+
+<h2 id="map">1. The map</h2>
+<p>All paths and names below come from vLLM's main branch at commit <code>a8dacd72</code> (7 November 2026). Engines move fast: re-run the lab's mapping script on the version you use.</p>
+<h3>Processes</h3>
+<div class="tbl"><table>
+<tr><th>Process</th><th>Count</th><th>Job</th></tr>
+<tr><td>API server</td><td>1 by default; one per data-parallel rank with DP (<code>--api-server-count</code>)</td><td>HTTP and the OpenAI-compatible API, tokenization and media loading, detokenization and streaming back to clients</td></tr>
+<tr><td>Engine core</td><td>1 per data-parallel rank</td><td>A busy loop: schedule, dispatch work to workers, update request state; owns the KV cache manager</td></tr>
+<tr><td>GPU worker</td><td>1 per GPU</td><td>Loads weights, prepares inputs, runs the forward pass and sampling, manages GPU memory</td></tr>
+<tr><td>DP coordinator</td><td>Only with data parallelism</td><td>Coordinates engine cores (for example, MoE waves)</td></tr>
+</table></div>
+<p>API servers and engine cores talk over ZMQ sockets in a many-to-many topology, so any API server can route to any engine core. This split is why chapter 6.2 warned about CPU sizing: tokenization, detokenization and streaming run on CPU in separate processes from the scheduler.</p>
+<h3>Directories and classes</h3>
+<div class="tbl"><table>
+<tr><th>Directory (lines of Python)</th><th>Main files and classes</th><th>Role</th></tr>
+<tr><td><code>vllm/entrypoints/openai/</code></td><td><code>api_server.py</code>; <code>chat_completion/serving.py</code> (<code>create_chat_completion</code>)</td><td>HTTP endpoints, request validation, chat templates, streaming responses</td></tr>
+<tr><td><code>vllm/v1/engine/</code> (12,699)</td><td><code>async_llm.py</code> <code>AsyncLLM</code>; <code>input_processor.py</code> <code>InputProcessor</code>; <code>core_client.py</code> <code>AsyncMPClient</code>; <code>core.py</code> <code>EngineCore</code>, <code>EngineCoreProc</code>; <code>output_processor.py</code> <code>OutputProcessor</code>; <code>detokenizer.py</code></td><td>The front end of the engine (in the API process) and the engine core (in its own process)</td></tr>
+<tr><td><code>vllm/v1/core/</code> (14,558)</td><td><code>sched/scheduler.py</code> <code>Scheduler</code>; <code>kv_cache_manager.py</code> <code>KVCacheManager</code>; <code>block_pool.py</code> <code>BlockPool</code>; <code>encoder_cache_manager.py</code></td><td>Scheduling, KV block allocation and prefix caching</td></tr>
+<tr><td><code>vllm/v1/request.py</code></td><td><code>Request</code>, <code>RequestStatus</code></td><td>Request state</td></tr>
+<tr><td><code>vllm/v1/executor/</code> (3,533)</td><td><code>multiproc_executor.py</code> <code>MultiprocExecutor</code>, <code>WorkerProc</code>; Ray executors</td><td>Sends each step to the workers and gathers results</td></tr>
+<tr><td><code>vllm/v1/worker/</code> (58,803)</td><td><code>gpu_worker.py</code> <code>Worker</code>; <code>gpu_model_runner.py</code> <code>GPUModelRunner</code>; <code>gpu/model_runner.py</code> (a newer runner behind <code>VLLM_USE_V2_MODEL_RUNNER</code>)</td><td>Input preparation, forward pass, CUDA graphs, sampling</td></tr>
+<tr><td><code>vllm/v1/attention/</code> (72,748)</td><td><code>selector.py</code> <code>get_attn_backend</code>; <code>backends/</code> (<code>flash_attn.py</code>, <code>flashinfer.py</code>, <code>triton_attn.py</code>, <code>flex_attention.py</code>, <code>mla/</code>, Mamba and linear attention, ROCm backends)</td><td>Attention kernels and their metadata</td></tr>
+<tr><td><code>vllm/v1/sample/</code> (5,935)</td><td><code>sampler.py</code> <code>Sampler</code></td><td>Logits processing, sampling, log-probabilities</td></tr>
+<tr><td><code>vllm/v1/spec_decode/</code>, <code>structured_output/</code>, <code>kv_offload/</code>, <code>metrics/</code></td><td>Drafters, grammar backends, KV offloading, Prometheus metrics</td><td>The features of Parts 3, 4 and 6</td></tr>
+<tr><td><code>vllm/model_executor/models/</code></td><td>One file per model family (for example <code>llama.py</code>, <code>qwen2.py</code>)</td><td>Model definitions built from vLLM's fused layers</td></tr>
+</table></div>
+<p>The line counts say something: attention backends and the worker are most of the code. The scheduler, the part chapter 3.2 spent most time on, is a few thousand lines.</p>
+
+<h2 id="trace">2. One request, end to end</h2>
+<div class="widget" id="trW">
+  <div class="wt">Interactive: follow one chat request through vLLM</div>
+  <div class="ws">Step through the path a streaming chat request takes. Each step names the process, the file and the function.</div>
+  <div class="ctrls"><button id="trPrev" type="button">Previous</button> <button id="trNext" type="button">Next</button> <span id="trPos"></span></div>
+  <div class="svgwrap"><svg id="trSvg2" viewBox="0 0 680 150" width="680" style="max-width:100%;height:auto" role="img" aria-label="Processes involved in a request"></svg></div>
+  <div class="stats" id="trStats"></div>
+</div>
+<h3>The engine core step</h3>
+<p><code>EngineCoreProc.run_busy_loop</code> repeats two things: <code>_process_input_queue</code> (take new requests and aborts from the API servers) and <code>_process_engine_step</code>, which calls <code>EngineCore.step</code>. Its body is short and worth reading in full; in outline:</p>
+<pre>scheduler_output = self.scheduler.schedule(...)                     # who runs, with how many tokens
+future = self.model_executor.execute_model(scheduler_output, non_block=True)
+grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)  # structured output masks
+model_output = self._wait_for_output(future)
+if model_output is None:
+    model_output = self.model_executor.sample_tokens(grammar_output)
+self._process_aborts_queue()                                         # cancellations during the step
+engine_core_outputs = self.scheduler.update_from_output(scheduler_output, model_output)</pre>
+<p>Note the overlap: the grammar bitmask is computed on the CPU while the GPU runs the forward pass, and sampling happens after, so structured output costs little extra time (chapter 3.5). A variant, <code>step_with_batch_queue</code>, keeps several batches in flight for pipeline parallelism.</p>
+<h3>The scheduler's one rule</h3>
+<p>The comment at the top of <code>Scheduler.schedule</code> states the design: there is no prefill phase or decode phase; each request has <code>num_computed_tokens</code> and <code>num_tokens_with_spec</code> (prompt + output + speculative tokens), and each step the scheduler assigns tokens so the first catches up with the second, within <code>max_num_batched_tokens</code>. A new prompt needs many tokens (prefill, chunked if the budget is smaller); a running request needs one (decode) or several (speculative verification); a prefix-cache hit simply starts with <code>num_computed_tokens</code> already high. For each scheduled request, <code>KVCacheManager.allocate_slots</code> reserves blocks from the <code>BlockPool</code>; if none are free, <code>_preempt_request</code> evicts a running request, which returns to <code>RequestStatus.PREEMPTED</code> (chapter 3.3).</p>
+<h3>Request states</h3>
+<p><code>RequestStatus</code> lists the life of a request: <code>WAITING</code>, <code>WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code> (grammar still compiling), <code>WAITING_FOR_REMOTE_KVS</code> (KV arriving from a prefill worker, chapter 4.6), <code>WAITING_FOR_STREAMING_REQ</code>, <code>RUNNING</code>, <code>PREEMPTED</code>, and finished states: stopped, length-capped, aborted, ignored, error and repetition. Every state you saw in metrics (chapter 3.1) maps to one of these.</p>
+
+<h2 id="method">3. How to read a large engine</h2>
+<ol>
+  <li><strong>Start from a request, not from a directory.</strong> Find the API handler, then follow calls with "go to definition" until you reach <code>EngineCore.step</code>.</li>
+  <li><strong>Read the loop, then the data.</strong> The step loop is short; most complexity sits in data structures (<code>SchedulerOutput</code>, the input batch, attention metadata). Print one of each for a real request.</li>
+  <li><strong>Use logs and a debugger on a tiny model.</strong> Run a small model with <code>enforce_eager=True</code> (no CUDA graphs) and one request, and set breakpoints in <code>schedule</code>, <code>execute_model</code> and <code>update_from_output</code>. The offline <code>LLM</code> class with <code>VLLM_ENABLE_V1_MULTIPROCESSING=0</code> keeps everything in one process, which makes breakpoints easy.</li>
+  <li><strong>Profile to see what matters.</strong> vLLM can capture torch profiler traces; read which kernels and CPU functions dominate (chapter 5.6).</li>
+  <li><strong>Read the design docs and blogs alongside the code:</strong> vLLM's architecture overview and Aleksa Gordic's "Inside vLLM" walk the same structure with diagrams.</li>
+  <li><strong>Pin a commit.</strong> Write file and line references with the commit hash so your notes stay valid.</li>
+</ol>
+
+<h2 id="change">4. Changing one component</h2>
+<p>Chapter 3.4 covered the plugin system for out-of-tree changes. For learning, a small in-tree change behind a flag teaches the most:</p>
+<ul>
+  <li><strong>A metric:</strong> count preemptions per step and their victims' lengths in <code>Scheduler</code>, expose it through the scheduler stats in <code>vllm/v1/metrics</code>, and graph it under load.</li>
+  <li><strong>A scheduler policy:</strong> change which request is preempted (for example the one with the most computed tokens instead of the newest), behind an environment variable, and measure preemption counts and p99 latency under memory pressure.</li>
+  <li><strong>A cache rule:</strong> refuse to cache prefixes shorter than N blocks, and measure hit rate and TTFT on a workload with many short unique prompts.</li>
+</ul>
+<p>Rules for the change: keep the default path unchanged, add a unit test next to the existing ones in <code>tests/v1/core/</code>, run the relevant existing tests, and benchmark before and after with the chapter 6.1 method.</p>
+
+<h2 id="expert">5. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Async scheduling and overlapping CPU with GPU</span>
+  <p>With asynchronous scheduling (<code>sched/async_scheduler.py</code>), the engine schedules step n + 1 while step n runs on the GPU, hiding scheduler CPU time (chapter 5.1's overhead regime). The cost is complexity: the scheduler must plan with outputs it has not seen yet, which is why draft tokens for speculative decoding are updated in the worker in this mode, as the comment in <code>post_step</code> notes.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Attention backend selection</span>
+  <p><code>vllm/v1/attention/selector.py</code> chooses a backend from the model (MLA, sliding windows, Mamba layers), the hardware, the KV cache dtype and user settings. Each backend supplies a metadata builder that converts the scheduler's batch into the layout its kernel needs (block tables, sequence lengths, split points). Most "why is this slower on my GPU" questions end in this selection and metadata code.</p>
+</div>
+
+<h2 id="mistakes">6. Common mistakes</h2>
+<ul>
+  <li>Reading directories top to bottom instead of following a request.</li>
+  <li>Debugging with CUDA graphs and multiprocessing on, where breakpoints do not hit.</li>
+  <li>Notes without a commit hash.</li>
+  <li>Changing default behaviour instead of adding a flag.</li>
+  <li>Measuring a change without a before-and-after benchmark on the same workload.</li>
+</ul>
+
+<h2 id="lab">7. Lab</h2>
+<h3>Part A: map the codebase yourself (CPU)</h3>
+<pre>git clone --depth 1 https://github.com/vllm-project/vllm.git && cd vllm && git log -1 --format='%h %cd'
+grep -n '^class ' vllm/v1/engine/core.py vllm/v1/core/sched/scheduler.py vllm/v1/core/kv_cache_manager.py \
+     vllm/v1/core/block_pool.py vllm/v1/worker/gpu_model_runner.py vllm/v1/worker/gpu_worker.py vllm/v1/sample/sampler.py
+grep -n '    def \(step\|schedule\|update_from_output\|allocate_slots\|execute_model\|sample_tokens\|run_busy_loop\)\b' \
+     vllm/v1/engine/core.py vllm/v1/core/sched/scheduler.py vllm/v1/core/kv_cache_manager.py vllm/v1/worker/gpu_model_runner.py
+for d in engine core worker attention sample executor; do echo "$d $(find vllm/v1/$d -name '*.py' | xargs cat | wc -l)"; done</pre>
+<details><summary>What we found (commit a8dacd72, 7 November 2026)</summary><pre class="out">vllm/v1/engine/core.py:129:class EngineCore:
+vllm/v1/engine/core.py:1302:class EngineCoreProc(EngineCore):
+vllm/v1/core/sched/scheduler.py:86:class Scheduler(SchedulerInterface):
+vllm/v1/core/kv_cache_manager.py:131:class KVCacheManager:
+vllm/v1/core/block_pool.py:107:class BlockPool:
+vllm/v1/worker/gpu_model_runner.py:483:class GPUModelRunner(
+vllm/v1/worker/gpu_worker.py:220:class Worker(WorkerBase):
+vllm/v1/sample/sampler.py:78:class Sampler(nn.Module):
+vllm/v1/engine/core.py:713:    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+vllm/v1/engine/core.py:1768:    def run_busy_loop(self):
+vllm/v1/core/sched/scheduler.py:721:    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+vllm/v1/core/sched/scheduler.py:2335:    def update_from_output(
+vllm/v1/core/kv_cache_manager.py:401:    def allocate_slots(
+vllm/v1/worker/gpu_model_runner.py:4001:    def execute_model(
+vllm/v1/worker/gpu_model_runner.py:4366:    def sample_tokens(
+engine 12699
+core 14558
+worker 58803
+attention 72748
+sample 5935
+executor 3533</pre>
+<p>Draw the architecture map with these names, one box per process, and arrows for the calls in section 2. Your line numbers will differ on a newer commit; the classes and the shape should not.</p></details>
+<h3>Part B: trace one request (GPU)</h3>
+<p>Install vLLM, run a small model with the offline <code>LLM</code> class, <code>enforce_eager=True</code> and <code>VLLM_ENABLE_V1_MULTIPROCESSING=0</code>, and set breakpoints in <code>Scheduler.schedule</code>, <code>GPUModelRunner.execute_model</code> and <code>Scheduler.update_from_output</code>. For one request, record: <code>num_computed_tokens</code> before and after each step, the blocks allocated, the attention backend chosen, and the shape of the input batch. Then send a second request that shares a prefix and confirm it starts with computed tokens from the cache.</p>
+<h3>Part C: change one component</h3>
+<p>Implement one change from section 4 behind an environment variable, add a unit test, and measure it with the chapter 6.1 harness on a workload that exercises it (memory pressure for the preemption policy, many short prompts for the cache rule). Write a one-page note: what changed, which files, what the benchmark showed, and whether you would propose it upstream.</p>
+
+<h2 id="realworld">8. In the real world</h2>
+<div class="box real">
+  <span class="lbl">In practice</span>
+  <ul>
+    <li><strong>Inference teams</strong> keep forks or plugins of vLLM and SGLang and need engineers who can read and change them.</li>
+    <li><strong>Debugging production issues</strong> (chapter 3.4's silent errors, chapter 6.6's correctness bugs) ends in this code.</li>
+    <li><strong>Upstream contributions</strong> start as small, flagged, measured changes like Part C.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">9. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz82"></div>
+<script type="application/json" id="qz82">[
+{"q":"Which process owns the KV cache manager?","o":["API server","Engine core","GPU worker","DP coordinator"],"a":1,"e":"The engine core runs the scheduler and KV cache manager."},
+{"q":"How do API servers talk to engine cores?","o":["HTTP","ZMQ sockets","Shared CUDA memory","gRPC only"],"a":1,"e":"Many-to-many over ZMQ."},
+{"q":"In vLLM's scheduler, a prefill is:","o":["A separate phase","Just a request that needs many tokens to catch up","Handled by the worker","Not scheduled"],"a":1,"e":"One rule covers chunked prefill, prefix caching and speculation."},
+{"q":"Which function reserves KV blocks for a scheduled request?","o":["Sampler.forward","KVCacheManager.allocate_slots","EngineCore.step","Worker.execute_model"],"a":1,"e":"Backed by BlockPool."},
+{"q":"Why compute the grammar bitmask after launching execute_model?","o":["It is required","To overlap CPU grammar work with the GPU forward pass","To save memory","For tokenization"],"a":1,"e":"Sampling waits for both."},
+{"q":"For easy breakpoints in vLLM:","o":["Use CUDA graphs","Use enforce_eager and disable V1 multiprocessing","Use tensor parallelism","Use the API server"],"a":1,"e":"Everything then runs in one process without graphs."}
+]</script>
+
+<h2 id="summary">10. Summary</h2>
+<ul>
+  <li>vLLM runs API servers, engine cores and GPU workers as separate processes connected by ZMQ and an executor.</li>
+  <li>The engine core loop is short: schedule, execute, grammar mask, sample, update; the scheduler assigns tokens so each request catches up.</li>
+  <li>Most code lives in the worker and attention backends; the scheduler and KV manager are compact.</li>
+  <li>Read by following a request, debug on a tiny model in one process, pin the commit, change things behind flags and measure.</li>
+</ul>
+
+<h2 id="refs">11. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://github.com/vllm-project/vllm/tree/a8dacd7238a3a71953cb0c22f13d950a0c6688b6">vLLM source at commit a8dacd72</a></td><td>Every file, class and function named in this chapter.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/design/arch_overview.html">vLLM: Architecture overview</a></td><td>The V1 process architecture and process counts.</td></tr>
+<tr><td><a href="https://www.aleksagordic.com/blog/vllm">Aleksa Gordic, Inside vLLM: Anatomy of a High-Throughput LLM Inference System</a></td><td>A layered walkthrough of the engine core, advanced features, multi-GPU execution and the serving layer.</td></tr>
+<tr><td><a href="https://neutree.ai/blog/nano-vllm-part-1">Neutree, nano-vLLM</a></td><td>The small reference engine from chapter 3.4, useful to compare with the real one.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026 against vLLM commit a8dacd72. Part A run on CPU; Parts B and C need a GPU.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$,el,css}=IE;
+const S=[
+['API server','vllm/entrypoints/openai/chat_completion/serving.py','create_chat_completion','Validate the request, apply the chat template, build sampling parameters.'],
+['API server','vllm/v1/engine/async_llm.py','AsyncLLM.generate','Register an output collector for this request and add it to the engine.'],
+['API server','vllm/v1/engine/input_processor.py','InputProcessor.process_inputs','Tokenize the prompt, load media, produce an EngineCoreRequest.'],
+['API server → engine core','vllm/v1/engine/core_client.py','AsyncMPClient.add_request_async','Send the request to an engine core over a ZMQ socket.'],
+['Engine core','vllm/v1/engine/core.py','EngineCoreProc.run_busy_loop → _process_input_queue','Take the new request and call Scheduler.add_request: status WAITING.'],
+['Engine core','vllm/v1/core/sched/scheduler.py','Scheduler.schedule','Give tokens to requests within the token budget; prefix-cache hits start with computed tokens.'],
+['Engine core','vllm/v1/core/kv_cache_manager.py','KVCacheManager.allocate_slots','Reserve KV blocks from the BlockPool, or preempt a running request if none are free.'],
+['Engine core → workers','vllm/v1/executor/multiproc_executor.py','MultiprocExecutor.execute_model','Send the SchedulerOutput to every GPU worker process.'],
+['GPU worker','vllm/v1/worker/gpu_model_runner.py','GPUModelRunner.execute_model (_update_states, _prepare_inputs)','Update the persistent batch, build input IDs, positions and attention metadata, run the model (CUDA graph if possible).'],
+['GPU worker','vllm/v1/attention/backends/…','the selected backend (for example flash_attn.py)','Paged attention over the block table for every layer.'],
+['GPU worker','vllm/v1/worker/gpu_model_runner.py → vllm/v1/sample/sampler.py','sample_tokens → Sampler','Apply the grammar bitmask and sampling parameters; pick tokens.'],
+['Engine core','vllm/v1/core/sched/scheduler.py','Scheduler.update_from_output','Append tokens, check stop conditions, free finished requests’ blocks, emit EngineCoreOutputs.'],
+['Engine core → API server','vllm/v1/engine/output_processor.py','OutputProcessor.process_outputs','Detokenize incrementally and push text to the request’s collector.'],
+['API server','vllm/entrypoints/openai/chat_completion/serving.py','streaming generator','Send a server-sent event with the new text; repeat from step 6 until finished.']];
+let i=0;
+function draw(){const s=$('trSvg2');s.innerHTML='';const P=[['API server',20],['Engine core',250],['GPU worker',480]];const cur=S[i][0];
+  P.forEach(([n,x])=>{const on=cur.startsWith(n)||cur.endsWith(n);el('rect',{x,y:30,width:180,height:70,rx:8,fill:css(on?'--pre-s':'--panel2'),stroke:css(on?'--pre':'--line'),'stroke-width':on?2:1},s);el('text',{x:x+90,y:62,'text-anchor':'middle','font-size':13,'font-weight':600,fill:css('--ink')},s,n);el('text',{x:x+90,y:82,'text-anchor':'middle','font-size':10,fill:css('--ink2')},s,n==='API server'?'HTTP, tokenize, stream':n==='Engine core'?'schedule, KV, update':'forward, attention, sample');});
+  el('text',{x:340,y:128,'text-anchor':'middle','font-size':10.5,fill:css('--ink2')},s,'ZMQ between API server and engine core; executor between engine core and workers');
+  $('trPos').textContent=`Step ${i+1} of ${S.length}`;
+  $('trStats').innerHTML=[['Process',S[i][0]],['File',`<code style="font-size:.78rem;word-break:break-all">${S[i][1]}</code>`],['Function',`<code style="font-size:.78rem;word-break:break-all">${S[i][2]}</code>`],['What happens',S[i][3]]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v" style="font-size:.9rem">${z[1]}</div></div>`).join('');}
+$('trNext').onclick=()=>{i=Math.min(S.length-1,i+1);draw();};$('trPrev').onclick=()=>{i=Math.max(0,i-1);draw();};IE.onTheme(draw);
+})();
+</script>
