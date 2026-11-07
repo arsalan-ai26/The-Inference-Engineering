@@ -1,0 +1,255 @@
+<div class="kicker">Part 5 · GPUs, hardware and kernels · Chapter 5.4</div>
+<h1>Kernels, fusion and Triton</h1>
+<p class="lede">A forward pass is a sequence of GPU kernels. Which kernels run, how many there are, and how much data each one moves through HBM decide most of a model's speed once the architecture is fixed. This chapter covers the kernels an inference engine runs, where they come from (vendor libraries, open kernel libraries, compilers), why fusing kernels is the most important optimization after batching, and how to read and write simple kernels in Triton, the Python-based language that most new inference kernels and compilers now use.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 4 hours with the lab</span>
+  <span class="chip">Needs: 5.1, 5.2, 5.3</span>
+  <span class="chip">Compute: Colab CPU (Triton interpreter), then T4</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why is a fused softmax kernel about 4 times faster than softmax written as separate PyTorch operations?</li>
+    <li>In Triton, what does one "program" correspond to on the GPU?</li>
+    <li>Why might a kernel that is fastest on an H100 be slow, or fail, on a B200?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Softmax is memory-bound. Done step by step it reads about 5MN and writes about 3MN elements for an M × N input; fused, it reads MN and writes MN. About 4 times less traffic.</li>
+    <li>One thread block. The program works on a whole block of data at once; Triton's compiler decides how the block's threads and warps split the work.</li>
+    <li>Kernels hard-code hardware details: tile sizes, shared memory use, tensor-core instructions (wgmma on Hopper, tcgen05 and TMEM on Blackwell). A new generation needs re-tuned or rewritten kernels.</li>
+  </ol></details>
+</div>
+
+<h2 id="inventory">1. The kernels in one decode step</h2>
+<p>For a Llama-style layer, an engine launches roughly these kernels (exact lists vary by engine and fusion):</p>
+<div class="tbl"><table>
+<tr><th>Operation</th><th>Kernel type</th><th>Usual bottleneck</th><th>Typical source</th></tr>
+<tr><td>QKV, output, gate/up and down projections</td><td>GEMM</td><td>Memory at small batch, compute at large</td><td>cuBLAS, CUTLASS, DeepGEMM; Marlin or Machete for 4-bit weights</td></tr>
+<tr><td>Attention</td><td>Fused attention (prefill and decode variants)</td><td>Compute in prefill, memory in decode</td><td>FlashAttention, FlashInfer, Triton, vendor kernels (chapter 4.2)</td></tr>
+<tr><td>RMSNorm (often fused with the residual add)</td><td>Reduction + element-wise</td><td>Memory</td><td>Engine custom kernels</td></tr>
+<tr><td>Rotary position embedding</td><td>Element-wise</td><td>Memory</td><td>Custom, often fused with the QKV split or the cache write</td></tr>
+<tr><td>SiLU(gate) × up</td><td>Element-wise</td><td>Memory</td><td>Custom fused kernel</td></tr>
+<tr><td>KV cache write</td><td>Scatter into pages</td><td>Memory</td><td>Custom (chapter 3.3)</td></tr>
+<tr><td>All-reduce (with tensor parallelism)</td><td>Collective</td><td>Interconnect</td><td>NCCL or custom all-reduce</td></tr>
+<tr><td>Sampling (top-k, top-p, penalties)</td><td>Sort or reduction</td><td>Memory and overhead</td><td>FlashInfer sampling kernels, custom</td></tr>
+</table></div>
+<p>The GEMMs and attention hold almost all the FLOPs. The rest hold few FLOPs but each costs at least one full read and write of an activation tensor plus a launch, which is why they are the first targets for fusion.</p>
+
+<h2 id="select">2. Where kernels come from, and kernel selection</h2>
+<ul>
+  <li><strong>Vendor libraries:</strong> cuBLAS (and cuBLASLt) for GEMMs, cuDNN for neural network primitives including attention. Solid defaults, closed source, tuned per GPU generation.</li>
+  <li><strong>Template libraries:</strong> CUTLASS and its layout layer CuTe (C++), and CuTe-DSL (Python), are NVIDIA's building blocks for custom high-performance GEMMs and attention; FlashAttention-3 and 4 are built on them.</li>
+  <li><strong>Open kernel libraries:</strong> FlashAttention, FlashInfer (attention and sampling for serving), DeepGEMM (FP8 GEMMs from DeepSeek), Marlin and Machete (mixed-precision 4-bit GEMMs).</li>
+  <li><strong>Compilers:</strong> <code>torch.compile</code> generates Triton kernels for fused element-wise and reduction chains (chapter 5.7); TensorRT builds an optimized engine per model and GPU.</li>
+</ul>
+<p>Kernels are tied to hardware: tile sizes, shared memory budgets and tensor-core instructions differ between generations, and a kernel may even be shape-specific. <strong>Kernel selection</strong>, choosing the best implementation for each operation, shape and GPU, is mostly automatic: libraries run heuristics or autotuning, and engines pick backends per GPU (chapter 4.2's attention priority list). Inference engineers mostly select, not write: swapping in DeepGEMM for FP8 GEMMs on Hopper, or a different attention backend, is a configuration change that must be benchmarked and checked for support on every GPU you deploy to.</p>
+
+<h2 id="fusion">3. Kernel fusion</h2>
+<p>Fusion combines several operations into one kernel so intermediate results stay in registers or shared memory instead of going through HBM. Each removed intermediate saves a full write and a full read of a tensor, plus a launch.</p>
+<div class="box ex">
+  <span class="lbl">Worked example: SiLU(gate) × up for one decode step</span>
+  <p>Llama 3.1 8B has an MLP width of 14,336. At batch 64 in BF16, each of the gate and up outputs is 64 × 14,336 × 2 bytes = 1.8 MB.</p>
+  <ul>
+    <li>Unfused: SiLU reads gate and writes a temporary (2 passes); the multiply reads the temporary and up and writes the result (3 passes). 5 × 1.8 MB = 9.2 MB, and 2 launches.</li>
+    <li>Fused: read gate and up, write the result. 3 × 1.8 MB = 5.5 MB, and 1 launch.</li>
+  </ul>
+  <p>40% less traffic for this operation, times 32 layers, every step. Small per kernel, large in total, and the same pattern repeats for RMSNorm, the residual add and RoPE.</p>
+</div>
+<h3>Kinds of fusion</h3>
+<ul>
+  <li><strong>Element-wise chains:</strong> any sequence of point-wise operations becomes one pass (activation × multiply, scaling, casting). Compilers do this well.</li>
+  <li><strong>Reduction plus element-wise:</strong> RMSNorm (sum of squares, then scale), softmax (max, sum of exponentials, then divide). Each row is reduced and normalized in one kernel; engines also fuse the residual add into RMSNorm.</li>
+  <li><strong>GEMM epilogues:</strong> bias, activation, scaling or quantization applied to the GEMM's output tile before it is written. CUTLASS and cuBLASLt support epilogue fusion.</li>
+  <li><strong>Whole algorithms:</strong> FlashAttention fuses two GEMMs, a mask and a softmax with online rescaling (chapter 4.2). Such fusions need hand-written kernels; compilers rarely find them.</li>
+</ul>
+<div class="widget" id="fuW">
+  <div class="wt">Interactive: memory traffic, unfused vs fused</div>
+  <div class="ws">Bytes moved through HBM for common operation chains, and the time at the GPU's bandwidth (memory-bound, so time ≈ bytes ÷ bandwidth). Launch overhead is added per kernel.</div>
+  <div class="ctrls">
+    <label>Chain <select id="fuC"><option value="sm">softmax over [M, N]</option><option value="sw" selected>SiLU(gate) × up</option><option value="rn">residual add + RMSNorm (eager: add, pow, mean, scale, weight)</option><option value="cc">x.cos().cos()</option></select></label>
+    <label>Rows M (tokens): <span class="mono" id="fuMv"></span><input type="range" id="fuM" min="0" max="13" step="1" value="6"></label>
+    <label>Columns N <select id="fuN"><option value="4096">4,096</option><option value="14336" selected>14,336</option><option value="128256">128,256 (vocabulary)</option></select></label>
+    <label>GPU <select id="fuG"><option value="320">T4 (320 GB/s)</option><option value="3350" selected>H100 (3,350 GB/s)</option></select></label>
+  </div>
+  <div class="stats" id="fuStats"></div>
+</div>
+
+<h2 id="triton">4. Triton: kernels in Python, one block at a time</h2>
+<p>CUDA C++ asks you to program individual threads and manage shared memory, synchronization and memory coalescing yourself. Triton raises the level: you write a <strong>program</strong> that handles one <strong>block</strong> of data (a vector or a tile), using whole-block operations such as load, add, max and dot. The Triton compiler decides how the block's threads and warps divide the work, uses shared memory, and coalesces loads. You keep control of what matters most: the block size, the order of loops, and what stays on chip.</p>
+<div class="tbl"><table>
+<tr><th>CUDA C++</th><th>Triton</th></tr>
+<tr><td>Kernel launches a grid of thread blocks</td><td>Kernel launches a grid of programs (one per block)</td></tr>
+<tr><td><code>blockIdx.x</code></td><td><code>tl.program_id(0)</code></td></tr>
+<tr><td>Each thread computes one index</td><td><code>offs = pid * BLOCK + tl.arange(0, BLOCK)</code>: a vector of indices</td></tr>
+<tr><td><code>if (i &lt; n)</code></td><td><code>mask = offs &lt; n</code>, passed to load and store</td></tr>
+<tr><td>Manual shared memory and <code>__syncthreads()</code></td><td>Handled by the compiler</td></tr>
+<tr><td>Manual tensor-core instructions</td><td><code>tl.dot</code> on tiles</td></tr>
+</table></div>
+<h3>Reading a Triton kernel, line by line</h3>
+<pre>@triton.jit
+def softmax_kernel(out_ptr, in_ptr, in_stride, out_stride, n_cols, BLOCK: tl.constexpr):
+    row = tl.program_id(0)                       # 1. one program per row
+    cols = tl.arange(0, BLOCK)                   # 2. the column indices this program covers
+    mask = cols &lt; n_cols                         # 3. BLOCK is a power of 2; mask the extra
+    x = tl.load(in_ptr + row * in_stride + cols, mask=mask, other=-float("inf"))   # 4. one read
+    x = x - tl.max(x, axis=0)                    # 5. reductions happen on chip
+    num = tl.exp(x)
+    y = num / tl.sum(num, axis=0)
+    tl.store(out_ptr + row * out_stride + cols, y, mask=mask)                      # 6. one write</pre>
+<p>Six things to look for in any Triton kernel: what one program covers (here a row), how indices are built, how the overhang is masked (padding with −∞ so the max ignores it), how many loads and stores touch HBM (here one each), what is reduced on chip, and which arguments are <code>tl.constexpr</code> (compile-time constants such as block sizes, for which Triton compiles a separate specialized kernel).</p>
+<p>The Triton tutorial measures this kernel at about 4 times the speed of the step-by-step PyTorch version and competitive with PyTorch's own softmax kernel, with the caveat that one row must fit in one program's block. Production kernels add autotuning (<code>@triton.autotune</code> over block sizes and warp counts), loops over large rows, and more numerics care.</p>
+<h3>When to use what</h3>
+<ul>
+  <li><strong>torch.compile</strong> first: it fuses element-wise and reduction chains into generated Triton kernels automatically.</li>
+  <li><strong>Hand-written Triton</strong> for custom fusions the compiler misses (a fused sampling step, a special normalization, a quantize-and-store), and for portability across NVIDIA and AMD GPUs. Many vLLM and SGLang kernels are Triton.</li>
+  <li><strong>CUDA C++, CUTLASS or CuTe</strong> for the last 10% to 30% on the most important kernels (GEMM, attention) on the newest hardware, where Triton cannot yet express every feature.</li>
+</ul>
+
+<h2 id="expert">5. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">From naive to near-cuBLAS GEMM</span>
+  <p>Simon Boehm's well-known walk-through takes a CUDA matrix multiply from a naive kernel to near cuBLAS speed in steps: coalesced global loads, shared memory tiling, then each thread computing several outputs (1D and 2D block tiling) for more reuse per load, vectorized loads, and finally warp-level tiling and autotuning. Each step raises arithmetic intensity at some level of the memory hierarchy. It is the best single exercise for understanding why GEMM libraries look the way they do (chapter 5.8).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Fusion across communication</span>
+  <p>With tensor parallelism, engines fuse the all-reduce with the following residual add and RMSNorm, or overlap GEMM tiles with sending finished tiles to other GPUs. These "compute-communication" fusions need kernels that talk to the network or NVLink directly, and are an active area in vLLM, SGLang and TensorRT-LLM.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Numerics in fused kernels</span>
+  <p>Fusion changes the order of floating-point operations, so fused and unfused results can differ in the last bits. Compute reductions in FP32 even for BF16 inputs (as the SiLU kernel in the lab does), and test fused kernels against a high-precision reference with tolerances. Chapter 6.6 discusses why this matters for reproducibility.</p>
+</div>
+
+<h2 id="mistakes">6. Common mistakes</h2>
+<ul>
+  <li>Writing a custom kernel before checking whether <code>torch.compile</code> or the engine already fuses the operation.</li>
+  <li>Benchmarking a kernel at one shape and deploying it at another.</li>
+  <li>Forgetting the mask, or padding a max with 0 instead of −∞.</li>
+  <li>Doing reductions in BF16.</li>
+  <li>Swapping in a faster kernel library without checking support on every GPU generation in the fleet.</li>
+  <li>Counting FLOPs to judge an element-wise kernel instead of bytes.</li>
+</ul>
+
+<h2 id="lab">7. Lab</h2>
+<p><strong>Goal:</strong> write, check and benchmark Triton kernels, and quantify what fusion saves.</p>
+<h3>Part A: the 100 Days notebook</h3>
+<p>Run day 07 (CUDA kernels and kernel fusion) of <em>100 Days of Inference</em>. It measures memory round trips for an unfused vs fused feed-forward pattern and benchmarks launch overhead. Check its launch-overhead figure against the note in References.</p>
+<h3>Part B: vector add and fused softmax (CPU interpreter, then T4)</h3>
+<p>Triton has an interpreter mode for checking logic without a GPU: set <code>TRITON_INTERPRET=1</code> in the environment before importing Triton (slow; correctness only). On a T4, leave it unset.</p>
+<pre>import torch, triton, triton.language as tl
+dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+@triton.jit
+def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs &lt; n
+    x = tl.load(x_ptr + offs, mask=mask)
+    y = tl.load(y_ptr + offs, mask=mask)
+    tl.store(out_ptr + offs, x + y, mask=mask)
+
+def add(x, y):
+    out = torch.empty_like(x); n = x.numel()
+    add_kernel[(triton.cdiv(n, 1024),)](x, y, out, n, BLOCK=1024)
+    return out
+
+# softmax_kernel exactly as in section 4, then:
+def softmax(x):
+    M, N = x.shape
+    out = torch.empty_like(x)
+    softmax_kernel[(M,)](out, x, x.stride(0), out.stride(0), N, BLOCK=triton.next_power_of_2(N))
+    return out
+
+x = torch.randn(10_003, device=dev); y = torch.randn(10_003, device=dev)
+print("add max error", (add(x, y) - (x + y)).abs().max().item())
+a = torch.randn(64, 781, device=dev)
+print("softmax max error", (softmax(a) - torch.softmax(a, dim=1)).abs().max().item())</pre>
+<details><summary>What we measured</summary><p>In the interpreter: add maximum error 0.0; softmax maximum error about 4 × 10⁻⁹. On a T4, benchmark with <code>triton.testing.do_bench</code> for a 4,096 × N input with N from 256 to 8,192, against <code>torch.softmax</code> and a step-by-step version (<code>x - x.max(1, keepdim=True)[0]</code>, <code>exp</code>, divide by the sum). Convert times to GB/s with 2 × M × N × 4 bytes for the fused kernels. Expect the step-by-step version at roughly a quarter of the fused bandwidth, as section 3 predicts.</p></details>
+<h3>Part C: write a fused SiLU × multiply</h3>
+<pre>@triton.jit
+def silu_mul_kernel(g_ptr, u_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs &lt; n
+    # TODO: load gate and up (convert to float32), compute g * sigmoid(g) * u,
+    #       store in the output's dtype: y.to(out_ptr.dtype.element_ty)
+
+def silu_mul(g, u):
+    out = torch.empty_like(g); n = g.numel()
+    silu_mul_kernel[(triton.cdiv(n, 1024),)](g, u, out, n, BLOCK=1024)
+    return out
+
+g, u = torch.randn(4, 5003, device=dev), torch.randn(4, 5003, device=dev)
+print("max error", (silu_mul(g, u) - torch.nn.functional.silu(g) * u).abs().max().item())</pre>
+<details><summary>Solution</summary>
+<pre>    g = tl.load(g_ptr + offs, mask=mask).to(tl.float32)
+    u = tl.load(u_ptr + offs, mask=mask).to(tl.float32)
+    y = g * tl.sigmoid(g) * u
+    tl.store(out_ptr + offs, y.to(out_ptr.dtype.element_ty), mask=mask)</pre>
+<p>Measured in the interpreter: maximum error about 5 × 10⁻⁷. On a T4 with BF16 tensors of 64 × 14,336, compare against <code>F.silu(g) * u</code> (two kernels). Predict the speedup from the widget (5 passes vs 3, plus one fewer launch), then measure. Then compare with <code>torch.compile(lambda g, u: F.silu(g) * u)</code>: the compiler should generate essentially the same fused kernel.</p></details>
+<h3>Part D: read a production kernel</h3>
+<p>In the vLLM or SGLang repository, find the fused residual-add + RMSNorm kernel (search for <code>fused_add_rms_norm</code>) and one Triton kernel (search for <code>@triton.jit</code>). For each, answer the six questions from section 4: what one program or block covers, index construction, masking, number of HBM reads and writes per element, on-chip reductions, and compile-time constants.</p>
+
+<h2 id="realworld">8. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Kernels in production</span>
+  <ul>
+    <li><strong>Engines</strong> ship dozens of custom fused kernels (RMSNorm with residual, rotary embedding with KV cache write, SiLU-and-multiply, quantize-on-store) next to library GEMMs and attention.</li>
+    <li><strong>Model launches</strong> often come with new kernels: DeepSeek released FlashMLA, DeepGEMM and DeepEP alongside its models.</li>
+    <li><strong>Triton</strong> is the common language for portable kernels across NVIDIA and AMD, and the target of PyTorch's compiler.</li>
+    <li><strong>Kernel selection</strong> per GPU generation is a routine part of upgrading hardware.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">9. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz54"></div>
+<script type="application/json" id="qz54">[
+{"q":"What does kernel fusion mainly save?","o":["FLOPs","HBM reads and writes of intermediate tensors, plus launches","Registers","Model memory"],"a":1,"e":"Intermediates stay on chip; each removed one saves a write and a read."},
+{"q":"In Triton, mask = offs < n is used to:","o":["Skip warps","Avoid reading or writing past the end of the data","Select a GPU","Set the block size"],"a":1,"e":"The last program's block can overhang the data."},
+{"q":"Why pad a softmax row with -inf rather than 0?","o":["Speed","So padded entries never become the max and contribute e^-inf = 0 to the sum","Triton requires it","To avoid NaN in the mask"],"a":1,"e":"Zeros could be the max and would add e^(0 − max) to the sum."},
+{"q":"Which fusion is hardest for compilers to find automatically?","o":["Two element-wise ops","FlashAttention-style fusion of matmuls with online softmax","Bias + activation","Casting"],"a":1,"e":"It needs an algorithmic change (online softmax, tiling), not just merging loops."},
+{"q":"tl.constexpr arguments are:","o":["Runtime values","Compile-time constants; Triton compiles a specialized kernel for each value","Pointers","Masks"],"a":1,"e":"Block sizes are typical constexpr parameters."},
+{"q":"A new FP8 GEMM library is faster on your H100s. Before rolling it out you must check:","o":["Nothing","Support and performance on every GPU generation and shape you serve","Only accuracy","Only the license"],"a":1,"e":"Kernels are hardware- and shape-specific."}
+]</script>
+
+<h2 id="summary">10. Summary</h2>
+<ul>
+  <li>A decode step runs GEMMs and attention (most FLOPs) plus many small memory-bound kernels (norms, activations, rotary, cache writes, sampling).</li>
+  <li>Kernels come from vendor libraries, template libraries, open kernel libraries and compilers; selection per GPU and shape is a real engineering task.</li>
+  <li>Fusion keeps intermediates on chip; it cut softmax traffic about 4 times and SiLU × multiply by 40% in the examples.</li>
+  <li>Triton programs one block at a time with masked loads and stores; the compiler handles threads, shared memory and coalescing.</li>
+  <li>Use the compiler first, Triton for custom fusions, and CUDA/CUTLASS for the most critical kernels on the newest hardware.</li>
+</ul>
+
+<h2 id="refs">11. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 4.1</td><td>CUDA kernels for inference, cuBLAS, CUTLASS, CuTe, FlashInfer, kernel selection and fusion.</td></tr>
+<tr><td><a href="https://triton-lang.org/main/getting-started/tutorials/index.html">Triton tutorials</a>: vector addition and fused softmax</td><td>The two kernels in the lab, and the 5MN + 2M traffic analysis of naive softmax.</td></tr>
+<tr><td><a href="https://horace.io/brrr_intro.html">Horace He: Making deep learning go brrrr</a></td><td>Why operator fusion is the most important compiler optimization.</td></tr>
+<tr><td><a href="https://siboehm.com/articles/22/CUDA-MMM">Simon Boehm: How to optimize a CUDA matmul kernel</a></td><td>A step-by-step path from a naive to a near-cuBLAS GEMM (optional deep dive).</td></tr>
+<tr><td><a href="https://hackbot.dad/writing/intro-to-gpus/">hackbot.dad: An introduction to GPUs</a></td><td>From CUDA kernels to reading Triton generated by the compiler.</td></tr>
+<tr><td>Hwu, Kirk and El Hajj, <em>Programming Massively Parallel Processors</em></td><td>Tiling, reductions and memory optimization in CUDA.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 07</td><td>Kernel dispatch, unfused vs fused FFN traffic and launch overhead.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The day 07 README of <em>100 Days of Inference</em> puts kernel launch overhead at about 10 to 50 µs. Typical figures for the launch itself are a few microseconds; tens of microseconds per operation usually include Python and framework dispatch. Measure your own stack (chapter 5.3, Part C).</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Lab kernels were checked with Triton 3.9 in interpreter mode.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$}=IE;
+function fu(){const c=$('fuC').value,M=2**+$('fuM').value,N=+$('fuN').value,BW=+$('fuG').value*1e9;$('fuMv').textContent=IE.int(M);
+  const E=M*N,b=2;let un,fu_,ku,kf,label;
+  if(c==='sm'){un=(8*E+4*M)*4;fu_=2*E*4;ku=5;kf=1;label='softmax (FP32)';}
+  else if(c==='sw'){un=5*E*b;fu_=3*E*b;ku=2;kf=1;label='SiLU(gate) × up';}
+  else if(c==='rn'){un=10*E*b;fu_=4*E*b;ku=5;kf=1;label='residual add + RMSNorm';}
+  else{un=4*E*b;fu_=2*E*b;ku=2;kf=1;label='cos(cos(x))';}
+  const lo=5e-6,tu=un/BW+ku*lo,tf=fu_/BW+kf*lo;
+  const f=t=>t<1e-3?(t*1e6).toFixed(1)+' µs':(t*1e3).toFixed(2)+' ms';
+  $('fuStats').innerHTML=[['Unfused traffic ('+ku+' kernels)',IE.gb(un)+' GB'],['Fused traffic (1 kernel)',IE.gb(fu_)+' GB'],['Unfused time',f(tu)],['Fused time',f(tf)],['Speedup',(tu/tf).toFixed(2)+'×']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['fuC','fuM','fuN','fuG'].forEach(id=>$(id).addEventListener('input',fu));fu();
+})();
+</script>

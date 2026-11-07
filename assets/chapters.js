@@ -214,7 +214,7 @@ window.IE_CHAPTERS = [
 "title": "Kernels, fusion and Triton",
 "slug": "5-4-kernels-fusion-triton",
 "part": 5,
-"ready": false
+"ready": true
 },
 {
 "n": "5.5",
