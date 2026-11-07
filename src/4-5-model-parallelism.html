@@ -1,0 +1,278 @@
+<div class="kicker">Part 4 · Model optimization · Chapter 4.5</div>
+<h1>Model parallelism</h1>
+<p class="lede">Large models do not fit on one GPU, and even when they fit, one GPU may be too slow or leave too little room for the KV cache. Parallelism spreads one model over several GPUs. There are four basic ways to split it (by replica, by tensor, by layer, by expert) plus a few special ones, and each trades memory, speed and communication differently. This chapter builds each split from a single matrix multiply, shows what it costs to communicate, and ends with a method for choosing a layout.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 5 hours with the lab</span>
+  <span class="chip">Needs: 1.1, 2.4, 2.5, 2.6</span>
+  <span class="chip">Compute: Colab CPU; Kaggle T4 ×2 for Part E</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why does tensor parallelism usually stay inside one node?</li>
+    <li>For decode at batch 1, does pipeline parallelism over 4 GPUs make each token faster?</li>
+    <li>With 256 routed experts and expert parallelism over 8 GPUs, how many experts does each GPU hold?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>It needs two all-reduces in every layer for every step. That is fine over NVLink (hundreds of GB/s, microseconds) but slow over the network between nodes (tens of GB/s per link, with more latency).</li>
+    <li>No. A token must pass through the 4 stages one after another, and each stage still reads its share of the weights. Pipelining helps fit and throughput, not single-token latency.</li>
+    <li>32 complete experts per GPU (256 ÷ 8).</li>
+  </ol></details>
+</div>
+
+<h2 id="why">1. Why split a model at all</h2>
+<p>Three reasons, in order of how often they decide the layout:</p>
+<ol>
+  <li><strong>It does not fit.</strong> Llama 3.1 70B in BF16 is 141 GB of weights; an H100 has 80 GB. DeepSeek-V3 (671B parameters) in FP8 is about 700 GB; a node of eight H100s has 640 GB.</li>
+  <li><strong>It fits, but leaves no room for the KV cache.</strong> Weights that fill 90% of memory leave space for only a handful of sequences (chapter 2.4). More GPUs means more total memory for KV, so bigger batches and longer contexts.</li>
+  <li><strong>It fits, but is too slow.</strong> Decode is bound by reading the weights (chapter 2.5). If 4 GPUs each read a quarter of the weights in parallel, each step can be up to 4 times faster, minus the cost of communicating.</li>
+</ol>
+<p>A first estimate of the GPUs needed: weight bytes plus the KV cache you want, divided by usable memory per GPU, rounded up to a size the hardware offers (1, 2, 4 or 8 GPUs in a node).</p>
+<div class="formula">GPUs ≥ (parameters × bytes per parameter + KV budget) ÷ (memory per GPU × usable fraction)</div>
+
+<h2 id="dp">2. Data parallelism: copies, not splits</h2>
+<p>The simplest option is not to split the model at all: run several complete copies (replicas) and send each request to one of them. No communication between replicas during inference, and throughput scales linearly with copies. It does not help a model that does not fit, and it does not make any single request faster. In engines this is <code>--data-parallel-size</code>, or just more replicas behind a router (chapter 6.4). Every other method below exists because data parallelism alone is not enough.</p>
+
+<h2 id="tp">3. Tensor parallelism: split every layer</h2>
+<p>Tensor parallelism (TP) splits each weight matrix across n GPUs. All GPUs work on every token at every layer, each with 1/n of the weights. Two splits of a matrix multiply Y = X W make this work:</p>
+<ul>
+  <li><strong>Column split.</strong> Split W by columns: GPU i holds Wᵢ and computes X Wᵢ, a slice of the output columns. No communication: every GPU already has the full input X.</li>
+  <li><strong>Row split.</strong> Split W by rows and X by columns: GPU i computes Xᵢ Wᵢ, a partial sum of the full output. The partial sums must be added across GPUs: an <strong>all-reduce</strong>.</li>
+</ul>
+<p>The standard transformer recipe (from Megatron-LM) pairs them so each block needs only one all-reduce:</p>
+<ul>
+  <li><strong>MLP:</strong> the first (up) projection is column-split, so each GPU applies the activation function to its own slice with no communication. The second (down) projection is row-split, and one all-reduce sums the result.</li>
+  <li><strong>Attention:</strong> heads are split across GPUs (column split of the Q, K and V projections). Each GPU runs attention for its own heads, with its own share of the KV cache. The output projection is row-split, followed by one all-reduce.</li>
+</ul>
+<p>So TP needs two all-reduces per layer, each of size [tokens in the step × model width], at every forward pass. Part C of the lab builds this split in a few lines and checks it matches the unsplit result.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Collective:</strong> a communication pattern among a group of GPUs. <strong>All-reduce:</strong> every GPU contributes a tensor and every GPU ends with the sum. <strong>All-gather:</strong> every GPU ends with all pieces. <strong>All-to-all:</strong> every GPU sends a different piece to every other GPU.</p>
+  <p><strong>Ring all-reduce:</strong> a common algorithm in which each GPU sends and receives about 2 × (n − 1) ÷ n times the tensor size. NCCL (NVIDIA) and RCCL (AMD) are the libraries that implement collectives.</p>
+</div>
+<h3>What TP costs: the interconnect</h3>
+<div class="tbl"><table>
+<tr><th>Link</th><th>Bandwidth per GPU (approximate, one direction)</th><th>Typical use</th></tr>
+<tr><td>HBM (for comparison)</td><td>3.35 TB/s (H100)</td><td>Reading weights and KV</td></tr>
+<tr><td>NVLink 4 with NVSwitch (H100, H200)</td><td>450 GB/s (900 GB/s both directions)</td><td>TP inside a node</td></tr>
+<tr><td>NVLink 5 (B200)</td><td>900 GB/s (1.8 TB/s both directions)</td><td>TP inside a node or an NVL72 rack</td></tr>
+<tr><td>PCIe 5 x16</td><td>About 64 GB/s</td><td>GPUs without NVLink</td></tr>
+<tr><td>InfiniBand NDR / 400 GbE</td><td>About 50 GB/s per port</td><td>Between nodes</td></tr>
+</table></div>
+<p>In decode each all-reduce is small (for Llama 3.1 70B at batch 64: 64 × 8,192 × 2 bytes = 1 MB) but there are 160 of them per step (2 per layer × 80 layers). Each one also has a fixed latency of several microseconds. Over NVLink the total is a modest share of the step; over PCIe or the network it can dominate. That is why TP is used inside a node, and why GPUs without NVLink scale poorly beyond TP 2.</p>
+<div class="widget" id="tpW">
+  <div class="wt">Interactive: tensor parallel decode of Llama 3.1 70B</div>
+  <div class="ws">BF16 weights (141 GB), 4K-token contexts, H100-class GPUs. Step time = memory time (weights and KV split over n GPUs) plus all-reduce time (2 per layer, ring algorithm, plus a fixed latency each). The compute bound is checked too. An idealized model: real systems overlap some communication with work.</div>
+  <div class="ctrls">
+    <label>Batch: <span class="mono" id="tpBv"></span><input type="range" id="tpB" min="0" max="8" step="1" value="5"></label>
+    <label>Link <select id="tpL"><option value="450">NVLink 4 (450 GB/s)</option><option value="64">PCIe 5 (64 GB/s)</option><option value="25">PCIe 4 (about 25 GB/s)</option></select></label>
+    <label>Latency per all-reduce (µs) <input type="number" id="tpLat" value="8" min="1" max="50" style="width:64px"></label>
+  </div>
+  <div class="svgwrap"><svg id="tpSvg" viewBox="0 0 680 230" width="680" style="max-width:100%;height:auto" role="img" aria-label="Decode step time by tensor parallel degree"></svg></div>
+  <div class="ws" id="tpNote"></div>
+</div>
+<p>Two things to see. On NVLink, going from TP 4 to TP 8 still cuts the step time noticeably, so per-user speed rises; on PCIe the communication eats most of the gain. And TP 1 and TP 2 are often impossible: the weights alone, or weights plus KV, do not fit.</p>
+<h3>Limits of TP</h3>
+<ul>
+  <li>The split must divide the number of attention heads (and KV heads). A model with 8 KV heads can use TP up to 8; beyond that, KV heads are replicated, not split.</li>
+  <li>MLA models (DeepSeek) have a single compressed latent per token, which cannot be split by head. Under TP, every GPU must hold the full latent cache: the KV cache is duplicated on every rank. The fix is data-parallel attention (section 6).</li>
+  <li>Efficiency per GPU falls as n grows: each GPU does less work per all-reduce.</li>
+</ul>
+
+<h2 id="pp">4. Pipeline parallelism: split by layers</h2>
+<p>Pipeline parallelism (PP) gives each GPU (or group of GPUs) a contiguous range of layers, a <strong>stage</strong>. Activations pass from one stage to the next: one [tokens × width] tensor per stage boundary per step, sent point to point. That is far less communication than TP, so PP works across nodes and over slower links.</p>
+<p>The cost is idle time. One request's token must go through the stages in order, so with P stages and one batch in flight, each GPU works 1/P of the time. These idle periods are pipeline <strong>bubbles</strong>. With M batches (micro-batches) in flight, the idle fraction is about (P − 1) ÷ (M + P − 1).</p>
+<div class="box ex">
+  <span class="lbl">Worked example</span>
+  <p>4 stages. One batch in flight: (4 − 1) ÷ (1 + 4 − 1) = 75% idle. Eight batches in flight: 3 ÷ 11 = 27%. Thirty-two: 3 ÷ 35 = 9%. Engines keep several batches in the pipeline at once so all stages stay busy; this raises throughput but does nothing for one token's latency.</p>
+</div>
+<p>PP is the usual way to cross nodes for a dense model (TP inside each node, PP between them), and to use GPU counts that do not divide the head count (for example 3 or 6 GPUs).</p>
+<pre># 2 nodes of 8 GPUs: TP 8 inside each node, 2 pipeline stages across nodes
+vllm serve meta-llama/Llama-3.1-405B-Instruct --tensor-parallel-size 8 --pipeline-parallel-size 2</pre>
+
+<h2 id="ep">5. Expert parallelism: split the experts</h2>
+<p>An MoE layer (chapter 2.6) has many experts, and each token uses only a few. Expert parallelism (EP) places whole experts on different GPUs: with 256 routed experts on 8 GPUs, each GPU holds 32. The router is small and replicated on every GPU.</p>
+<ol>
+  <li>Each GPU runs the router for its tokens and learns which experts they need.</li>
+  <li><strong>Dispatch:</strong> an all-to-all sends each token's hidden state to the GPUs holding its chosen experts.</li>
+  <li>Each GPU runs its experts on the tokens it received, as ordinary dense matmuls.</li>
+  <li><strong>Combine:</strong> another all-to-all sends results back, and each token sums its experts' outputs, weighted by the router.</li>
+</ol>
+<p>EP keeps each expert's weights whole, so every expert matmul is large and efficient, and it spreads the memory of hundreds of experts. The challenges: two all-to-alls per MoE layer, and <strong>load imbalance</strong>. If many tokens pick experts on the same GPU, that GPU becomes the straggler that everyone waits for. Production systems replicate popular experts on several GPUs (DeepSeek calls these redundant experts) and use specialized all-to-all kernels (for example DeepEP).</p>
+<div class="box watch">
+  <span class="lbl">Watch out</span>
+  <p>In vLLM, EP is not a separate size: it is a flag (<code>--enable-expert-parallel</code>) that changes how the MoE layers are split when TP or DP is greater than 1. Without it, every GPU holds a slice of every expert (TP-style sharding).</p>
+</div>
+
+<h2 id="combo">6. Combining them, and data-parallel attention</h2>
+<p>Real deployments mix methods, and often split different parts of the model differently. The most important mix for large MoE models is <strong>DP attention + EP experts</strong>:</p>
+<ul>
+  <li>Attention layers are replicated: each GPU runs full attention for its own subset of requests, holding only those requests' KV cache. No head splitting, so no KV duplication even for MLA.</li>
+  <li>MoE layers use EP across all GPUs: tokens from every GPU's requests are dispatched to the experts they need.</li>
+</ul>
+<p>AMD's vLLM benchmarks of DeepSeek-R1, Qwen3-235B and Llama 4 Maverick on MI300X found the crossover practitioners expect: TP + EP gives lower latency at low concurrency; DP + EP scales better for high-throughput batch serving.</p>
+<pre># one 8-GPU node: TP 8 for attention, experts split by EP (lower latency)
+vllm serve deepseek-ai/DeepSeek-V3 --tensor-parallel-size 8 --enable-expert-parallel
+# one 8-GPU node: DP 8 attention, EP experts (higher throughput)
+vllm serve deepseek-ai/DeepSeek-V3 --data-parallel-size 8 --enable-expert-parallel</pre>
+<h3>Context parallelism</h3>
+<p>For very long prompts, context parallelism (CP) splits the sequence itself across GPUs. Each GPU computes attention for its chunk of queries while keys and values are passed around a ring of GPUs (ring attention), and partial results are merged with the log-sum-exp trick from chapter 4.2. It cuts prefill time and per-GPU activation memory for million-token prompts, and is common in video generation. Chapter 4.7 returns to it.</p>
+
+<h2 id="choose">7. Choosing a layout</h2>
+<ol>
+  <li><strong>Fit.</strong> Find the smallest GPU count where weights plus a useful KV budget fit (section 1). Consider quantization first (chapter 4.1): FP8 often halves the GPU count.</li>
+  <li><strong>Inside a node, dense model:</strong> TP up to the node size. Larger TP lowers per-user latency; smaller TP with more replicas (DP) usually gives more throughput per GPU.</li>
+  <li><strong>Inside a node, MoE model:</strong> TP + EP for latency; DP attention + EP for throughput.</li>
+  <li><strong>Across nodes:</strong> TP inside, PP across (dense); or wide EP across nodes (MoE). Only cross nodes when the model or KV does not fit one node: otherwise extra nodes are better used as more replicas or for disaggregation (chapter 4.6).</li>
+  <li><strong>Measure.</strong> Benchmark two or three candidate layouts on your traffic (chapter 6.1). Interconnect, kernel support and batch size change the answer.</li>
+</ol>
+<div class="tbl"><table>
+<tr><th>Method</th><th>Splits</th><th>Communication</th><th>Helps</th><th>Typical scope</th></tr>
+<tr><td>DP</td><td>Requests (whole copies)</td><td>None</td><td>Throughput</td><td>Anywhere</td></tr>
+<tr><td>TP</td><td>Every weight matrix</td><td>2 all-reduces per layer per step</td><td>Fit, per-user latency</td><td>Inside a node (NVLink)</td></tr>
+<tr><td>PP</td><td>Layers into stages</td><td>Point to point between stages</td><td>Fit across nodes, throughput</td><td>Across nodes</td></tr>
+<tr><td>EP</td><td>Experts</td><td>2 all-to-alls per MoE layer</td><td>Fit and throughput for MoE</td><td>Inside and across nodes</td></tr>
+<tr><td>CP</td><td>The sequence</td><td>K and V passed around a ring</td><td>Very long prefills</td><td>Long-context and video</td></tr>
+</table></div>
+
+<h2 id="expert">8. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Hiding communication</span>
+  <p>Communication time only matters if the GPU waits for it. Engines overlap collectives with independent work: for example splitting a batch into two halves so one half's all-to-all runs while the other half computes (DeepSeek describes this "dual micro-batch" overlap for its serving). Custom all-reduce kernels for small decode tensors, and fusing the all-reduce with the following RMSNorm, cut the fixed latency per collective.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Rack-scale NVLink</span>
+  <p>NVL72 systems (GB200, GB300) connect 72 GPUs in one NVLink domain. Within that domain, collectives run at NVLink speed, so wide EP (and larger TP) no longer pays the inter-node penalty. This changes the layout trade-offs for the largest MoE models, which is why serving stacks for these systems emphasize wide expert parallelism.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Sequence parallelism and vocabulary parallelism</span>
+  <p>In training stacks such as Megatron-Core, the all-reduce after a row split is often replaced by a reduce-scatter (each GPU keeps a slice of the sequence for the element-wise ops) and an all-gather before the next column split. The embedding table and output head can be split by vocabulary. The same ideas appear in inference engines in simplified forms; the principle is always "decompose the tensor op, and pick the cheapest collective that restores what the next op needs".</p>
+</div>
+
+<h2 id="mistakes">9. Common mistakes</h2>
+<ul>
+  <li>Picking the smallest GPU count that fits the weights and leaving no room for the KV cache.</li>
+  <li>Running TP across nodes, or TP above 2 on GPUs connected only by PCIe.</li>
+  <li>Expecting pipeline parallelism to cut single-request latency.</li>
+  <li>Using TP for an MLA model at large scale and wondering why the KV cache is duplicated on every GPU.</li>
+  <li>Spreading a model over 16 GPUs when it fits on 8, instead of running two replicas.</li>
+  <li>Ignoring expert load imbalance when reading MoE benchmark numbers.</li>
+  <li>Choosing a TP size that does not divide the number of attention heads.</li>
+</ul>
+
+<h2 id="lab">10. Lab</h2>
+<p><strong>Goal:</strong> plan GPU counts with numbers, build tensor parallelism and a pipeline bubble model by hand, and measure TP on two real GPUs.</p>
+<h3>Part A: the 100 Days notebook</h3>
+<p>Run day 17 (model parallelism) of <em>100 Days of Inference</em>. Its bubble and throughput simulations match sections 4 and 7.</p>
+<h3>Part B: plan three deployments</h3>
+<ol>
+  <li>Llama 3.1 70B in BF16 on H100 80 GB. How many GPUs to fit the weights, and how many to also hold 64 sequences of 8K tokens (KV 320 KiB per token) with a 0.9 usable fraction?</li>
+  <li>The same model in FP8 (weights and KV).</li>
+  <li>DeepSeek-V3 (671B, FP8, about 700 GB of weights) on H100 vs H200 (141 GB) nodes of 8.</li>
+</ol>
+<details><summary>Answers</summary><ol>
+  <li>Weights 141 GB → 2 GPUs (144 GB usable) barely fit the weights with almost nothing left. KV: 64 × 8,192 × 327,680 bytes = 172 GB. Total 313 GB ÷ 72 GB usable = 4.3, so TP 8 (TP must be a power of 2 that divides 64 heads and 8 KV heads; 4 is not enough).</li>
+  <li>Weights 70.6 GB, KV 86 GB: 157 GB ÷ 72 = 2.2, so TP 4 with room to spare, or TP 2 with fewer sequences.</li>
+  <li>8 × H100 = 640 GB total, less than the weights: does not fit in one node (needs 2 nodes or a smaller format). 8 × H200 = 1,128 GB: fits with about 300 GB usable for KV after a 0.9 fraction. This is why DeepSeek-V3 is commonly served on one H200 or B200 node.</li>
+</ol></details>
+<h3>Part C: tensor parallelism by hand (CPU, seconds)</h3>
+<pre>import torch
+torch.manual_seed(0)
+B, D, F, n = 4, 512, 2048, 4                  # tokens, width, MLP width, "GPUs"
+x = torch.randn(B, D)
+W1, W2 = torch.randn(D, F) / D**0.5, torch.randn(F, D) / F**0.5
+ref = torch.relu(x @ W1) @ W2                  # full MLP on one device
+
+# TODO: split W1 by columns and W2 by rows into n pieces (torch.chunk),
+#       compute each "GPU's" partial output relu(x @ W1_g) @ W2_g,
+#       then sum the partials (that sum is the all-reduce).
+out = ...
+print("max error vs full:", (out - ref).abs().max().item())</pre>
+<details><summary>Solution</summary>
+<pre>W1s, W2s = W1.chunk(n, dim=1), W2.chunk(n, dim=0)
+partials = [torch.relu(x @ W1s[g]) @ W2s[g] for g in range(n)]
+out = sum(partials)</pre>
+<p>Measured maximum error: about 1 × 10⁻⁶ (float32 rounding). Each "GPU" holds a quarter of the weights; the only communication is one sum of a [tokens × width] tensor. Now try splitting W1 by rows instead: the activation function would see partial sums, so you would need a second all-reduce before it. That is why the up projection is column-split.</p></details>
+<h3>Part D: pipeline bubbles</h3>
+<pre>def bubble(P, M):           # P stages, M micro-batches, 1 time unit per stage per micro-batch
+    return (P - 1) / (M + P - 1)
+for P in [2, 4, 8]:
+    print(P, [f"{bubble(P, M):.0%}" for M in (1, 8, 32)])</pre>
+<details><summary>What we measured</summary><p>P = 2: 50%, 11%, 3%. P = 4: 75%, 27%, 9%. P = 8: 88%, 47%, 18%. Deep pipelines need many batches in flight to stay busy, which is why PP is used for as few stages as possible.</p></details>
+<h3>Part E: TP on two GPUs (Kaggle T4 ×2)</h3>
+<p>Kaggle's free tier offers two T4s in one machine, connected over PCIe (no NVLink). Serve Qwen2.5-3B-Instruct in FP16 with <code>--tensor-parallel-size 1</code> and then <code>2</code>. Compare the KV cache size in the startup log, single-request tokens per second, and throughput at 32 concurrent requests. Predict first with the widget (choose the PCIe 4 link). Explain why TP 2 gives more KV capacity but only a modest per-user speedup here.</p>
+
+<h2 id="realworld">11. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Layouts in production</span>
+  <ul>
+    <li><strong>Dense 70B-class models</strong> are commonly served at TP 2 to 8 inside one node, with many replicas.</li>
+    <li><strong>Large MoE models</strong> (DeepSeek, Kimi, Qwen3-235B) use EP, often with DP attention, on one 8-GPU H200 or B200 node, or wide EP across nodes or NVL72 racks for the largest deployments.</li>
+    <li><strong>405B-class dense models</strong> in BF16 need two nodes (TP 8 × PP 2) or FP8 on one node.</li>
+    <li><strong>Kubernetes stacks</strong> (llm-d, Dynamo, KServe) treat a multi-GPU or multi-node replica as one unit that is scheduled, scaled and restarted together.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">12. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz45"></div>
+<script type="application/json" id="qz45">[
+{"q":"In the Megatron MLP split, why is the up projection split by columns?","o":["To save memory","So each GPU can apply the activation to its own slice without communicating","Because rows are larger","For FP8"],"a":1,"e":"A row split would leave partial sums, which need an all-reduce before the non-linearity."},
+{"q":"How many all-reduces does TP need per transformer layer per forward pass?","o":["0","1","2","One per head"],"a":2,"e":"One after attention's output projection and one after the MLP's down projection."},
+{"q":"Pipeline parallelism with 4 stages and 1 batch in flight keeps each GPU busy about:","o":["100%","25% of the time","50%","75%"],"a":1,"e":"Idle fraction (P−1)/(M+P−1) = 3/4."},
+{"q":"Expert parallelism communicates with:","o":["All-reduce per layer","Two all-to-alls per MoE layer (dispatch and combine)","Point to point between stages","Nothing"],"a":1,"e":"Tokens are sent to their experts' GPUs and the results sent back."},
+{"q":"Why does TP duplicate the KV cache of an MLA model?","o":["MLA uses FP32","The single latent cannot be split by heads, so every TP rank needs all of it","NCCL requires it","It does not"],"a":1,"e":"DP attention avoids this by splitting requests instead of heads."},
+{"q":"A model fits on one 8-GPU node. You have two nodes. Usually best:","o":["TP 16 across both","TP 8 × PP 2","Two replicas of TP 8 (or disaggregation)","EP 16 always"],"a":2,"e":"Crossing nodes adds communication; extra nodes are usually better as replicas."},
+{"q":"For a large MoE at high concurrency on one node, which tends to give more throughput?","o":["TP + EP","DP attention + EP","PP 8","No parallelism"],"a":1,"e":"Benchmarks show DP + EP scaling better for high-throughput serving; TP + EP wins on latency."}
+]</script>
+
+<h2 id="summary">13. Summary</h2>
+<ul>
+  <li>Split a model when it does not fit, when it leaves no room for KV, or when one GPU is too slow.</li>
+  <li>DP copies the model (no communication); TP splits every matrix (two all-reduces per layer, NVLink only); PP splits layers (cheap communication, bubbles); EP spreads experts (all-to-all, load balance); CP splits long sequences.</li>
+  <li>Column then row split gives TP one all-reduce per block; heads split naturally in attention.</li>
+  <li>Large MoE models use EP, often with DP attention to avoid KV duplication.</li>
+  <li>Choose the smallest layout that fits with KV headroom, stay inside a node when possible, and measure two or three candidates on real traffic.</li>
+</ul>
+
+<h2 id="refs">14. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 5.4</td><td>Minimum GPU counts, TP, EP and PP trade-offs, and multi-node layouts (TP8PP2, EP16).</td></tr>
+<tr><td><a href="https://ailzhang.github.io/posts/distributed-compute-in-transformer/">Ailing Zhang: Distributed compute in transformers</a></td><td>Diagrams of where each collective happens for DP, TP, SP, CP, EP and vocabulary parallelism.</td></tr>
+<tr><td><a href="https://rocm.blogs.amd.com/software-tools-optimization/vllm-moe-guide/README.html">AMD: The vLLM MoE playbook</a></td><td>TP, DP, PP and EP in vLLM, DP attention, KV duplication with MLA, and measured crossovers.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/1909.08053">Shoeybi et al., Megatron-LM</a></td><td>The column-then-row split for transformer layers.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 technical report</a></td><td>Expert parallelism at scale, redundant experts and communication overlap.</td></tr>
+<tr><td><a href="https://jax-ml.github.io/scaling-book/">How to Scale Your Model (the JAX scaling book)</a></td><td>A thorough treatment of sharding and collectives, with exercises.</td></tr>
+<tr><td>Fuheng Wu, <em>Distributed AI Systems</em></td><td>Collectives, NCCL and parallel serving in depth.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, distributed inference chapters</td><td>NVLink, NCCL tuning and multi-GPU inference performance.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 17</td><td>Bubble and throughput simulations for each method.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The Kiely book's table describes pipeline stages as handling "the forward and backward pass". Inference has no backward pass; the description is carried over from training.</li>
+  <li>The Kiely book says EP needs less communication than TP. That depends on the model and batch: EP avoids per-layer all-reduces in the MoE layers but adds two all-to-alls, whose cost grows with tokens and suffers from load imbalance. Measure both for your model.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Lab Parts C and D were run on CPU with PyTorch 2.15.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+function tp(){const B=2**+$('tpB').value,L=+$('tpL').value*1e9,lat=+$('tpLat').value*1e-6;$('tpBv').textContent=B;
+  const W=141.2e9,KV=327680*4096*B,P=70.6e9,layers=80,D=8192;
+  const rows=[1,2,4,8].map(n=>{const fit=(W+KV)/n<=80e9*0.9;const mem=(W+KV)/(n*3.35e12);const comp=2*P*B/(n*989e12);
+    const ar=n>1?2*layers*(lat+2*(n-1)/n*B*D*2/L):0;const t=Math.max(mem,comp)+ar;return {n,fit,t,mem,ar};});
+  const svg=$('tpSvg');svg.innerHTML='';const mx=Math.max(...rows.map(r=>r.t));
+  rows.forEach((r,i)=>{const y=14+i*52;el('text',{x:0,y:y+21,fill:css('--ink'),'font-size':13},svg,'TP '+r.n);
+    const wm=300*Math.max(r.mem,r.t-r.ar)/mx,wa=300*r.ar/mx;
+    el('rect',{x:60,y,width:wm,height:30,rx:3,fill:css('--kv'),'fill-opacity':r.fit?.95:.3},svg);
+    el('rect',{x:60+wm,y,width:wa,height:30,rx:3,fill:css('--dec'),'fill-opacity':r.fit?.95:.3},svg);
+    el('text',{x:68+wm+wa,y:y+13,fill:css('--ink'),'font-size':12},svg,(r.t*1e3).toFixed(1)+' ms/step'+(r.fit?'':'  (does not fit)'));
+    el('text',{x:68+wm+wa,y:y+28,fill:css('--ink2'),'font-size':11},svg,r.fit?IE.int(1/r.t)+' tok/s per user · '+IE.int(B/r.t/r.n)+' tok/s per GPU':'weights + KV exceed 72 GB per GPU');});
+  el('rect',{x:60,y:222,width:12,height:6,fill:css('--kv')},svg);el('text',{x:76,y:229,fill:css('--ink2'),'font-size':11},svg,'memory or compute');
+  el('rect',{x:200,y:222,width:12,height:6,fill:css('--dec')},svg);el('text',{x:216,y:229,fill:css('--ink2'),'font-size':11},svg,'all-reduce communication');
+  $('tpNote').textContent=`KV cache for the batch: ${IE.gb(KV)} GB. Each all-reduce carries ${IE.int(B*D*2/1024)} KiB; there are ${2*layers} per step.`;}
+['tpB','tpL','tpLat'].forEach(id=>$(id).addEventListener('input',tp));IE.onTheme(tp);
+})();
+</script>

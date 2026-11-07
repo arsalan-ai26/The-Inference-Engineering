@@ -172,7 +172,7 @@ window.IE_CHAPTERS = [
 "title": "Model parallelism",
 "slug": "4-5-model-parallelism",
 "part": 4,
-"ready": false
+"ready": true
 },
 {
 "n": "4.6",
