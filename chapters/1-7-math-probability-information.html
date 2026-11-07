@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>1.7 Math for papers I: expectation, sampling proofs and information (optional)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="1.7">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 1 · Chapter 1.7</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 1 · Math, PyTorch and neural net foundations · Chapter 1.7 (optional)</div>
+<h1>Math for papers I: expectation, sampling proofs and information</h1>
+<p class="lede">Chapters 1.1 to 1.5 are enough to follow the book. The papers it cites go further: speculative decoding papers prove that their output distribution is exact, quantization and distillation papers measure loss in KL divergence and perplexity, and RL papers weight samples by probability ratios. This optional chapter, the first of four, covers the probability and information theory those papers assume, one idea at a time, each checked in code.</p>
+<div class="meta">
+  <span class="chip">Level: optional, for reading papers</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 1.2, 1.5</span>
+  <span class="chip">Compute: CPU, seconds</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>A draft token is accepted with probability 0.8, independently, and you draft 4. How many tokens does one target pass produce on average?</li>
+    <li>KL(p‖q) is 0.24 nats. What is KL(q‖p)?</li>
+    <li>A model's cross-entropy on some text is 1.44 nats per token. What is its perplexity?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>(1 − 0.8⁵) ÷ (1 − 0.8) ≈ 3.36: the expected number of accepted drafts plus the one token the target always adds.</li>
+    <li>Not determined: KL is not symmetric. In the lab's example it is 0.21.</li>
+    <li>e^1.44 ≈ 4.2: on average the model is as unsure as a uniform choice among about 4 tokens.</li>
+  </ol></details>
+</div>
+
+<h2 id="map">1. Where the papers use this</h2>
+<div class="tbl"><table>
+<tr><th>Idea</th><th>Papers and chapters that rely on it</th></tr>
+<tr><td>Expectation, geometric series</td><td>Speculative decoding speedup (Leviathan et al., Medusa, EAGLE-3; chapter 4.3); DSpark's expected accepted length (4.8)</td></tr>
+<tr><td>Rejection sampling</td><td>The lossless proof of speculative sampling (4.3), SpecInfer's tree verification</td></tr>
+<tr><td>Entropy, cross-entropy, perplexity</td><td>Quality of quantized models (GPTQ, AWQ, QuaRot, SqueezeLLM; 4.1), long-context and KV compression evaluations (4.7)</td></tr>
+<tr><td>KL divergence, forward and reverse</td><td>Distillation and on-policy distillation (7.5, the DeepSeek-V4 and V4.1 reports), RLHF and GRPO's KL penalty (7.4), DPO (chapter 1.9)</td></tr>
+<tr><td>Log-sum-exp</td><td>Online softmax, FlashAttention and Flash-Decoding (4.2), Hydragen's merge (4.4)</td></tr>
+<tr><td>Importance sampling and ratios</td><td>PPO and GRPO's clipped ratios, MiniMax-M1's CISPO (7.4), off-policy RL with stale rollouts (7.7)</td></tr>
+</table></div>
+
+<h2 id="expect">2. Random variables and expectation</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Random variable:</strong> a quantity whose value depends on chance, such as the number of draft tokens accepted in one speculative step.</p>
+  <p><strong>Expectation (mean):</strong> the probability-weighted average of its values, E[X] = Σ x × P(X = x). Expectation is linear: E[X + Y] = E[X] + E[Y] even when X and Y depend on each other.</p>
+  <p><strong>Variance:</strong> the expected squared distance from the mean, Var[X] = E[(X − E[X])²]; its square root is the standard deviation.</p>
+</div>
+<p>Linearity is the tool papers use most. To count accepted drafts, write the count as a sum of indicators: I<sub>i</sub> = 1 if draft i is accepted (which needs every draft before it accepted too), else 0. If each is accepted with probability α independently, P(I<sub>i</sub> = 1) = α<sup>i</sup>, so</p>
+<div class="formula">E[accepted] = α + α² + … + α^k        E[tokens per pass] = 1 + α + … + α^k = (1 − α^(k+1)) ÷ (1 − α)</div>
+<p>The last step is the <strong>geometric series</strong>: 1 + α + … + α^k times (1 − α) telescopes to 1 − α^(k+1). Every speculative decoding paper's speedup formula starts here; lab Part A checks it by simulation.</p>
+
+<h2 id="reject">3. Rejection sampling: why speculation is exact</h2>
+<p>A draft model proposes token x with probability q(x); the target model would have chosen it with probability p(x). The rule from Leviathan et al. (chapter 4.3):</p>
+<ol>
+  <li>Accept x with probability min(1, p(x) ÷ q(x)).</li>
+  <li>If rejected, sample a replacement from the <strong>residual</strong> distribution: max(0, p − q), rescaled to sum to 1.</li>
+</ol>
+<p>Why the output follows p exactly: the chance of outputting x through acceptance is q(x) × min(1, p(x)/q(x)) = min(p(x), q(x)). The total acceptance probability is β = Σ min(p, q), so rejection happens with probability 1 − β = Σ max(0, p − q), and the replacement step adds (1 − β) × max(0, p(x) − q(x)) ÷ (1 − β) = max(0, p(x) − q(x)). Adding the two: min(p, q) + max(0, p − q) = p(x). The acceptance rate β = Σ min(p, q) is also how similar the two distributions are, which is why a drafter trained to imitate the target (EAGLE, MTP, DSpark) gets long accepted runs. Lab Part B runs the rule 400,000 times.</p>
+
+<h2 id="info">4. Entropy, cross-entropy, KL and perplexity</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Entropy:</strong> H(p) = −Σ p(x) log p(x), the average surprise of outcomes drawn from p; zero when one outcome is certain, largest when all are equally likely. With natural logs the unit is nats; with log base 2, bits.</p>
+  <p><strong>Cross-entropy:</strong> CE(p, q) = −Σ p(x) log q(x), the average surprise when outcomes come from p but you predict with q. A language model's training loss is the cross-entropy between the text and the model.</p>
+  <p><strong>KL divergence:</strong> KL(p‖q) = Σ p(x) log(p(x) ÷ q(x)) = CE(p, q) − H(p), the extra surprise caused by using q instead of p. It is never negative and is zero only when q = p.</p>
+  <p><strong>Perplexity:</strong> e raised to the cross-entropy per token; the number of equally likely choices that would be as confusing as the model is.</p>
+</div>
+<p>Three facts that papers use without saying:</p>
+<ul>
+  <li><strong>Perplexity differences are KL differences.</strong> The text's own entropy is fixed, so when a quantized model's perplexity rises from 4.0 to 4.1, its KL from the true distribution rose by log(4.1 ÷ 4.0) ≈ 0.025 nats per token. Many quantization papers report perplexity; some report the KL between the original and the quantized model directly, which is the cleaner measure.</li>
+  <li><strong>KL is not symmetric.</strong> Minimizing KL(p‖q) over q (forward KL, what standard distillation and SFT do) makes q cover everything p might do. Minimizing KL(q‖p) (reverse KL, what on-policy distillation and RL's KL penalty measure on the student's own samples) lets q pick the modes of p and ignore the rest.</li>
+  <li><strong>Per-token, then averaged.</strong> Papers compute these per position and average over tokens. A small average can hide a few positions with large divergence; that is why chapter 7.6 also checks task accuracy.</li>
+</ul>
+<div class="widget" id="klW">
+  <div class="wt">Interactive: how far is a student from its teacher?</div>
+  <div class="ws">Teacher p is fixed over five tokens. The student q is the teacher's logits divided by a temperature, plus an optional shift toward one token. Watch the two KLs differ.</div>
+  <div class="ctrls">
+    <label>Student temperature: <span class="mono" id="klTv"></span><input type="range" id="klT" min="0.3" max="3" step="0.05" value="1.5"></label>
+    <label>Extra weight on token E: <span class="mono" id="klSv"></span><input type="range" id="klS" min="0" max="3" step="0.1" value="0"></label>
+  </div>
+  <div class="svgwrap"><svg id="klSvg" viewBox="0 0 680 220" width="680" style="max-width:100%;height:auto" role="img" aria-label="Teacher and student distributions"></svg></div>
+  <div class="legend"><span><i style="background:var(--pre)"></i>Teacher p</span><span><i style="background:var(--dec)"></i>Student q</span></div>
+  <div class="stats" id="klStats"></div>
+</div>
+
+<h2 id="lse">5. Log-sum-exp</h2>
+<p>Softmax divides e<sup>z<sub>i</sub></sup> by Σ e<sup>z<sub>j</sub></sup>. For logits near 1,000, e<sup>z</sup> overflows to infinity. Since softmax is unchanged when every z shifts by the same constant, subtract the maximum m first: log Σ e<sup>z<sub>j</sub></sup> = m + log Σ e<sup>z<sub>j</sub> − m</sup>. This <strong>log-sum-exp</strong> identity is what lets FlashAttention process keys in blocks: each block keeps its own maximum and sum, and two partial results merge by rescaling with e<sup>m<sub>old</sub> − m<sub>new</sub></sup> (chapter 4.2). Flash-Decoding, Hydragen and context parallelism all merge partial attention this way.</p>
+
+<h2 id="is">6. Importance sampling</h2>
+<p>To estimate an average under p using samples drawn from a different distribution b, weight each sample by the <strong>importance ratio</strong> p(x) ÷ b(x): E<sub>p</sub>[f] = E<sub>b</sub>[(p/b) × f]. The estimate stays unbiased, but when b puts little probability where p puts a lot, a few samples get huge weights and the variance explodes. RL for LLMs meets this constantly: rollouts come from an older copy of the policy (or a different engine with slightly different numerics, chapter 6.6), so the trainer weights them by π<sub>new</sub> ÷ π<sub>old</sub>. PPO and GRPO clip that ratio to a band such as [0.8, 1.2]; MiniMax-M1's CISPO clips the importance-sampling weight instead of dropping tokens (chapter 7.4). Lab Part E shows the variance growing as b moves away from p.</p>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Bits per byte and comparing tokenizers</span>
+  <p>Perplexity per token depends on the tokenizer: a tokenizer with longer tokens has fewer, harder predictions. To compare models with different tokenizers, papers convert to bits per byte (or per character): total cross-entropy in bits divided by the number of bytes of text. The DeepSeek-V4.1-Flash report compares its base models this way.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Variance of an estimate falls as 1/N</span>
+  <p>The standard deviation of an average of N independent samples is σ ÷ √N. Halving the error of an acceptance-rate or accuracy estimate costs four times the samples. Chapter 1.10 turns this into confidence intervals.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Mixing nats and bits (a factor of ln 2 ≈ 0.693).</li>
+  <li>Treating KL as a distance: it is not symmetric and does not satisfy the triangle inequality.</li>
+  <li>Comparing perplexities across tokenizers or context lengths.</li>
+  <li>Multiplying many small probabilities instead of adding log-probabilities, then underflowing to zero.</li>
+  <li>Using unclipped importance ratios from stale rollouts.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p>All parts run in a few seconds with NumPy. Predict each result before running.</p>
+<pre>import numpy as np
+rng = np.random.default_rng(0)
+# Part A: expected tokens per target pass in speculative decoding, simulation vs formula
+alpha, k, n = 0.8, 4, 200_000
+accepted = np.zeros(n, dtype=int)
+alive = np.ones(n, dtype=bool)
+for i in range(k):                                   # draft i survives only if all earlier ones did
+    alive &amp;= rng.random(n) &lt; alpha
+    accepted += alive
+sim = (accepted + 1).mean()                          # +1: the target always adds one token of its own
+formula = (1 - alpha ** (k + 1)) / (1 - alpha)
+print(f"A  tokens per pass: simulated {sim:.4f}, formula (1-a^(k+1))/(1-a) = {formula:.4f}")
+
+# Part B: the speculative sampling rule keeps the target distribution exactly
+p = np.array([0.50, 0.25, 0.15, 0.10])               # target model
+q = np.array([0.20, 0.40, 0.30, 0.10])               # draft model
+m = 400_000
+x = rng.choice(4, size=m, p=q)                       # draft proposes
+accept = rng.random(m) &lt; np.minimum(1, p[x] / q[x])  # accept with min(1, p/q)
+resid = np.maximum(p - q, 0); resid /= resid.sum()   # on rejection, sample from norm(max(0, p - q))
+out = np.where(accept, x, rng.choice(4, size=m, p=resid))
+print("B  target p:     ", p)
+print("   output share: ", np.round(np.bincount(out, minlength=4) / m, 4))
+print(f"   acceptance rate {accept.mean():.4f}, theory sum(min(p,q)) = {np.minimum(p, q).sum():.4f}")
+
+# Part C: entropy, cross-entropy, KL and perplexity (natural log, nats)
+H = lambda a: -(a * np.log(a)).sum()
+CE = lambda a, b: -(a * np.log(b)).sum()
+KL = lambda a, b: (a * np.log(a / b)).sum()
+print(f"C  H(p) = {H(p):.4f}, CE(p,q) = {CE(p,q):.4f}, KL(p||q) = {KL(p,q):.4f} (= CE - H: {CE(p,q)-H(p):.4f})")
+print(f"   KL(q||p) = {KL(q,p):.4f}  (not symmetric)")
+print(f"   perplexity of q on text drawn from p: exp(CE) = {np.exp(CE(p,q)):.3f}; best possible exp(H) = {np.exp(H(p)):.3f}")
+
+# Part D: log-sum-exp keeps softmax finite
+z = np.array([1000.0, 999.0, 990.0])
+with np.errstate(over="ignore", invalid="ignore"):
+    naive = np.exp(z) / np.exp(z).sum()
+stable = np.exp(z - z.max()) / np.exp(z - z.max()).sum()
+print("D  naive softmax:", naive, " stable:", np.round(stable, 6))
+
+# Part E: importance sampling, and why large ratios are clipped
+f = np.array([1.0, 0.0, 0.0, 5.0])                   # a reward per outcome
+true = (p * f).sum()
+for name, b in [("close", q), ("far", np.array([0.70, 0.27, 0.025, 0.005]))]:
+    s = rng.choice(4, size=(2000, 200), p=b)         # 2,000 estimates of 200 samples each
+    w = p[s] / b[s]
+    est = (w * f[s]).mean(axis=1)
+    print(f"E  behaviour '{name}': true {true:.3f}, mean estimate {est.mean():.3f}, std of estimate {est.std():.3f}, max ratio {w.max():.1f}")</pre>
+<details><summary>What we measured</summary><pre class="out">A  tokens per pass: simulated 3.3665, formula (1-a^(k+1))/(1-a) = 3.3616
+B  target p:      [0.5  0.25 0.15 0.1 ]
+   output share:  [0.4998 0.2502 0.1494 0.1007]
+   acceptance rate 0.7006, theory sum(min(p,q)) = 0.7000
+C  H(p) = 1.2080, CE(p,q) = 1.4446, KL(p||q) = 0.2367 (= CE - H: 0.2367)
+   KL(q||p) = 0.2127  (not symmetric)
+   perplexity of q on text drawn from p: exp(CE) = 4.240; best possible exp(H) = 3.347
+D  naive softmax: [nan nan nan]  stable: [7.31034e-01 2.68932e-01 3.30000e-05]
+E  behaviour 'close': true 1.000, mean estimate 1.002, std of estimate 0.118, max ratio 2.5
+E  behaviour 'far': true 1.000, mean estimate 1.000, std of estimate 0.487, max ratio 20.0</pre>
+<p>A: simulation and the geometric-series formula agree. B: the output frequencies match the target p to three decimals although every sample was proposed by q, and the acceptance rate equals Σ min(p, q). C: KL equals cross-entropy minus entropy, and swapping the arguments gives a different number. D: the naive softmax overflows; subtracting the maximum fixes it. E: both estimates are unbiased, but the far behaviour distribution has four times the standard deviation, driven by ratios up to 20.</p></details>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Where this shows up</span>
+  <ul>
+    <li><strong>Engines</strong> implement the rejection rule in their speculative samplers and compute log-probabilities with log-sum-exp.</li>
+    <li><strong>Quantization tooling</strong> reports perplexity or KL against the original model as the first quality check.</li>
+    <li><strong>RL frameworks</strong> log the importance ratio and its clipping fraction as health metrics.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz17"></div>
+<script type="application/json" id="qz17">[
+{"q":"Why does speculative sampling keep the target distribution exactly?","o":["Drafts are always correct","Accepted mass min(p,q) plus resampled mass max(0,p−q) adds up to p","The target recomputes every token","Temperature is set to 0"],"a":1,"e":"Section 3 adds the two paths."},
+{"q":"KL(p‖q) equals:","o":["CE(p,q) + H(p)","CE(p,q) − H(p)","H(q) − H(p)","KL(q‖p)"],"a":1,"e":"The extra surprise from predicting with q."},
+{"q":"Perplexity rises from 4.0 to 4.4. The cross-entropy rose by about:","o":["0.4 nats","0.095 nats","1.1 nats","It cannot be said"],"a":1,"e":"ln(4.4/4.0) ≈ 0.095."},
+{"q":"Why subtract the maximum logit before exponentiating?","o":["It changes the result to be more accurate","Softmax is shift-invariant, and it prevents overflow","It speeds up the GPU","It removes the top token"],"a":1,"e":"The log-sum-exp identity."},
+{"q":"Why do PPO and GRPO clip the probability ratio?","o":["To make training deterministic","To bound the variance and size of updates from samples of an older policy","To save memory","Because KL is asymmetric"],"a":1,"e":"Large importance ratios make estimates noisy and updates unstable."},
+{"q":"Each of 5 drafts is accepted with probability 0.6 (independently, each needing the previous). Expected tokens per pass?","o":["About 2.38","3.0","5","0.6"],"a":0,"e":"(1 − 0.6⁶) ÷ 0.4 ≈ 2.38."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Linearity of expectation plus the geometric series gives every speculative speedup formula.</li>
+  <li>Accept with min(1, p/q), resample from max(0, p − q): output follows p exactly; acceptance rate is Σ min(p, q).</li>
+  <li>Cross-entropy = entropy + KL; perplexity is e^cross-entropy; KL is asymmetric, and the direction matters for distillation and RL.</li>
+  <li>Log-sum-exp makes softmax stable and lets attention be computed in blocks and merged.</li>
+  <li>Importance ratios re-weight samples from another distribution; clipping keeps their variance in check.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2211.17192">Leviathan, Kalman and Matias, Fast Inference from Transformers via Speculative Decoding</a></td><td>The speculative sampling rule, its proof and the expected-tokens formula.</td></tr>
+<tr><td><a href="https://www.inference.org.uk/mackay/itila/">MacKay, Information Theory, Inference, and Learning Algorithms</a> (free online)</td><td>Entropy, relative entropy and their meaning, from first principles.</td></tr>
+<tr><td><a href="https://mml-book.github.io/">Deisenroth, Faisal and Ong, Mathematics for Machine Learning</a> (free PDF), chapter 6</td><td>Probability, expectation and variance for machine learning.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2506.13585">MiniMax-M1</a></td><td>CISPO: clipping importance-sampling weights in RL.</td></tr>
+</table></div>
+<p class="note">Written on 7 November 2026. The lab was run with Python 3.13 and NumPy 2.5.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {$,el,css}=IE;
+const Z=[2.0,1.2,0.6,0.1,-0.8],N=['A','B','C','D','E'];
+const sm=z=>{const m=Math.max(...z),e=z.map(v=>Math.exp(v-m)),s=e.reduce((a,b)=>a+b,0);return e.map(v=>v/s);};
+function kl(){const T=+$('klT').value,S=+$('klS').value;$('klTv').textContent=T.toFixed(2);$('klSv').textContent=S.toFixed(1);
+  const p=sm(Z),q=sm(Z.map((v,i)=>v/T+(i===4?S:0)));
+  const H=-p.reduce((a,v)=>a+v*Math.log(v),0),CE=-p.reduce((a,v,i)=>a+v*Math.log(q[i]),0);
+  const f=p.reduce((a,v,i)=>a+v*Math.log(v/q[i]),0),r=q.reduce((a,v,i)=>a+v*Math.log(v/p[i]),0);
+  const s=$('klSvg');s.innerHTML='';const l=40,b=30,t=12,W=680,Hh=220,bw=(W-l-20)/5,Y=v=>Hh-b-v*(Hh-t-b);
+  for(let i=0;i<=4;i++){const v=i/4;el('line',{x1:l,x2:W-20,y1:Y(v),y2:Y(v),stroke:css('--line')},s);el('text',{x:l-6,y:Y(v)+4,'text-anchor':'end','font-size':10,fill:css('--ink2')},s,v.toFixed(2));}
+  N.forEach((n,i)=>{const x=l+i*bw;el('rect',{x:x+bw*0.15,y:Y(p[i]),width:bw*0.33,height:Hh-b-Y(p[i]),fill:css('--pre')},s);
+    el('rect',{x:x+bw*0.52,y:Y(q[i]),width:bw*0.33,height:Hh-b-Y(q[i]),fill:css('--dec')},s);
+    el('text',{x:x+bw/2,y:Hh-b+16,'text-anchor':'middle','font-size':11,fill:css('--ink')},s,n);});
+  $('klStats').innerHTML=[['KL(p‖q), forward',f.toFixed(3)+' nats'],['KL(q‖p), reverse',r.toFixed(3)+' nats'],['Cross-entropy',CE.toFixed(3)],['Perplexity ratio',Math.exp(CE-H).toFixed(3)+'×']].map(x=>`<div class="stat"><div class="k">${x[0]}</div><div class="v">${x[1]}</div></div>`).join('');}
+['klT','klS'].forEach(i=>$(i).addEventListener('input',kl));IE.onTheme(kl);
+})();
+</script>
+
+</body>
+</html>

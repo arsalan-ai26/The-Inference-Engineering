@@ -3,7 +3,7 @@
   {
    "n": 1,
    "title": "Math, PyTorch and neural net foundations",
-   "weeks": "2.5 weeks",
+   "weeks": "2.5 weeks, plus 2 optional",
    "chapters": [
     [
      "1.1",
@@ -34,6 +34,26 @@
      "1.6",
      "Remote GPU machines and a reproducible setup",
      "1-6-remote-gpu-setup"
+    ],
+    [
+     "1.7",
+     "Math for papers I: expectation, sampling proofs and information (optional)",
+     "1-7-math-probability-information"
+    ],
+    [
+     "1.8",
+     "Math for papers II: rotations, low rank, orthogonalization and curvature (optional)",
+     "1-8-math-linear-algebra-ii"
+    ],
+    [
+     "1.9",
+     "Math for papers III: likelihood, optimizers, preferences and policy gradients (optional)",
+     "1-9-math-optimization-rl"
+    ],
+    [
+     "1.10",
+     "Math for papers IV: tail latency, confidence, queues and algorithm analysis (optional)",
+     "1-10-math-statistics-queues-algorithms"
     ]
    ]
   },

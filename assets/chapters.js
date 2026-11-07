@@ -42,6 +42,34 @@ window.IE_CHAPTERS = [
 "ready": true
 },
 {
+"n": "1.7",
+"title": "Math for papers I: expectation, sampling proofs and information (optional)",
+"slug": "1-7-math-probability-information",
+"part": 1,
+"ready": true
+},
+{
+"n": "1.8",
+"title": "Math for papers II: rotations, low rank, orthogonalization and curvature (optional)",
+"slug": "1-8-math-linear-algebra-ii",
+"part": 1,
+"ready": true
+},
+{
+"n": "1.9",
+"title": "Math for papers III: likelihood, optimizers, preferences and policy gradients (optional)",
+"slug": "1-9-math-optimization-rl",
+"part": 1,
+"ready": true
+},
+{
+"n": "1.10",
+"title": "Math for papers IV: tail latency, confidence, queues and algorithm analysis (optional)",
+"slug": "1-10-math-statistics-queues-algorithms",
+"part": 1,
+"ready": true
+},
+{
 "n": "2.1",
 "title": "Tokenization and embeddings",
 "slug": "2-1-tokenization",

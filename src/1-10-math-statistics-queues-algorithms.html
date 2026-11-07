@@ -1,0 +1,221 @@
+<div class="kicker">Part 1 · Math, PyTorch and neural net foundations · Chapter 1.10 (optional)</div>
+<h1>Math for papers IV: tail latency, confidence, queues and algorithm analysis</h1>
+<p class="lede">Systems papers (Orca, vLLM, Sarathi-Serve, DistServe, Mooncake, Aegaeon, DeepSeek's kernel reports) argue with a different kind of math: latency percentiles and goodput, how sure a measurement is, how queues behave as load rises, how the cost of an algorithm grows, and how a sequential recurrence can run in parallel. This optional chapter covers each with a short derivation and a simulation, so a reader can check a paper's claims instead of taking them on trust.</p>
+<div class="meta">
+  <span class="chip">Level: optional, for reading papers</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 1.7</span>
+  <span class="chip">Compute: CPU, seconds</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>A server is 90% utilized with random arrivals. Roughly how does its average latency compare with the same server at 50%?</li>
+    <li>An evaluation of 500 items reports 80% accuracy. About how wide is its 95% interval?</li>
+    <li>How can a recurrence h<sub>t</sub> = a<sub>t</sub>h<sub>t−1</sub> + b<sub>t</sub> over 1,024 steps run in about 10 parallel steps?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>About 5 times higher in the simplest queue model (latency ∝ 1 ÷ (1 − utilization): 10 against 2), and the tail grows the same way.</li>
+    <li>About ±3.5 points: 1.96 × √(0.8 × 0.2 ÷ 500).</li>
+    <li>The step "apply (a, b)" composes associatively, so pairs can be combined in a tree: log₂ 1,024 = 10 levels (a parallel scan).</li>
+  </ol></details>
+</div>
+
+<h2 id="map">1. Where the papers use this</h2>
+<div class="tbl"><table>
+<tr><th>Idea</th><th>Papers and chapters that rely on it</th></tr>
+<tr><td>Percentiles, tail latency, goodput</td><td>DistServe and Sarathi-Serve's SLO-based goodput (3.2, 4.6), benchmarking (6.1), the llm-d routing results (4.4)</td></tr>
+<tr><td>Confidence intervals, paired tests</td><td>Evaluating quantized and fine-tuned models (4.1, 7.6), comparing engines (6.10), reproductions (8.4)</td></tr>
+<tr><td>Little's law, queueing</td><td>Concurrency-based autoscaling (6.3), routing and admission (6.4), capacity planning (6.5)</td></tr>
+<tr><td>Expected-cost analysis, harmonic numbers</td><td>DeepSelect's top-k bound (5.8), randomized algorithms in schedulers</td></tr>
+<tr><td>Associative scans</td><td>Mamba and linear attention (2.7), online softmax merges (4.2), parallel prefix sums in kernels (5.8)</td></tr>
+</table></div>
+
+<h2 id="tail">2. Percentiles and the tail</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Percentile:</strong> the p-th percentile (p50, p95, p99) is the value below which p% of measurements fall. p50 is the median.</p>
+  <p><strong>Tail latency:</strong> the high percentiles, which describe the slowest requests rather than the typical one.</p>
+  <p><strong>Goodput:</strong> the rate of requests that meet their latency targets (SLOs), as opposed to total throughput.</p>
+</div>
+<p>Latency distributions are skewed: most requests are fast, a few are much slower (a long prefill landed in their batch, a cache miss, a preemption). The mean is pulled by the tail while the median ignores it, which is why papers report p50 and p99 separately (lab Part A: with 2% slow requests the mean is 0.37 s, p50 0.30 s, p99 3.1 s). The tail matters more as systems fan out: if a page or an agent step waits for n parallel calls and each is slow 1% of the time, the step is slow 1 − 0.99<sup>n</sup> of the time, 63% at n = 100. An agent that makes many model calls lives in the tail.</p>
+
+<h2 id="ci">3. How sure is a measurement?</h2>
+<p>An accuracy measured on N independent items is an average of 0s and 1s, so (chapter 1.7) its standard error is √(p(1 − p) ÷ N), and a 95% confidence interval is about ±1.96 standard errors. At 80% accuracy that is ±7.8 points for 100 items, ±3.5 for 500 and ±1.8 for 2,000 (lab Part B). Two practical tools follow:</p>
+<ul>
+  <li><strong>The bootstrap.</strong> Resample the N results with replacement thousands of times and take the 2.5th and 97.5th percentiles of the recomputed metric. It works for any metric (a median latency, a pass@k) without a formula, and agrees with the formula where one exists.</li>
+  <li><strong>Paired comparison.</strong> When two models are scored on the same items, analyze the per-item difference. Items that both get right or both get wrong cancel, so the standard error of the difference is smaller than treating the two scores as independent (lab Part B: 0.023 against 0.027). Chapter 7.6 uses this to detect small regressions with fewer items.</li>
+</ul>
+<p>Latency benchmarks need the same care: repeat runs, report the spread, and do not call a 3% difference real when run-to-run variation is 5% (chapter 6.1).</p>
+
+<h2 id="queue">4. Queues: Little's law and the utilization curve</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Little's law:</strong> in any stable system, the average number of requests inside (L) equals the arrival rate (λ) times the average time each spends inside (W): L = λW. It needs no assumption about distributions.</p>
+  <p><strong>Utilization:</strong> ρ = λ ÷ μ, arrival rate over service capacity.</p>
+  <p><strong>M/M/1 queue:</strong> the simplest queue model: random (Poisson) arrivals, random (exponential) service times, one server. Its average time in the system is W = 1 ÷ (μ − λ).</p>
+</div>
+<p>Little's law is why autoscaling on concurrency works (chapter 6.3): at 20 requests per second and 5 seconds per request, 100 requests are in flight, whatever the distributions. The M/M/1 formula, rewritten as W = (1/μ) ÷ (1 − ρ), shows the <strong>knee</strong>: latency is twice the bare service time at 50% utilization, 5 times at 80%, 10 times at 90% and 20 times at 95%, and the p99 grows the same way (lab Part C simulates it). An inference server is not an M/M/1 queue (it batches, so its service rate rises with load until memory runs out), but the shape holds near saturation, which is why capacity plans keep headroom (chapter 6.5) and why goodput falls off a cliff past a certain request rate in serving papers.</p>
+<div class="widget" id="qW">
+  <div class="wt">Interactive: latency against utilization</div>
+  <div class="ws">An M/M/1 queue with a service time of 100 ms. The curve is average latency; the marker shows where you are. In this model the p99 is about 4.6 times the average.</div>
+  <div class="ctrls"><label>Utilization: <span class="mono" id="qRv"></span><input type="range" id="qR" min="0.05" max="0.98" step="0.01" value="0.7"></label></div>
+  <div class="svgwrap"><svg id="qSvg" viewBox="0 0 680 230" width="680" style="max-width:100%;height:auto" role="img" aria-label="Latency against utilization"></svg></div>
+  <div class="stats" id="qStats"></div>
+</div>
+
+<h2 id="algo">5. Algorithm cost: big-O and expected bounds</h2>
+<p><strong>Big-O</strong> describes how cost grows with input size, ignoring constant factors: attention prefill is O(T²) in the context length, DSA's core attention O(T × k) (chapter 4.2). Papers with randomized algorithms state <strong>expected</strong> costs, and the same small toolkit keeps appearing: linearity of expectation, and the <strong>harmonic number</strong> H<sub>n</sub> = 1 + ½ + … + 1/n ≈ ln n + 0.577.</p>
+<p>The classic example is the one inside DeepSelect's analysis (chapter 5.8): scan n values in random order and count how often a new maximum appears. Element i is a new maximum exactly when it is the largest of the first i, which happens with probability 1/i, so by linearity the expected count is H<sub>n</sub>: about 14 for a million values. That is why a running threshold, raised only when something beats it, does almost no extra work, and why DeepSelect processes blocks in random order. Lab Part D checks the count by simulation.</p>
+
+<h2 id="scan">6. Associative scans: recurrences in parallel</h2>
+<p>A linear recurrence h<sub>t</sub> = a<sub>t</sub> h<sub>t−1</sub> + b<sub>t</sub> looks inherently sequential. Treat each step as a pair (a<sub>t</sub>, b<sub>t</sub>) meaning "multiply by a, then add b". Applying (a₁, b₁) then (a₂, b₂) is the same as applying (a₁a₂, a₂b₁ + b₂). That combine is <strong>associative</strong>, so pairs can be combined in any grouping, as a tree: T steps finish in log₂ T parallel levels. This <strong>parallel scan</strong> is how Mamba and linear attention train and prefill fast (chapter 2.7), and the same idea, with "merge two softmax partial results" as the combine, lets FlashAttention, Flash-Decoding and context parallelism split attention across blocks and GPUs (chapter 4.2). Lab Part E: 1,024 steps in 10 levels, matching the sequential loop to 10<sup>−15</sup>.</p>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Open-loop and closed-loop load</span>
+  <p>A closed-loop benchmark (a fixed number of clients that send a new request when the previous one finishes) can never overload a server: when it slows, the arrival rate drops. Real traffic is open-loop (arrivals do not wait), so queues and tail latency grow as in section 4. Systems papers that measure capacity use open-loop arrivals at increasing rates; chapter 6.1 shows how.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Multiple comparisons</span>
+  <p>Comparing 20 configurations at a 95% level, about one will look significantly better by chance. When a paper or your own sweep reports the best of many settings, rerun the winner on fresh data before believing the gain.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Reporting mean latency only, or a p99 from a few hundred requests (the p99 of 200 samples rests on 2 of them).</li>
+  <li>Calling a difference smaller than its confidence interval an improvement.</li>
+  <li>Benchmarking closed-loop and claiming a capacity.</li>
+  <li>Planning capacity at 95% utilization.</li>
+  <li>Assuming a recurrence must run step by step without checking whether its update is associative.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<pre>import numpy as np
+rng = np.random.default_rng(0)
+# Part A: latency distributions. Mean and median hide the tail
+lat = np.concatenate([rng.lognormal(np.log(0.3), 0.3, 9_800), rng.lognormal(np.log(3.0), 0.4, 200)])  # 2% slow requests
+print(f"A  mean {lat.mean():.2f} s, p50 {np.percentile(lat,50):.2f} s, p95 {np.percentile(lat,95):.2f} s, p99 {np.percentile(lat,99):.2f} s")
+# fan-out: a page waits for n calls; if each is slow 1% of the time, how often is the page slow?
+for n in (1, 10, 50, 100):
+    print(f"   {n:3d} parallel calls, each slow 1% of the time: {1 - 0.99 ** n:.1%} of pages are slow")
+
+# Part B: uncertainty of an accuracy measured on N items (chapter 7.6)
+for N in (100, 500, 2000):
+    acc = 0.80; se = np.sqrt(acc * (1 - acc) / N)
+    items = rng.random(N) &lt; acc
+    boot = [rng.choice(items, N).mean() for _ in range(2000)]
+    print(f"B  N={N:5d}: 95% interval ±{1.96*se:.3f} (formula), bootstrap [{np.percentile(boot,2.5):.3f}, {np.percentile(boot,97.5):.3f}] around {items.mean():.3f}")
+# paired comparison: two models on the same 500 items, model B better by 2 points
+N = 500; skill = rng.random(N)
+a = rng.random(N) &lt; np.clip(skill + 0.30, 0, 1); b = rng.random(N) &lt; np.clip(skill + 0.32, 0, 1)
+diff = b.astype(float) - a
+se_paired = diff.std(ddof=1) / np.sqrt(N); se_unpaired = np.sqrt(a.var(ddof=1)/N + b.var(ddof=1)/N)
+print(f"   difference {diff.mean():+.3f}: paired std error {se_paired:.3f}, unpaired {se_unpaired:.3f}")
+
+# Part C: Little's law L = lambda * W, checked on a simulated queue, and the M/M/1 latency curve
+def mm1(lam, mu, n=200_000):
+    arr = np.cumsum(rng.exponential(1 / lam, n)); svc = rng.exponential(1 / mu, n)
+    start = np.empty(n); end = np.empty(n); t = 0.0
+    for i in range(n):
+        start[i] = max(arr[i], t); t = end[i] = start[i] + svc[i]
+    W = end - arr
+    T = end[-1] - arr[0]; L = W.sum() / T                       # time-average number in system
+    return W, L, lam * W.mean()
+mu = 10.0                                                       # 10 requests per second of capacity
+for rho in (0.5, 0.8, 0.9, 0.95):
+    W, L, lw = mm1(rho * mu, mu)
+    print(f"C  utilization {rho:.2f}: mean latency {W.mean():.3f} s (theory 1/(mu-lambda) = {1/(mu - rho*mu):.3f}), p99 {np.percentile(W,99):.2f} s, L {L:.2f} vs lambda*W {lw:.2f}")
+
+# Part D: expected cost with harmonic numbers: how often does the running maximum change in a random order?
+for n, trials in ((100, 500), (10_000, 200), (1_000_000, 20)):
+    ch = [(lambda x: (x == np.maximum.accumulate(x)).sum())(rng.permutation(n)) for _ in range(trials)]
+    print(f"D  n={n:&gt;9,}: new maximum seen {np.mean(ch):.1f} times on average over {trials} orders; H_n = ln n + 0.577 = {np.log(n) + 0.5772:.1f}")
+
+# Part E: a linear recurrence h_t = a_t * h_{t-1} + b_t computed sequentially and by a parallel (associative) scan
+T = 1024; a = rng.uniform(0.9, 1.0, T); b = rng.standard_normal(T)
+h = np.empty(T); acc = 0.0
+for t in range(T): acc = a[t] * acc + b[t]; h[t] = acc
+A, B = a.copy(), b.copy(); step = 1; levels = 0           # combine (a1,b1) then (a2,b2) -&gt; (a1*a2, a2*b1 + b2)
+while step &lt; T:
+    A2, B2 = A.copy(), B.copy()
+    A2[step:] = A[step:] * A[:-step]; B2[step:] = A[step:] * B[:-step] + B[step:]
+    A, B = A2, B2; step *= 2; levels += 1
+print(f"E  {T} steps: parallel scan matches sequential (max diff {np.abs(B - h).max():.1e}) in {levels} parallel levels instead of {T} serial steps")</pre>
+<details><summary>What we measured</summary><pre class="out">A  mean 0.37 s, p50 0.30 s, p95 0.53 s, p99 3.06 s
+     1 parallel calls, each slow 1% of the time: 1.0% of pages are slow
+    10 parallel calls, each slow 1% of the time: 9.6% of pages are slow
+    50 parallel calls, each slow 1% of the time: 39.5% of pages are slow
+   100 parallel calls, each slow 1% of the time: 63.4% of pages are slow
+B  N=  100: 95% interval ±0.078 (formula), bootstrap [0.740, 0.900] around 0.820
+B  N=  500: 95% interval ±0.035 (formula), bootstrap [0.782, 0.850] around 0.816
+B  N= 2000: 95% interval ±0.018 (formula), bootstrap [0.805, 0.838] around 0.822
+   difference +0.046: paired std error 0.023, unpaired 0.027
+C  utilization 0.50: mean latency 0.200 s (theory 1/(mu-lambda) = 0.200), p99 0.93 s, L 1.00 vs lambda*W 1.00
+C  utilization 0.80: mean latency 0.502 s (theory 1/(mu-lambda) = 0.500), p99 2.39 s, L 4.02 vs lambda*W 4.01
+C  utilization 0.90: mean latency 0.979 s (theory 1/(mu-lambda) = 1.000), p99 5.11 s, L 8.75 vs lambda*W 8.81
+C  utilization 0.95: mean latency 1.814 s (theory 1/(mu-lambda) = 2.000), p99 7.60 s, L 17.25 vs lambda*W 17.23
+D  n=      100: new maximum seen 5.2 times on average over 500 orders; H_n = ln n + 0.577 = 5.2
+D  n=   10,000: new maximum seen 9.8 times on average over 200 orders; H_n = ln n + 0.577 = 9.8
+D  n=1,000,000: new maximum seen 13.0 times on average over 20 orders; H_n = ln n + 0.577 = 14.4
+E  1024 steps: parallel scan matches sequential (max diff 3.1e-15) in 10 parallel levels instead of 1024 serial steps</pre>
+<p>A: the p99 is ten times the median while the mean barely moves; fan-out turns a 1% tail into a 63% one. B: formula and bootstrap intervals agree; the paired standard error is smaller than the unpaired one. (The true gap built into the simulation is 2 points; this sample shows 4.6, inside its interval.) C: simulated latency follows 1/(μ − λ) and Little's law holds at every load; at 95% utilization the simulation runs a little below theory because the queue has not fully settled in 200,000 requests. D: the average number of new maxima matches H<sub>n</sub> for 100 and 10,000 values; the million-value case uses only 20 orders, so it is noisier. E: the parallel scan reproduces the sequential recurrence exactly in 10 levels.</p></details>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Where this shows up</span>
+  <ul>
+    <li><strong>SLOs</strong> are written as percentiles (p95 TTFT, p99 TPOT), and goodput is the metric disaggregation papers optimize.</li>
+    <li><strong>Evaluation harnesses</strong> report standard errors or bootstrap intervals next to scores.</li>
+    <li><strong>Autoscalers</strong> use concurrency targets that are Little's law in practice.</li>
+    <li><strong>Kernels</strong> for state-space models, top-k and softmax merges are parallel scans and reductions underneath.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz110"></div>
+<script type="application/json" id="qz110">[
+{"q":"Each of 50 parallel calls is slow 1% of the time. How often is the step that waits for all of them slow?","o":["1%","About 40%","50%","99%"],"a":1,"e":"1 − 0.99⁵⁰ ≈ 39.5%."},
+{"q":"Little's law says:","o":["Latency = 1/(μ − λ)","In-flight requests = arrival rate × time in system","Throughput = batch size","p99 = 4.6 × mean"],"a":1,"e":"L = λW, for any stable system."},
+{"q":"In an M/M/1 queue, going from 80% to 95% utilization multiplies average latency by:","o":["1.2","2","4","20"],"a":2,"e":"1/(1−0.95) ÷ 1/(1−0.8) = 20 ÷ 5 = 4."},
+{"q":"Why is a paired comparison of two models more sensitive?","o":["It uses more items","Items both models get right or wrong cancel, reducing the variance of the difference","It ignores errors","It uses the bootstrap"],"a":1,"e":"Analyze per-item differences."},
+{"q":"Scanning a million values in random order, about how many times does the running maximum change?","o":["About 14","About 1,000","About 500,000","Once"],"a":0,"e":"H_n ≈ ln n + 0.577."},
+{"q":"A recurrence can be computed by a parallel scan when:","o":["It is nonlinear","Its step combines associatively","It has no inputs","It runs on a CPU"],"a":1,"e":"Then steps can be grouped in a tree."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Report percentiles; tails dominate fan-out systems and agents; goodput counts only requests within SLO.</li>
+  <li>Standard error √(p(1−p)/N); bootstrap for any metric; paired differences for model comparisons.</li>
+  <li>L = λW always; latency grows like 1/(1 − ρ) near saturation, so keep headroom.</li>
+  <li>Expected-cost arguments use linearity and harmonic numbers; random orders make bounds hold for every input.</li>
+  <li>Associative updates run as parallel scans in log T levels: state-space models, linear attention, attention merges.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2401.09670">Zhong et al., DistServe</a></td><td>Goodput under latency SLOs as the metric for serving systems.</td></tr>
+<tr><td><a href="https://www.inference.org.uk/mackay/itila/">MacKay, Information Theory, Inference, and Learning Algorithms</a></td><td>Probability and inference, including estimating with uncertainty.</td></tr>
+<tr><td><a href="https://github.com/deepseek-ai/DeepSelect/blob/main/docs/DeepSelect-deep-dive.md">DeepSelect deep dive</a></td><td>An expected-cost bound with harmonic numbers under a random block order.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2312.00752">Gu and Dao, Mamba</a></td><td>Selective state spaces computed with a hardware-aware parallel scan.</td></tr>
+<tr><td><a href="https://d2l.ai/chapter_appendix-mathematics-for-deep-learning/index.html">Dive into Deep Learning, mathematics appendix</a></td><td>Statistics, probability and calculus for deep learning, with code.</td></tr>
+</table></div>
+<p class="note">Written on 7 November 2026. The lab was run with Python 3.13 and NumPy 2.5.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$,el,css}=IE;
+function q(){const rho=+$('qR').value;$('qRv').textContent=(rho*100).toFixed(0)+'%';
+  const S=0.1,W=r=>S/(1-r),s=$('qSvg');s.innerHTML='';const l=50,b=34,t=12,Wd=680,H=230,maxY=2.5;
+  const X=r=>l+r*(Wd-l-20),Y=v=>H-b-Math.min(v,maxY)/maxY*(H-t-b);
+  [0,0.5,1,1.5,2,2.5].forEach(v=>{el('line',{x1:l,x2:Wd-20,y1:Y(v),y2:Y(v),stroke:css('--line')},s);el('text',{x:l-6,y:Y(v)+4,'text-anchor':'end','font-size':10,fill:css('--ink2')},s,v+' s');});
+  [0,0.25,0.5,0.75,1].forEach(v=>el('text',{x:X(v),y:H-b+16,'text-anchor':'middle','font-size':10,fill:css('--ink2')},s,(v*100)+'%'));
+  let d='';for(let r=0;r<=0.985;r+=0.005)d+=(d?'L':'M')+X(r).toFixed(1)+' '+Y(W(r)).toFixed(1);
+  el('path',{d,fill:'none',stroke:css('--dec'),'stroke-width':2.5},s);
+  el('circle',{cx:X(rho),cy:Y(W(rho)),r:6,fill:css('--pre')},s);
+  $('qStats').innerHTML=[['Average latency',(W(rho)*1000).toFixed(0)+' ms'],['p99 latency',(W(rho)*Math.log(100)*1000).toFixed(0)+' ms'],['× bare service time',(1/(1-rho)).toFixed(1)+'×'],['Requests in system (L = λW)',(rho/(1-rho)).toFixed(1)]].map(x=>`<div class="stat"><div class="k">${x[0]}</div><div class="v">${x[1]}</div></div>`).join('');}
+$('qR').addEventListener('input',q);IE.onTheme(q);
+})();
+</script>

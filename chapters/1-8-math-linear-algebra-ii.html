@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>1.8 Math for papers II: rotations, low rank, orthogonalization and curvature (optional)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="1.8">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 1 · Chapter 1.8</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 1 · Math, PyTorch and neural net foundations · Chapter 1.8 (optional)</div>
+<h1>Math for papers II: rotations, low rank, orthogonalization and curvature</h1>
+<p class="lede">Chapter 1.1 covered vectors, dot products and matrix multiplication. Architecture and quantization papers lean on a second layer of linear algebra: rotations (RoPE, QuaRot), rank and low-rank factorization (LoRA, MLA), the singular value decomposition, orthogonalization (the Muon optimizer), doubly stochastic matrices (mHC) and second-order curvature (GPTQ, SqueezeLLM). This optional chapter explains each with one picture or one formula and checks it in NumPy.</p>
+<div class="meta">
+  <span class="chip">Level: optional, for reading papers</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 1.1, 1.5</span>
+  <span class="chip">Compute: CPU, seconds</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why does RoPE make the attention score depend only on the distance between two tokens?</li>
+    <li>A LoRA adapter of rank 16 on a 4,096 × 4,096 matrix has how many trainable parameters?</li>
+    <li>What does Muon do to the singular values of an update matrix?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>It rotates queries and keys by an angle proportional to position. The dot product of two rotated vectors depends only on the difference of their angles.</li>
+    <li>16 × (4,096 + 4,096) = 131,072, about 0.78% of the matrix.</li>
+    <li>It pushes all of them toward 1 (approximately replacing the update by its orthogonal factor UVᵀ), so no direction dominates.</li>
+  </ol></details>
+</div>
+
+<h2 id="map">1. Where the papers use this</h2>
+<div class="tbl"><table>
+<tr><th>Idea</th><th>Papers and chapters that rely on it</th></tr>
+<tr><td>Rotations, orthogonal matrices</td><td>RoPE and its extensions (RoFormer, YaRN; 2.3), partial RoPE in DeepSeek-V4 (4.8), QuaRot's Hadamard rotations (4.1)</td></tr>
+<tr><td>Rank, low-rank factorization, SVD</td><td>LoRA and QLoRA (7.3), MLA's latent KV (2.4), query compression in DeepSeek-V4 (4.8)</td></tr>
+<tr><td>Orthogonalization, matrix norms</td><td>Muon and MuonClip (7.7), DeepSeek-V4's optimizer (4.8)</td></tr>
+<tr><td>Doubly stochastic matrices, Sinkhorn</td><td>Manifold-constrained hyper-connections (mHC; 2.7, 4.8)</td></tr>
+<tr><td>Hessian and second-order error</td><td>GPTQ (4.1), SqueezeLLM's sensitivity-based quantization, optimal brain surgeon style pruning</td></tr>
+</table></div>
+
+<h2 id="rot">2. Rotations and orthogonal matrices</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Orthogonal matrix:</strong> a square matrix Q with QᵀQ = I. Multiplying by it preserves lengths and dot products: (Qx)·(Qy) = x·y. Rotations and reflections are orthogonal.</p>
+  <p><strong>2D rotation by angle θ:</strong> the matrix [[cos θ, −sin θ], [sin θ, cos θ]]. Rotating by θ₁ then θ₂ is rotating by θ₁ + θ₂, and Rᵀ(θ) = R(−θ).</p>
+</div>
+<p><strong>RoPE</strong> (chapter 2.3) splits a query or key of size d into d/2 pairs and rotates pair i by the angle position × ω<sub>i</sub>, with frequencies ω<sub>i</sub> = θ<sup>−2i/d</sup>. For a query at position m and a key at position n:</p>
+<div class="formula">(R(mω) q) · (R(nω) k) = qᵀ R(mω)ᵀ R(nω) k = qᵀ R((n − m)ω) k</div>
+<p>The score depends only on n − m: <strong>relative position from absolute rotations</strong>. Thinking of each pair as a complex number, rotation is multiplication by e<sup>i·pos·ω</sup>, which is how the RoFormer paper writes it. DeepSeek-V4 applies RoPE to only the last 64 dimensions, and also rotates its attention outputs by −i, because its compressed entries act as both keys and values (chapter 4.8). Lab Part A checks the relative property.</p>
+<div class="widget" id="rpW">
+  <div class="wt">Interactive: RoPE turns positions into angles</div>
+  <div class="ws">One frequency pair. The query sits at position m and the key at position n; each is rotated by its position times ω. Shift both positions together and the angle between them, and so the score, stays the same.</div>
+  <div class="ctrls">
+    <label>Query position m: <span class="mono" id="rpMv"></span><input type="range" id="rpM" min="0" max="60" step="1" value="3"></label>
+    <label>Key position n: <span class="mono" id="rpNv"></span><input type="range" id="rpN" min="0" max="60" step="1" value="10"></label>
+    <label>Frequency ω: <span class="mono" id="rpWv"></span><input type="range" id="rpWf" min="0.02" max="1" step="0.02" value="0.2"></label>
+  </div>
+  <div class="svgwrap"><svg id="rpSvg" viewBox="0 0 680 240" width="680" style="max-width:100%;height:auto" role="img" aria-label="Rotated query and key vectors"></svg></div>
+  <div class="stats" id="rpStats"></div>
+</div>
+<p><strong>QuaRot</strong> (chapter 4.1) uses the other property, that an orthogonal matrix changes nothing the model computes: multiply the hidden state by Q and the next weight matrix by Qᵀ, and the product is unchanged. With Q a normalized <strong>Hadamard matrix</strong> (entries ±1/√n, built recursively from [[1, 1], [1, −1]]), a vector with one large outlier becomes a vector whose energy is spread across all channels, so a single 4-bit scale fits it much better. Lab Part B: the outlier ratio drops from 11 to 1.5 and the INT4 error falls by about three times.</p>
+
+<h2 id="rank">3. Rank, low-rank factorization and the SVD</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Rank:</strong> the number of independent directions a matrix can output; an m × n matrix of rank r can be written as the product of an m × r and an r × n matrix.</p>
+  <p><strong>Singular value decomposition (SVD):</strong> any matrix W = U Σ Vᵀ, with U and V orthogonal and Σ diagonal with non-negative singular values in decreasing order. Each singular value says how much W stretches one direction.</p>
+</div>
+<p>Keeping only the largest r singular values gives the <strong>best rank-r approximation</strong> in the sense of least squared error (the Eckart-Young theorem). That fact sits behind three designs in the book:</p>
+<ul>
+  <li><strong>LoRA</strong> (chapter 7.3) learns a weight change ΔW = BA with B of size d × r and A of size r × d. Its bet is that the useful fine-tuning update has low rank, so r of 8 to 64 is enough: r × 2d parameters instead of d².</li>
+  <li><strong>MLA</strong> (chapter 2.4) stores a 512-value latent per token instead of full keys and values, and reconstructs them with up-projections: a learned low-rank factorization of the KV cache.</li>
+  <li><strong>Query compression</strong> in DeepSeek-V4 (the c<sub>t</sub><sup>Q</sup> latent, shared by the attention and the indexer queries) applies the same idea to queries.</li>
+</ul>
+<p>Lab Part C builds a matrix that is nearly rank 32: rank-4 and rank-16 approximations leave most of it unexplained, rank 32 captures it almost fully, and going further buys little.</p>
+
+<h2 id="ortho">4. Orthogonalization: what Muon does</h2>
+<p>Every matrix has a <strong>polar decomposition</strong> G = (UVᵀ)(VΣVᵀ): an orthogonal-like part UVᵀ (all singular values set to 1) times a stretch. Muon (chapter 7.7) takes the momentum update G and applies (approximately) only UVᵀ, so every direction moves by a similar amount instead of a few large ones dominating. Computing an SVD each step would be slow, so Muon runs five steps of a <strong>Newton-Schulz iteration</strong>, a polynomial X ← aX + b(XXᵀ)X + c(XXᵀ)²X that pushes singular values toward 1 using only matrix multiplications, which GPUs do fast in BF16. Keller Jordan's coefficients (3.4445, −4.7750, 2.0315) deliberately leave the singular values between about 0.7 and 1.2 rather than exactly 1, which works as well in practice and converges faster. DeepSeek-V4 describes a "hybrid" Newton-Schulz variant in its Muon. Lab Part D runs the iteration.</p>
+
+<h2 id="sinkhorn">5. Doubly stochastic matrices and Sinkhorn</h2>
+<p>A <strong>doubly stochastic</strong> matrix has non-negative entries and every row and column summing to 1; multiplying by it mixes values without growing or shrinking their total. Manifold-constrained hyper-connections (mHC) keep several parallel residual streams and mix them with such a matrix, so the residual signal neither explodes nor vanishes across layers. The <strong>Sinkhorn-Knopp</strong> algorithm makes any positive matrix doubly stochastic by alternately dividing rows by their sums and columns by their sums; DeepSeek-V4 runs 20 iterations (t<sub>max</sub> = 20). For inference this means a few extra small matmuls per layer, which is why DeepSeek fuses them (Mega-mHC, chapter 4.8). Lab Part E.</p>
+
+<h2 id="hess">6. Curvature: the Hessian and second-order error</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Hessian:</strong> the matrix H of second derivatives of the loss with respect to the weights. It describes curvature: how fast the loss rises when weights move in each direction.</p>
+  <p><strong>Second-order approximation:</strong> near a trained minimum the gradient is about zero, so changing the weights by e raises the loss by about ½ eᵀHe.</p>
+</div>
+<p>Quantization adds an error e to the weights. The formula says <strong>errors along high-curvature directions cost far more</strong> than the same errors along flat ones (lab Part F: the same 0.1 error costs 100 times more on the steep axis). GPTQ (chapter 4.1) uses this layer by layer: for a linear layer with inputs X, the Hessian of its output error is proportional to XXᵀ, and after rounding each weight it updates the remaining unrounded weights to cancel as much of ½ eᵀHe as possible. SqueezeLLM uses a diagonal approximation (the Fisher information, squared gradients) to decide which weights deserve more precision. You do not need to derive these algorithms to read the papers; you need to recognize that "Hessian-aware" means "weighted by how much the loss cares".</p>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Kronecker products and preconditioners</span>
+  <p>Shampoo and SOAP (chapter 7.7) precondition a weight matrix's gradient with two small matrices, one for rows and one for columns, instead of one huge matrix over all entries. The combined preconditioner is their Kronecker product A ⊗ B, which never needs to be formed: (A ⊗ B) vec(G) = vec(B G Aᵀ). Muon can be read as a special case that keeps only the orthogonal direction.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Rank of attention and of the KV cache</span>
+  <p>Several KV compression papers start from the observation that keys across heads and positions have low effective rank (a few singular values carry most of the energy). The lab's SVD experiment is the measurement to run on a real model's keys before believing such a claim for your model.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Applying RoPE with the wrong pairing (interleaved pairs vs first-half and second-half), which silently breaks attention; DeepSeek-V3.2's own demo code had this bug in its indexer, as its README noted in November 2025.</li>
+  <li>Assuming low rank: check the singular value spectrum first.</li>
+  <li>Reading "orthogonalized update" as "normalized update": normalizing scales all directions together, orthogonalizing equalizes them.</li>
+  <li>Forgetting that a rotation must be applied consistently to both sides (activations and weights), or the model's output changes.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p>Six short experiments in NumPy. Predict each before running.</p>
+<pre>import numpy as np
+rng = np.random.default_rng(0)
+# Part A: RoPE is a rotation, so the q.k score depends only on the distance n - m
+d, theta = 8, 10000.0
+inv = theta ** (-np.arange(0, d, 2) / d)
+def rope(x, pos):                                    # rotate each pair (x[2i], x[2i+1]) by pos * inv[i]
+    a = pos * inv; c, s = np.cos(a), np.sin(a)
+    x1, x2 = x[0::2], x[1::2]
+    out = np.empty_like(x); out[0::2] = x1 * c - x2 * s; out[1::2] = x1 * s + x2 * c
+    return out
+q, k = rng.standard_normal(d), rng.standard_normal(d)
+for m, n in [(3, 10), (103, 110), (5003, 5010)]:
+    print(f"A  positions ({m},{n}): score {rope(q, m) @ rope(k, n):+.6f}   norm kept: {np.linalg.norm(rope(q, m)):.6f} vs {np.linalg.norm(q):.6f}")
+
+# Part B: a Hadamard rotation spreads an outlier, so 4-bit quantization loses less
+def hadamard(n):
+    H = np.array([[1.0]])
+    while H.shape[0] &lt; n: H = np.block([[H, H], [H, -H]])
+    return H / np.sqrt(n)
+def int4_error(v):
+    scale = np.abs(v).max() / 7; return np.linalg.norm(np.round(v / scale) * scale - v) / np.linalg.norm(v)
+x = rng.standard_normal(128); x[5] = 60.0           # one outlier channel, as in real activations
+Hm = hadamard(128)
+print(f"B  max/RMS before {np.abs(x).max()/np.sqrt((x**2).mean()):.1f}, after {np.abs(Hm@x).max()/np.sqrt(((Hm@x)**2).mean()):.1f}")
+print(f"   INT4 relative error before {int4_error(x):.3f}, after rotation {int4_error(Hm @ x):.3f};  H is orthogonal: {np.allclose(Hm @ Hm.T, np.eye(128))}")
+
+# Part C: low rank. SVD gives the best rank-r approximation; LoRA trains a rank-r update
+W = rng.standard_normal((256, 32)) @ rng.standard_normal((32, 256)) + 0.1 * rng.standard_normal((256, 256))  # nearly rank 32
+U, S, Vt = np.linalg.svd(W)
+for r in (4, 16, 32, 64):
+    Wr = (U[:, :r] * S[:r]) @ Vt[:r]
+    print(f"C  rank {r:3d}: relative error {np.linalg.norm(W - Wr)/np.linalg.norm(W):.3f}, parameters {r*(256+256):6,} vs {256*256:,} full")
+d_model, r = 4096, 16
+print(f"   LoRA on one 4096x4096 matrix at rank {r}: {r*2*d_model:,} trainable parameters = {r*2*d_model/d_model**2:.2%} of the matrix")
+
+# Part D: Muon's orthogonalization. Newton-Schulz drives all singular values toward 1 (the U V^T factor)
+G = rng.standard_normal((64, 32))
+X = G / np.linalg.norm(G)                            # scale so singular values are at most 1
+a, b, c = 3.4445, -4.7750, 2.0315                    # Keller Jordan's quintic coefficients
+for step in range(1, 6):
+    A = X.T @ X; X = a * X + X @ (b * A + c * A @ A)
+    sv = np.linalg.svd(X, compute_uv=False)
+    print(f"D  step {step}: singular values in [{sv.min():.3f}, {sv.max():.3f}]")
+Ug, _, Vg = np.linalg.svd(G, full_matrices=False)
+print(f"   distance to U V^T: {np.linalg.norm(X - Ug @ Vg)/np.linalg.norm(Ug @ Vg):.3f} (rough on purpose: Muon needs only singular values near 1)")
+
+# Part E: Sinkhorn-Knopp makes a positive matrix doubly stochastic (rows and columns sum to 1), as mHC needs
+M = np.exp(rng.standard_normal((4, 4)))
+for it in range(20):
+    M /= M.sum(1, keepdims=True); M /= M.sum(0, keepdims=True)
+print("E  after 20 iterations, row sums", np.round(M.sum(1), 4), "column sums", np.round(M.sum(0), 4))
+
+# Part F: second order. With error e in weights, the loss rises by about 1/2 e^T H e, so errors along high-curvature directions cost most
+H2 = np.diag([100.0, 1.0])                           # curvature: steep along axis 0, flat along axis 1
+for e in (np.array([0.1, 0.0]), np.array([0.0, 0.1])):
+    print(f"F  weight error {e}: loss increase {0.5 * e @ H2 @ e:.4f}")</pre>
+<details><summary>What we measured</summary><pre class="out">A  positions (3,10): score -1.359445   norm kept: 1.862653 vs 1.862653
+A  positions (103,110): score -1.359445   norm kept: 1.862653 vs 1.862653
+A  positions (5003,5010): score -1.359445   norm kept: 1.862653 vs 1.862653
+B  max/RMS before 11.1, after 1.5
+   INT4 relative error before 0.178, after rotation 0.058;  H is orthogonal: True
+C  rank   4: relative error 0.871, parameters  2,048 vs 65,536 full
+C  rank  16: relative error 0.539, parameters  8,192 vs 65,536 full
+C  rank  32: relative error 0.016, parameters 16,384 vs 65,536 full
+C  rank  64: relative error 0.012, parameters 32,768 vs 65,536 full
+   LoRA on one 4096x4096 matrix at rank 16: 131,072 trainable parameters = 0.78% of the matrix
+D  step 1: singular values in [0.177, 0.871]
+D  step 2: singular values in [0.583, 1.202]
+D  step 3: singular values in [0.682, 1.199]
+D  step 4: singular values in [0.692, 1.134]
+D  step 5: singular values in [0.682, 1.124]
+   distance to U V^T: 0.218 (rough on purpose: Muon needs only singular values near 1)
+E  after 20 iterations, row sums [1. 1. 1. 1.] column sums [1. 1. 1. 1.]
+F  weight error [0.1 0. ]: loss increase 0.5000
+F  weight error [0.  0.1]: loss increase 0.0050</pre>
+<p>A: the score is identical when both positions shift by 100 or 5,000, and lengths are preserved. B: the rotation leaves the vector's length unchanged but spreads the outlier, cutting the INT4 error about three times. C: the error collapses at the true rank, 32, and LoRA's rank-16 adapter is under 1% of the full matrix. D: after five Newton-Schulz steps every singular value is between about 0.7 and 1.1. E: rows and columns all sum to 1. F: the same weight error costs 100 times more along the high-curvature axis.</p></details>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Where this shows up</span>
+  <ul>
+    <li><strong>Engines</strong> ship fused RoPE kernels with model-specific pairing and scaling rules.</li>
+    <li><strong>Quantization libraries</strong> offer Hadamard rotations (QuaRot) and Hessian-based GPTQ as standard options.</li>
+    <li><strong>Training stacks</strong> now ship Muon next to AdamW; Kimi K2 and DeepSeek-V4 were trained with it.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz18"></div>
+<script type="application/json" id="qz18">[
+{"q":"Multiplying a vector by an orthogonal matrix:","o":["Changes its length","Preserves its length and its dot products with other rotated vectors","Makes it sparse","Quantizes it"],"a":1,"e":"QᵀQ = I."},
+{"q":"Why does a Hadamard rotation help 4-bit quantization?","o":["It removes information","It spreads an outlier's energy over all channels, so one scale fits better","It makes values integers","It halves the memory"],"a":1,"e":"Max/RMS falls from 11 to 1.5 in the lab."},
+{"q":"The best rank-r approximation of a matrix in least squares keeps:","o":["The first r rows","The r largest singular values and their vectors","Random r columns","The diagonal"],"a":1,"e":"Eckart-Young."},
+{"q":"Muon's Newton-Schulz iteration aims to:","o":["Invert the matrix","Push all singular values toward 1 using only matmuls","Compute eigenvalues exactly","Quantize the update"],"a":1,"e":"It approximates the orthogonal factor UVᵀ."},
+{"q":"Sinkhorn-Knopp makes a positive matrix:","o":["Symmetric","Orthogonal","Doubly stochastic: rows and columns sum to 1","Low rank"],"a":2,"e":"Alternate row and column normalization."},
+{"q":"Near a minimum, a weight error e raises the loss by about:","o":["g·e","½ eᵀHe","‖e‖","e²"],"a":1,"e":"The gradient is about zero, so the second-order term dominates."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Orthogonal matrices preserve lengths and dot products: RoPE gets relative positions from rotations, QuaRot spreads outliers with Hadamard rotations.</li>
+  <li>The SVD gives the best low-rank approximation; LoRA, MLA and query compression are learned low-rank factorizations.</li>
+  <li>Muon replaces an update by approximately its orthogonal factor using a Newton-Schulz polynomial.</li>
+  <li>Sinkhorn normalization gives the doubly stochastic mixing matrices of mHC.</li>
+  <li>The Hessian weights quantization error: ½ eᵀHe; GPTQ and SqueezeLLM are built on it.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://mml-book.github.io/">Mathematics for Machine Learning</a>, chapters 3 and 4</td><td>Orthogonality, rotations, the SVD and low-rank approximation.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2104.09864">Su et al., RoFormer</a></td><td>RoPE as rotation and its relative-position property.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2404.00456">Ashkboos et al., QuaRot</a></td><td>Hadamard rotations for outlier-free 4-bit inference.</td></tr>
+<tr><td><a href="https://kellerjordan.github.io/posts/muon/">Keller Jordan, Muon</a></td><td>The Newton-Schulz orthogonalization and its coefficients.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2512.24880">mHC: Manifold-Constrained Hyper-Connections</a></td><td>Doubly stochastic residual mixing with Sinkhorn normalization.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2210.17323">Frantar et al., GPTQ</a></td><td>Second-order, Hessian-based weight quantization.</td></tr>
+</table></div>
+<p class="note">Written on 7 November 2026. The lab was run with Python 3.13 and NumPy 2.5.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {$,el,css}=IE;
+const q0=[1,0.25],k0=[0.6,0.8];
+const rot=(v,a)=>[v[0]*Math.cos(a)-v[1]*Math.sin(a),v[0]*Math.sin(a)+v[1]*Math.cos(a)];
+function rp(){const m=+$('rpM').value,n=+$('rpN').value,w=+$('rpWf').value;$('rpMv').textContent=m;$('rpNv').textContent=n;$('rpWv').textContent=w.toFixed(2);
+  const q=rot(q0,m*w),k=rot(k0,n*w),s=$('rpSvg');s.innerHTML='';const cx=170,cy=120,R=90;
+  el('circle',{cx,cy,r:R,fill:'none',stroke:css('--line')},s);el('line',{x1:cx-R-10,x2:cx+R+10,y1:cy,y2:cy,stroke:css('--line')},s);el('line',{x1:cx,x2:cx,y1:cy-R-10,y2:cy+R+10,stroke:css('--line')},s);
+  const arr=(v,c,t)=>{const x=cx+v[0]*R*0.95,y=cy-v[1]*R*0.95;el('line',{x1:cx,y1:cy,x2:x,y2:y,stroke:css(c),'stroke-width':3},s);el('circle',{cx:x,cy:y,r:4,fill:css(c)},s);el('text',{x:x+6,y:y-4,'font-size':11,fill:css(c)},s,t);};
+  arr(q,'--pre','q at m');arr(k,'--kv','k at n');
+  const sc=q[0]*k[0]+q[1]*k[1],base=q0[0]*rot(k0,(n-m)*w)[0]+q0[1]*rot(k0,(n-m)*w)[1];
+  el('text',{x:330,y:60,'font-size':12,fill:css('--ink')},s,`angle added to q: m × ω = ${(m*w).toFixed(2)} rad`);
+  el('text',{x:330,y:82,'font-size':12,fill:css('--ink')},s,`angle added to k: n × ω = ${(n*w).toFixed(2)} rad`);
+  el('text',{x:330,y:110,'font-size':12,fill:css('--ink')},s,`score q·k = ${sc.toFixed(4)}`);
+  el('text',{x:330,y:132,'font-size':12,fill:css('--ink2')},s,'q unrotated, k rotated by (n − m)ω:');el('text',{x:330,y:152,'font-size':12,fill:css('--ink2')},s,`score ${base.toFixed(4)}, the same`);
+  $('rpStats').innerHTML=[['Distance n − m',n-m],['Score',sc.toFixed(4)],['|q| after rotation',Math.hypot(...q).toFixed(4)]].map(x=>`<div class="stat"><div class="k">${x[0]}</div><div class="v">${x[1]}</div></div>`).join('');}
+['rpM','rpN','rpWf'].forEach(i=>$(i).addEventListener('input',rp));IE.onTheme(rp);
+})();
+</script>
+
+</body>
+</html>

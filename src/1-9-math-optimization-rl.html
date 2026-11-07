@@ -1,0 +1,236 @@
+<div class="kicker">Part 1 · Math, PyTorch and neural net foundations · Chapter 1.9 (optional)</div>
+<h1>Math for papers III: likelihood, optimizers, preferences and policy gradients</h1>
+<p class="lede">Post-training papers (DPO, GRPO, DeepSeekMath, DeepSeek-R1, MiniMax-M1, Kimi K2) and the RL systems chapters assume a handful of results: training is maximum likelihood, the KL-regularized objective has a closed-form optimum, preferences follow the Bradley-Terry model, and the policy gradient can be estimated from samples. This optional chapter derives each in a few lines and checks it numerically, so the equations in those papers read as steps rather than leaps.</p>
+<div class="meta">
+  <span class="chip">Level: optional, for reading papers</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 1.5, 1.7</span>
+  <span class="chip">Compute: CPU, seconds</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What policy maximizes E<sub>π</sub>[r] − β KL(π‖π<sub>ref</sub>)?</li>
+    <li>In DPO, what plays the role of the reward?</li>
+    <li>Why does GRPO learn nothing from a prompt where all eight answers get the same reward?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>π*(y) ∝ π<sub>ref</sub>(y) × exp(r(y) ÷ β): the reference policy re-weighted by exponentiated reward.</li>
+    <li>β × log(π(y) ÷ π<sub>ref</sub>(y)), the "implicit reward" obtained by inverting that closed form.</li>
+    <li>Its advantage is reward minus the group mean, divided by the group's standard deviation; identical rewards give zero advantage for every answer.</li>
+  </ol></details>
+</div>
+
+<h2 id="map">1. Where the papers use this</h2>
+<div class="tbl"><table>
+<tr><th>Idea</th><th>Papers and chapters that rely on it</th></tr>
+<tr><td>Maximum likelihood, cross-entropy loss</td><td>Every pretraining and SFT objective (7.2), distillation (7.5)</td></tr>
+<tr><td>Momentum, Adam, update rules</td><td>Training memory and optimizer state (7.7), Muon (7.7, 1.8)</td></tr>
+<tr><td>KL-regularized objective and its optimum</td><td>RLHF, DPO (7.4), on-policy distillation in DeepSeek-V4</td></tr>
+<tr><td>Bradley-Terry preference model</td><td>Reward models and DPO (7.4)</td></tr>
+<tr><td>Policy gradient, baselines, advantages</td><td>PPO, GRPO (DeepSeekMath, DeepSeek-R1), DAPO and Dr. GRPO (7.4), RL rollout systems (8.1)</td></tr>
+<tr><td>Clipped ratios</td><td>PPO, GRPO, CISPO in MiniMax-M1 (7.4), with the importance sampling of chapter 1.7</td></tr>
+</table></div>
+
+<h2 id="mle">2. Maximum likelihood is minimum cross-entropy</h2>
+<p>A model assigns probability π<sub>θ</sub>(x) to data x. <strong>Maximum likelihood</strong> chooses θ to make the observed data most probable; with independent tokens that is maximizing Σ log π<sub>θ</sub>(x<sub>t</sub>), or equivalently minimizing the average negative log-likelihood, which is the cross-entropy between the data and the model (chapter 1.7). For a softmax over logits z, the gradient of the cross-entropy with respect to z is simply <strong>p − target</strong>: predicted probabilities minus the one-hot (or soft) target. That one line explains why distillation with soft teacher targets is "SFT with a different target" (chapter 7.5). Lab Part A fits probabilities to counts with exactly this gradient.</p>
+
+<h2 id="opt">3. From gradient descent to Adam</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Gradient descent:</strong> θ ← θ − η g, with learning rate η and gradient g.</p>
+  <p><strong>Momentum:</strong> keep a running average m ← μm + g and step along m, which smooths noisy gradients.</p>
+  <p><strong>Adam:</strong> keep running averages of g (first moment) and of g² (second moment, per element) and step by η × m̂ ÷ (√v̂ + ε), with bias corrections m̂, v̂ for the first steps. Each parameter gets its own effective step size.</p>
+</div>
+<p>For inference engineers the consequence is memory: Adam stores two extra values per parameter (usually in FP32), which is why full fine-tuning needs several times the model's size in memory and LoRA needs far less (chapters 7.3 and 7.7). Muon replaces the per-element second moment with a matrix-level orthogonalization (chapter 1.8), and keeps only one momentum buffer.</p>
+
+<h2 id="klreg">4. The KL-regularized objective and its closed form</h2>
+<p>RLHF and its successors maximize reward while staying close to a reference model:</p>
+<div class="formula">maximize over π:   E<sub>y∼π</sub>[r(y)] − β × KL(π ‖ π<sub>ref</sub>)</div>
+<p>Write the objective as Σ π(y)[r(y) − β log(π(y)/π<sub>ref</sub>(y))], add a Lagrange multiplier for Σ π = 1, set the derivative to zero and solve: log π(y) = log π<sub>ref</sub>(y) + r(y)/β − constant. So</p>
+<div class="formula">π*(y) = π<sub>ref</sub>(y) × exp(r(y) ÷ β) ÷ Z,    Z = Σ π<sub>ref</sub>(y) exp(r(y) ÷ β)</div>
+<p>Large β keeps π* near the reference; small β concentrates it on the highest reward. Lab Part B checks the formula against gradient ascent at three values of β.</p>
+<div class="widget" id="krW">
+  <div class="wt">Interactive: the KL-regularized optimum</div>
+  <div class="ws">Four answers with a reference policy and a reward each. The optimal policy is the reference re-weighted by exp(reward ÷ β). Lower β and the policy chases reward; raise it and it stays near the reference.</div>
+  <div class="ctrls"><label>β: <span class="mono" id="krBv"></span><input type="range" id="krB" min="-2" max="1.5" step="0.05" value="0"></label></div>
+  <div class="svgwrap"><svg id="krSvg" viewBox="0 0 680 220" width="680" style="max-width:100%;height:auto" role="img" aria-label="Reference and optimal policy"></svg></div>
+  <div class="legend"><span><i style="background:var(--pre)"></i>Reference π<sub>ref</sub></span><span><i style="background:var(--good)"></i>Optimal π*</span></div>
+  <div class="stats" id="krStats"></div>
+</div>
+
+<h2 id="bt">5. Bradley-Terry and DPO</h2>
+<p>Human or model preferences come as pairs: answer a was preferred to answer b. The <strong>Bradley-Terry model</strong> assumes each answer has a hidden reward and</p>
+<div class="formula">P(a ≻ b) = σ(r(a) − r(b)),    σ(x) = 1 ÷ (1 + e^(−x))</div>
+<p>A reward model is trained by maximizing the log-likelihood of observed preferences under this model. Only differences of rewards matter, so rewards are identified up to a constant (lab Part C recovers 0, 1, 2 from 3,000 simulated comparisons).</p>
+<p><strong>DPO</strong> combines this with section 4. Invert the closed form: r(y) = β log(π*(y)/π<sub>ref</sub>(y)) + β log Z. Substitute into Bradley-Terry; the β log Z terms cancel because both answers answer the same prompt:</p>
+<div class="formula">P(a ≻ b) = σ( β log(π(a)/π<sub>ref</sub>(a)) − β log(π(b)/π<sub>ref</sub>(b)) )</div>
+<p>Maximizing the likelihood of the preference data under this expression trains the policy directly, with no reward model and no sampling loop. β log(π/π<sub>ref</sub>) is called the <strong>implicit reward</strong>; lab Part C shows it equals the true reward differences at the optimum. For serving, the practical point of chapter 7.4 follows: DPO needs only forward passes of two models on fixed data, while RL methods need fresh generations.</p>
+
+<h2 id="pg">6. Policy gradients, baselines and GRPO</h2>
+<p>When the reward comes from sampling and checking (a unit test, a maths verifier), there is no preference data to fit. We want the gradient of J(θ) = E<sub>y∼π<sub>θ</sub></sub>[R(y)]. The <strong>log-derivative trick</strong>, ∇π = π ∇log π, gives</p>
+<div class="formula">∇J = E<sub>y∼π</sub>[ R(y) × ∇ log π<sub>θ</sub>(y) ]</div>
+<p>which can be estimated from samples: generate, score, and push up the log-probability of each sample in proportion to its reward (REINFORCE). Subtracting a <strong>baseline</strong> b that does not depend on y leaves the expectation unchanged (because E[∇log π] = 0) but can cut the variance a lot; R − b is the <strong>advantage</strong>. Lab Part D halves the mean squared gradient with a baseline on a bandit.</p>
+<ul>
+  <li><strong>PPO</strong> learns a value model to serve as the baseline, and maximizes min(ratio × A, clip(ratio, 1 − ε, 1 + ε) × A), with ratio = π<sub>new</sub>/π<sub>old</sub> (chapter 1.7's importance ratio). The min makes the clip one-sided: it removes the incentive to move further once the ratio leaves the band in the helpful direction (lab Part E).</li>
+  <li><strong>GRPO</strong> (DeepSeekMath, then DeepSeek-R1) drops the value model: it samples a group of G answers per prompt and uses the group itself as the baseline, A<sub>i</sub> = (r<sub>i</sub> − mean(r)) ÷ std(r). Prompts that every answer solves (or fails) give zero advantage and no learning signal, which is why rollout systems filter or resample them; dividing by the standard deviation and averaging per sequence introduce biases that DAPO and Dr. GRPO correct (chapter 7.4).</li>
+</ul>
+<p>The inference link: every gradient step needs G fresh generations per prompt, so RL training throughput is set by the rollout engine (chapters 7.4 and 8.1).</p>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Token-level vs sequence-level</span>
+  <p>A sequence's log-probability is the sum of its tokens' log-probabilities, so sequence-level formulas (DPO, the policy gradient) become sums over tokens in code. Where papers differ is how they average: per token across the batch, or per sequence then across sequences. That choice changes how much long answers count, which is the length bias chapter 7.4 discusses.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">KL estimators in RL code</span>
+  <p>RL code rarely computes the exact KL to the reference (it would need the full distribution at each step). It uses sample-based estimators of log(π/π<sub>ref</sub>) on the generated tokens, some of which are unbiased but noisy and others biased but always positive. When a paper's KL term looks unusual, check which estimator it uses.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Reading β the wrong way: larger β means a stronger pull toward the reference, not a stronger push toward reward.</li>
+  <li>Expecting absolute rewards from Bradley-Terry: only differences are defined.</li>
+  <li>Forgetting that the baseline must not depend on the action being scored, or the gradient becomes biased.</li>
+  <li>Comparing GRPO runs without checking how many prompts had zero-variance groups.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<pre>import numpy as np
+rng = np.random.default_rng(0)
+sm = lambda z: np.exp(z - z.max()) / np.exp(z - z.max()).sum()
+# Part A: maximum likelihood is minimum cross-entropy. Fit token probabilities to counts by gradient descent
+counts = np.array([50, 30, 15, 5]); z = np.zeros(4)
+for _ in range(2000):
+    p = sm(z); z -= 0.5 * (p - counts / counts.sum())          # gradient of mean cross-entropy w.r.t. logits is p - target
+print("A  fitted p", np.round(sm(z), 4), " counts/total", counts / counts.sum())
+
+# Part B: the KL-regularized objective  max E_pi[r] - beta * KL(pi || ref)  has the closed form pi* ∝ ref * exp(r / beta)
+ref = np.array([0.4, 0.3, 0.2, 0.1]); r = np.array([0.0, 1.0, 2.0, 0.5])
+for beta in (10.0, 1.0, 0.1):
+    closed = ref * np.exp(r / beta); closed /= closed.sum()
+    z = np.log(ref).copy()                                       # start at the reference policy, then gradient ascent
+    for _ in range(20000):
+        pi = sm(z)
+        u = r - beta * np.log(pi / ref)                          # gradient of the objective w.r.t. logits: pi * (u - E_pi[u])
+        g = pi * (u - (pi * u).sum())
+        z += 0.05 * g
+    print(f"B  beta {beta:5.1f}: closed form {np.round(closed, 3)}  gradient ascent {np.round(sm(z), 3)}")
+
+# Part C: Bradley-Terry. P(a preferred over b) = sigmoid(r_a - r_b); DPO's implicit reward is beta * log(pi/ref)
+sig = lambda x: 1 / (1 + np.exp(-x))
+true_r = np.array([0.0, 1.0, 2.0])
+pairs = [(i, j) for i in range(3) for j in range(3) if i != j]
+data = []
+for _ in range(3000):
+    i, j = pairs[rng.integers(len(pairs))]
+    data.append((i, j) if rng.random() &lt; sig(true_r[i] - true_r[j]) else (j, i))   # (winner, loser)
+est = np.zeros(3)
+for _ in range(500):
+    g = np.zeros(3)
+    for w, l in data: d = 1 - sig(est[w] - est[l]); g[w] += d; g[l] -= d
+    est += 0.5 * g / len(data)
+print(f"C  true rewards {true_r - true_r[0]}, fitted from 3,000 comparisons {np.round(est - est[0], 2)} (only differences are identifiable)")
+beta = 1.0
+pi_star = ref[:3] * np.exp(true_r / beta); pi_star /= pi_star.sum(); refn = ref[:3] / ref[:3].sum()
+implicit = beta * np.log(pi_star / refn)
+print(f"   policy pi* = {np.round(pi_star, 4)}; implicit reward beta*log(pi*/ref) = {np.round(implicit - implicit[0], 3)} (recovers the true differences)")
+
+# Part D: policy gradient (REINFORCE) on a 5-armed bandit; a baseline cuts the variance without biasing it
+means = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+def run(baseline, steps=3000, lr=0.1):
+    z = np.zeros(5); gvar = []
+    for t in range(steps):
+        pi = sm(z); a = rng.choice(5, p=pi); R = float(rng.random() &lt; means[a])
+        b = (pi * means).sum() if baseline else 0.0
+        g = -pi.copy(); g[a] += 1                                 # grad of log pi(a) w.r.t. logits
+        step = (R - b) * g; gvar.append((step ** 2).sum()); z += lr * step
+    return sm(z), np.mean(gvar)
+for bl in (False, True):
+    pi, v = run(bl)
+    print(f"D  baseline {str(bl):5s}: final P(best arm) {pi[4]:.3f}, mean squared gradient {v:.4f}")
+
+# Part E: GRPO advantages. Rewards of a group of answers to one prompt, normalized within the group
+for rewards in ([1, 0, 0, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1, 1]):
+    rw = np.array(rewards, float); std = rw.std()
+    adv = (rw - rw.mean()) / (std if std &gt; 0 else 1)
+    print(f"E  rewards {rewards} -&gt; advantages {np.round(adv, 2)}")
+# PPO-style clipping: the ratio pi_new/pi_old is clipped to [1-eps, 1+eps] so one update cannot move far
+eps = 0.2
+for ratio, A in [(1.5, 1.0), (0.5, 1.0), (1.5, -1.0), (0.5, -1.0)]:
+    obj = min(ratio * A, np.clip(ratio, 1 - eps, 1 + eps) * A)
+    print(f"   ratio {ratio}, advantage {A:+.0f}: clipped objective {obj:+.2f} (unclipped {ratio*A:+.2f})")</pre>
+<details><summary>What we measured</summary><pre class="out">A  fitted p [0.5  0.3  0.15 0.05]  counts/total [0.5  0.3  0.15 0.05]
+B  beta  10.0: closed form [0.37  0.307 0.226 0.097]  gradient ascent [0.37  0.307 0.226 0.097]
+B  beta   1.0: closed form [0.14  0.285 0.517 0.058]  gradient ascent [0.14  0.285 0.517 0.058]
+B  beta   0.1: closed form [0. 0. 1. 0.]  gradient ascent [0.    0.001 0.999 0.   ]
+C  true rewards [0. 1. 2.], fitted from 3,000 comparisons [0.   1.07 2.02] (only differences are identifiable)
+   policy pi* = [0.1485 0.3028 0.5487]; implicit reward beta*log(pi*/ref) = [0. 1. 2.] (recovers the true differences)
+D  baseline False: final P(best arm) 0.988, mean squared gradient 0.0680
+D  baseline True : final P(best arm) 0.992, mean squared gradient 0.0304
+E  rewards [1, 0, 0, 1, 1, 0, 0, 0] -&gt; advantages [ 1.29 -0.77 -0.77  1.29  1.29 -0.77 -0.77 -0.77]
+E  rewards [1, 1, 1, 1, 1, 1, 1, 1] -&gt; advantages [0. 0. 0. 0. 0. 0. 0. 0.]
+   ratio 1.5, advantage +1: clipped objective +1.20 (unclipped +1.50)
+   ratio 0.5, advantage +1: clipped objective +0.50 (unclipped +0.50)
+   ratio 1.5, advantage -1: clipped objective -1.50 (unclipped -1.50)
+   ratio 0.5, advantage -1: clipped objective -0.80 (unclipped -0.50)</pre>
+<p>A: gradient descent on cross-entropy recovers the empirical frequencies, which is what maximum likelihood means. B: gradient ascent reaches the closed form at every β, and at β = 0.1 the policy has almost all its mass on the highest-reward answer. C: fitted Bradley-Terry rewards match the true differences within sampling noise, and the implicit reward of the optimal policy equals them exactly. D: both runs find the best arm; the baseline halves the mean squared gradient. E: group-normalized advantages are positive for correct answers and zero for a group where all agree; the clip caps the gain of a large ratio with positive advantage and the gain from shrinking a ratio with negative advantage, and leaves the other two cases alone.</p></details>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Where this shows up</span>
+  <ul>
+    <li><strong>TRL and other post-training libraries</strong> implement these objectives directly: their DPO and GRPO loss functions are the formulas of sections 5 and 6.</li>
+    <li><strong>Reasoning model reports</strong> (DeepSeek-R1, MiniMax-M1, Kimi K2) describe their RL as variations on the group baseline and the clipped ratio.</li>
+    <li><strong>Inference engines</strong> add features for RL (weight updates, returned log-probabilities, routing replay) because rollouts are this loop's bottleneck.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz19"></div>
+<script type="application/json" id="qz19">[
+{"q":"The gradient of softmax cross-entropy with respect to the logits is:","o":["target − p","p − target","log p","p × target"],"a":1,"e":"Predicted probabilities minus the target."},
+{"q":"As β grows, the KL-regularized optimum:","o":["Moves to the highest reward","Moves toward the reference policy","Becomes uniform","Does not change"],"a":1,"e":"exp(r/β) flattens as β grows."},
+{"q":"Bradley-Terry models P(a ≻ b) as:","o":["r(a) ÷ r(b)","σ(r(a) − r(b))","r(a) − r(b)","Softmax over all answers"],"a":1,"e":"Only reward differences matter."},
+{"q":"Why does the β log Z term vanish in DPO?","o":["Z is 1","Both answers share the prompt, so it cancels in the difference","It is ignored for speed","β is 0"],"a":1,"e":"The partition function depends only on the prompt."},
+{"q":"A baseline in the policy gradient:","o":["Biases the gradient","Leaves it unbiased and can reduce variance","Replaces the reward","Is the KL penalty"],"a":1,"e":"E[∇log π] = 0."},
+{"q":"GRPO's baseline is:","o":["A learned value model","The mean reward of the group of answers to the same prompt","Zero","The reference model's reward"],"a":1,"e":"Normalized by the group's standard deviation."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Training is maximum likelihood, which is minimum cross-entropy; its logit gradient is p − target.</li>
+  <li>Adam keeps two moments per parameter; Muon orthogonalizes instead.</li>
+  <li>The KL-regularized optimum is π<sub>ref</sub> × exp(r/β), normalized.</li>
+  <li>Bradley-Terry plus that closed form gives DPO and its implicit reward β log(π/π<sub>ref</sub>).</li>
+  <li>The log-derivative trick gives a sample-based policy gradient; baselines reduce variance; PPO clips ratios; GRPO uses the group as the baseline.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2305.18290">Rafailov et al., Direct Preference Optimization</a></td><td>The closed-form optimum, Bradley-Terry and the DPO loss, with full derivations.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2402.03300">Shao et al., DeepSeekMath</a></td><td>GRPO and its group-relative advantage.</td></tr>
+<tr><td><a href="https://spinningup.openai.com/en/latest/spinningup/rl_intro3.html">OpenAI Spinning Up, Intro to Policy Optimization</a></td><td>The log-derivative trick and baselines, derived step by step.</td></tr>
+<tr><td><a href="https://mml-book.github.io/">Mathematics for Machine Learning</a>, chapters 5 and 7</td><td>Gradients, Lagrange multipliers and optimization.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1</a> and <a href="https://arxiv.org/abs/2506.13585">MiniMax-M1</a></td><td>GRPO at scale and the CISPO variant.</td></tr>
+</table></div>
+<p class="note">Written on 7 November 2026. The lab was run with Python 3.13 and NumPy 2.5.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$,el,css}=IE;
+const ref=[0.4,0.3,0.2,0.1],r=[0,1,2,0.5],N=['answer 1 (r = 0)','answer 2 (r = 1)','answer 3 (r = 2)','answer 4 (r = 0.5)'];
+function kr(){const beta=Math.pow(10,+$('krB').value);$('krBv').textContent=beta<1?beta.toFixed(2):beta.toFixed(1);
+  const w=ref.map((p,i)=>p*Math.exp(r[i]/beta)),Z=w.reduce((a,b)=>a+b,0),pi=w.map(v=>v/Z);
+  const s=$('krSvg');s.innerHTML='';const l=40,b=30,t=12,W=680,H=220,bw=(W-l-20)/4,Y=v=>H-b-v*(H-t-b);
+  for(let i=0;i<=4;i++){const v=i/4;el('line',{x1:l,x2:W-20,y1:Y(v),y2:Y(v),stroke:css('--line')},s);el('text',{x:l-6,y:Y(v)+4,'text-anchor':'end','font-size':10,fill:css('--ink2')},s,v.toFixed(2));}
+  N.forEach((n,i)=>{const x=l+i*bw;el('rect',{x:x+bw*0.15,y:Y(ref[i]),width:bw*0.33,height:H-b-Y(ref[i]),fill:css('--pre')},s);
+    el('rect',{x:x+bw*0.52,y:Y(pi[i]),width:bw*0.33,height:H-b-Y(pi[i]),fill:css('--good')},s);
+    el('text',{x:x+bw/2,y:H-b+16,'text-anchor':'middle','font-size':10.5,fill:css('--ink')},s,n);});
+  const er=pi.reduce((a,p,i)=>a+p*r[i],0),kl=pi.reduce((a,p,i)=>a+(p>0?p*Math.log(p/ref[i]):0),0);
+  $('krStats').innerHTML=[['Expected reward',er.toFixed(3)],['KL(π*‖π_ref)',kl.toFixed(3)+' nats'],['Objective',(er-beta*kl).toFixed(3)]].map(x=>`<div class="stat"><div class="k">${x[0]}</div><div class="v">${x[1]}</div></div>`).join('');}
+$('krB').addEventListener('input',kr);IE.onTheme(kr);
+})();
+</script>
