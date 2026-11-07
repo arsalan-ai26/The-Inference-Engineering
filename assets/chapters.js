@@ -291,7 +291,7 @@ window.IE_CHAPTERS = [
 "title": "Expert depth: production case studies, cluster infrastructure and confidential inference",
 "slug": "6-7-case-studies-clusters",
 "part": 6,
-"ready": false
+"ready": true
 },
 {
 "n": "6.8",

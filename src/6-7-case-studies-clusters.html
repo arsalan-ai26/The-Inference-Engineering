@@ -1,0 +1,233 @@
+<div class="kicker">Part 6 · Production inference infrastructure · Chapter 6.7</div>
+<h1>Expert depth: production case studies, cluster infrastructure and confidential inference</h1>
+<p class="lede">This chapter looks at how real systems put the earlier chapters together. Two published deployments come first: DeepSeek's own service for V3 and R1, with its full cost and token statistics, and Cursor's real-time coding models served by Together AI on Blackwell. Then the cluster layer underneath: Kubernetes and its GPU extensions, Slurm, and multi-cloud orchestrators such as dstack and SkyPilot, plus how fleets keep GPUs busy. Last, confidential inference: how trusted execution environments protect prompts even from the machine's owner, what they cost, and what they do not protect against.</p>
+<div class="meta">
+  <span class="chip">Level: expert</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 4.5, 4.6, 6.3, 6.5</span>
+  <span class="chip">Compute: none required</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why does DeepSeek spread a single decode deployment over 18 nodes, when the model fits on fewer?</li>
+    <li>What does a Kubernetes LeaderWorkerSet add that a normal Deployment lacks?</li>
+    <li>A provider runs your model inside a confidential VM with GPU confidential computing turned on. Can their staff read your prompts?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>To make the batch per expert large. Only 8 of 256 experts are active per token, so a huge batch spread over many GPUs (expert parallelism) gives each expert enough tokens to use the GPU efficiently, and each GPU reads fewer expert weights.</li>
+    <li>It treats a group of pods (one leader, several workers) as one replica: created, scheduled, updated and restarted together. That is what a model sharded over several nodes needs.</li>
+    <li>Not from the host, hypervisor or by reading memory or the PCIe bus, if attestation checks out. But code running inside the protected environment can still log or leak them, so you also need verified builds and network egress control.</li>
+  </ol></details>
+</div>
+
+<h2 id="deepseek">1. Case study: DeepSeek's V3/R1 service</h2>
+<p>In February 2025 DeepSeek published how it serves DeepSeek-V3 and R1 (671B-parameter mixture-of-experts models, chapter 4.5) and a day of production statistics. It uses nearly every technique from Part 4.</p>
+<ul>
+  <li><strong>Disaggregation</strong> (chapter 4.6): separate prefill and decode deployments.</li>
+  <li><strong>Large-scale expert parallelism.</strong> Prefill units span 4 nodes (32 GPUs, expert parallelism 32, with 9 routed experts and 1 shared expert per GPU). Decode units span 18 nodes (144 GPUs, 2 routed experts and 1 shared expert per GPU). Attention and shared experts use data parallelism across the same GPUs. Both include 32 redundant copies of busy experts.</li>
+  <li><strong>Overlapping communication with computation.</strong> Each batch is split into two micro-batches so one computes while the other communicates; decode uses a 5-stage pipeline because its stages have uneven lengths.</li>
+  <li><strong>Three load balancers:</strong> prefill (balance attention work and input tokens across GPUs), decode (balance KV cache use and request counts), and experts (balance expert work so no GPU becomes the bottleneck).</li>
+  <li><strong>Precision as in training:</strong> FP8 for matmuls and dispatch, BF16 for attention and combine.</li>
+  <li><strong>A KV cache on disk</strong> for prefix reuse (chapter 4.4).</li>
+</ul>
+<div class="svgwrap"><svg id="dsSvg" viewBox="0 0 680 210" width="680" style="max-width:100%;height:auto" role="img" aria-label="DeepSeek prefill and decode deployment units"></svg></div>
+<p class="cap">One prefill unit (4 nodes) and one decode unit (18 nodes), each with 8 H800 GPUs per node. Many such units run side by side.</p>
+<div class="tbl"><table>
+<tr><th>Published statistic (24 hours, from 27 Feb 2025)</th><th>Value</th></tr>
+<tr><td>Nodes (8 × H800 each) for inference, peak / average</td><td>278 / 226.75</td></tr>
+<tr><td>Input tokens, of which hit the on-disk KV cache</td><td>608 billion, 342 billion (56.3%)</td></tr>
+<tr><td>Output tokens</td><td>168 billion</td></tr>
+<tr><td>Output speed per user; average context per output token</td><td>20 to 22 tokens/s; 4,989 tokens</td></tr>
+<tr><td>Throughput per node</td><td>About 73,700 input tokens/s in prefill, or about 14,800 output tokens/s in decode</td></tr>
+<tr><td>Cost at an assumed $2 per GPU-hour</td><td>$87,072 per day</td></tr>
+<tr><td>Theoretical revenue if all tokens were billed at R1 prices</td><td>$562,027 (cost profit margin 545%)</td></tr>
+</table></div>
+<p>Three lessons. First, <strong>expert parallelism trades latency for throughput deliberately</strong>: 20 to 22 tokens per second per user is modest, but each decode node produces about 14,800 tokens per second. Second, <strong>prefix caching changes the economics</strong>: over half of all input tokens were cache hits, billed at a quarter of the price. Third, <strong>fleets follow the day</strong>: DeepSeek runs inference on all nodes at peak and moves nodes to research and training at night, which is how the average stays 18% below the peak. Actual revenue is much lower than the theoretical figure (free web and app use, cheaper V3 pricing, night discounts), so read the margin as an upper bound.</p>
+
+<h2 id="cursor">2. Case study: Cursor on Together AI</h2>
+<p>Cursor's in-editor agents must answer while the developer is still looking at the same code; a late suggestion no longer matches the file. That makes worst-case latency under concurrency the main requirement. Together AI's published account of the work:</p>
+<ul>
+  <li><strong>New hardware early:</strong> GB200 NVL72 and HGX B200 for memory bandwidth and tensor throughput, with the reliability work early hardware needs.</li>
+  <li><strong>ARM hosts:</strong> GB200 pairs GPUs with Grace CPUs (ARM). Much of the inference stack assumed x86, so the host side had to be ported and tuned (recall chapter 5.1: CPU overhead matters at small batch).</li>
+  <li><strong>Custom kernels</strong> for Blackwell's low-precision tensor core instructions, and <strong>parallelism layouts</strong> designed for the 72-GPU NVLink domain.</li>
+  <li><strong>A weights-to-production pipeline:</strong> each new model from Cursor's research team is quantized to NVFP4 with TensorRT-LLM, validated, and deployed to a test endpoint within days; Cursor runs its evaluations, then A/B tests on production traffic, and cuts over only after validation and live checks (chapters 4.1, 6.5 and 6.6).</li>
+</ul>
+<p>The lesson: for a fast-moving product, the speed and safety of shipping new weights matters as much as the kernels. Quantization is part of the release pipeline, with quality gates, not a one-off optimization.</p>
+
+<h2 id="cluster">3. The cluster layer</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Orchestrator (scheduler):</strong> software that decides which job or service runs on which machines, starts it, and restarts it on failure.</p>
+  <p><strong>Pod:</strong> Kubernetes' unit of deployment, one or more containers scheduled together on one node.</p>
+  <p><strong>Gang scheduling:</strong> start all parts of a multi-node job together or none of them, so half a model never sits waiting for the other half.</p>
+</div>
+<div class="tbl"><table>
+<tr><th>System</th><th>Model</th><th>Strengths for inference</th></tr>
+<tr><td>Kubernetes</td><td>Containers on a cluster with a control plane and worker nodes</td><td>The standard for services: autoscaling, rolling updates, health checks, service discovery. Most inference platforms (llm-d, Dynamo, KServe) build on it.</td></tr>
+<tr><td>Slurm</td><td>Batch jobs as native processes on static HPC nodes, with partitions and queues</td><td>Common in research and training clusters; good for batch inference and evaluations; less natural for long-running autoscaled services.</td></tr>
+<tr><td>dstack</td><td>Container-first, provisions cloud instances on demand, or uses Kubernetes or SSH-reachable machines</td><td>One YAML file for development, training and inference services across clouds and on-premises; fleets as explicit pools of capacity.</td></tr>
+<tr><td>SkyPilot</td><td>Multi-cloud orchestrator over clouds and Kubernetes clusters</td><td>Runs the same job or service on whichever cloud has GPUs, including AMD Instinct GPUs; treats several clusters as one pool.</td></tr>
+</table></div>
+<h3>GPUs in Kubernetes</h3>
+<ul>
+  <li>The <strong>NVIDIA device plugin</strong> makes GPUs a schedulable resource (<code>nvidia.com/gpu: 1</code>); the GPU Operator installs drivers, the device plugin and monitoring (DCGM, chapter 6.6) on each node. AMD has an equivalent ROCm GPU operator.</li>
+  <li><strong>Sharing one GPU:</strong> MIG gives hardware-isolated slices (chapter 5.5). The device plugin also offers time-slicing (workloads interleave with no memory isolation, and if one crashes they all do) and MPS (memory and compute limits per workload). Use sharing for small models and development, not for latency-critical services.</li>
+  <li><strong>Multi-node replicas:</strong> a model sharded across nodes (chapter 4.5) needs its pods created, placed close together, updated and restarted as one unit. The <strong>LeaderWorkerSet</strong> API does this: each replica is a leader pod plus worker pods, with gang scheduling, topology-aware placement and all-or-nothing restart. Its <strong>DisaggregatedSet</strong> extension manages prefill and decode roles together, with rollouts that keep their capacity ratio. Both are co-designed with llm-d.</li>
+  <li><strong>Networking:</strong> multi-node inference needs RDMA networks (InfiniBand or RoCE) exposed to pods, and placement that keeps a replica's nodes on the same network fabric (chapters 4.5 and 4.6).</li>
+</ul>
+<h3>Keeping a fleet busy</h3>
+<p>Past a few hundred GPUs, the problem becomes capacity spread over regions and clouds, with some clusters starved while others idle. The answer is to treat all capacity as one pool: a global control plane (chapter 6.5) that places replicas wherever GPUs are free, plus work that can fill gaps. DeepSeek's day and night reallocation is one example; low-priority batch inference, evaluations and training jobs that can be preempted are others. Each requires fast, reliable start-up (chapter 6.2) so capacity can move back when traffic returns.</p>
+
+<h2 id="tee">4. Confidential inference</h2>
+<p>Normally you must trust whoever runs the hardware: the cloud provider, the GPU marketplace host, their staff and anyone who compromises their machines. A <strong>trusted execution environment (TEE)</strong> removes them from that trust.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Confidential VM:</strong> a virtual machine whose memory is encrypted with keys held inside the CPU, so the host operating system and hypervisor cannot read it (Intel TDX, AMD SEV-SNP).</p>
+  <p><strong>GPU confidential computing:</strong> a GPU mode (from NVIDIA Hopper onwards) that protects the GPU's memory and encrypts traffic between the confidential VM and the GPU over PCIe.</p>
+  <p><strong>Remote attestation:</strong> a signed report, produced by the hardware, of exactly what was booted and loaded. A client checks it against known-good values before sending data.</p>
+</div>
+<div class="widget" id="teeW">
+  <div class="wt">Interactive: who can see a prompt?</div>
+  <div class="ws">Pick a deployment. Red parties can read prompts while they are processed, amber ones are reduced risks, green ones are blocked.</div>
+  <div class="ctrls"><label>Deployment <select id="teeM">
+    <option value="0">Standard cloud VM</option>
+    <option value="1">Confidential VM + GPU confidential computing</option>
+    <option value="2">TEE + verified image + egress control + attestation checked by the client</option>
+  </select></label></div>
+  <div class="svgwrap"><svg id="teeSvg" viewBox="0 0 680 205" width="680" style="max-width:100%;height:auto" role="img" aria-label="Parties that can or cannot read prompts"></svg></div>
+  <p id="teeNote" class="cap"></p>
+</div>
+<p>Chutes, a decentralized GPU network whose machines are run by anonymous operators, describes a full stack for this case. Its confidential mode runs workloads in Intel TDX confidential VMs with NVIDIA's protected PCIe between CPU and GPU. Attestation ties into disk access: the encrypted root filesystem's key is released only after the measured boot checks out. Only images built and signed by its own build system can run. Outbound network traffic is blocked by default. Random challenges hash slices of the model weights to catch a host that swaps in a cheaper model. The important caveat, which Chutes states: a TEE protects you from the host, not from malicious code inside the TEE. A server that logs prompts inside the protected VM still leaks them, which is why signed images and egress control are part of the design.</p>
+<p><strong>Cost:</strong> a 2024 benchmark of LLM inference on Hopper GPUs in confidential mode found little overhead inside the GPU; the cost came from encrypted CPU to GPU transfers over PCIe. For most typical queries the overhead stayed below 7%, and it approached zero for larger models and longer sequences, where GPU computation dominates.</p>
+
+<h2 id="expert">5. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Why expert-parallel decode needs a load balancer for experts</span>
+  <p>Some experts are popular. With 2 experts per GPU across 144 GPUs, the GPU that holds the hottest experts receives the most tokens, and every step waits for the slowest GPU. Redundant copies of hot experts, placed by observed load, spread that work. It is the same straggler problem as in chapter 6.4, inside a single model step.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Verifying the model, not just the machine</span>
+  <p>Attestation shows which software booted. It does not prove which weights produced a given answer. Weight-slice hashing challenges and per-token verification hashes bound to a specific model revision (as Chutes describes) address the "bait and switch" where a provider serves a smaller or more quantized model than advertised. Chapter 6.6's provider comparison is the statistical version of the same check.</p>
+</div>
+
+<h2 id="mistakes">6. Common mistakes</h2>
+<ul>
+  <li>Reading published margins or throughput as typical without the assumptions (GPU price, billing mix, free traffic).</li>
+  <li>Deploying multi-node models as independent pods that can be scheduled, updated or restarted separately.</li>
+  <li>Using GPU time-slicing for latency-sensitive services.</li>
+  <li>Assuming a TEE protects data from the code that runs inside it.</li>
+  <li>Accepting a TEE claim without checking attestation against known-good values.</li>
+</ul>
+
+<h2 id="lab">7. Lab</h2>
+<p><strong>Goal:</strong> check a published case study's numbers, then design the cluster layer for a deployment.</p>
+<h3>Part A: reproduce DeepSeek's economics</h3>
+<pre>avg_nodes, peak_nodes, gpus_per_node, gpu_hour = 226.75, 278, 8, 2.00
+inp, hit, out = 608e9, 342e9, 168e9
+cost = avg_nodes * gpus_per_node * gpu_hour * 24
+revenue = hit/1e6*0.14 + (inp-hit)/1e6*0.55 + out/1e6*2.19      # R1 prices per million tokens
+print(f"cost ${cost:,.0f}, revenue ${revenue:,.0f}, margin {(revenue-cost)/cost:.0%}")
+print(f"cost per M output tokens ${cost/(out/1e6):.3f}, per M tokens of any kind ${cost/((inp+out)/1e6):.3f}")
+print(f"fixed at peak all day: ${peak_nodes*gpus_per_node*gpu_hour*24:,.0f}")
+print(f"input revenue if nothing hit the cache ${inp/1e6*0.55:,.0f} vs ${hit/1e6*0.14+(inp-hit)/1e6*0.55:,.0f}")
+node_s = avg_nodes * 86400
+print(f"share of node-time: prefill {inp/73.7e3/node_s:.0%}, decode {out/14.8e3/node_s:.0%}")</pre>
+<p>Predict first: what share of the fleet's time goes to prefill?</p>
+<details><summary>What we computed</summary><pre class="out">cost $87,072, revenue $562,100, margin 546%
+cost per M output tokens $0.518, per M tokens of any kind $0.112
+fixed at peak all day: $106,752
+input revenue if nothing hit the cache $334,400 vs $194,180
+share of node-time: prefill 42%, decode 58%</pre>
+<p>The cost matches exactly. Revenue comes out $73 higher than published (the token totals are rounded), giving 546% instead of 545%. The prefill and decode shares add up to the whole average fleet, so the published per-node rates are averages over all inference nodes. Despite producing only 168 billion of the 776 billion tokens, decode takes most of the machine time.</p></details>
+<h3>Part B: design a multi-node deployment</h3>
+<p>You must serve a model that needs 16 GPUs (two 8-GPU nodes, tensor parallelism inside each node and pipeline parallelism across them) on Kubernetes, with autoscaling from 2 to 6 replicas. Write down: the LeaderWorkerSet layout (leader and workers, size), what happens on a rolling update and when one worker pod crashes, the network and placement requirements, and the readiness check that decides when a replica can take traffic. Then compare with running the same model as a dstack or SkyPilot service across two clouds: what changes in failover and capacity?</p>
+<h3>Part C: a confidential inference threat model</h3>
+<p>For a hospital that wants to use an open-weight model on a GPU marketplace: list who could see prompts in a standard deployment, which of them a TEE removes, what remains (the serving code, the client side, logs and traces, the model output), and which controls address each. Decide which attestation evidence the hospital's client must check before sending a request.</p>
+
+<h2 id="realworld">8. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Where these patterns appear</span>
+  <ul>
+    <li><strong>Large MoE providers</strong> use disaggregation with wide expert parallelism and expert load balancing, as DeepSeek describes.</li>
+    <li><strong>Inference platforms</strong> run multi-cloud control planes on Kubernetes, with LeaderWorkerSet-style groups for multi-node models.</li>
+    <li><strong>Research labs</strong> run Slurm or Kubernetes for training and lend capacity between training and inference over the day.</li>
+    <li><strong>Privacy-sensitive users</strong> (health, finance, decentralized networks) use confidential VMs with GPU confidential computing and client-side attestation checks.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">9. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz67"></div>
+<script type="application/json" id="qz67">[
+{"q":"Why does DeepSeek use expert parallelism across 144 GPUs for decode?","o":["The model needs 144 GPUs of memory","To make the batch per expert large and reduce weight reads per GPU","To lower cost per GPU-hour","Because Kubernetes requires it"],"a":1,"e":"Only 8 of 256 experts are active per token; wide EP gives each expert enough tokens."},
+{"q":"What share of DeepSeek's input tokens hit the KV cache?","o":["5%","25%","56%","95%"],"a":2,"e":"342 of 608 billion input tokens: 56.3%."},
+{"q":"How does DeepSeek's average fleet stay 18% below its peak?","o":["Spot instances","Moving nodes to research and training at night","Quantization","Smaller models at night"],"a":1,"e":"Inference uses all nodes at peak, fewer at night."},
+{"q":"Which Kubernetes API manages a leader pod and worker pods as one replica?","o":["Deployment","StatefulSet","LeaderWorkerSet","DaemonSet"],"a":2,"e":"LeaderWorkerSet adds gang scheduling, group updates and all-or-nothing restarts."},
+{"q":"GPU time-slicing in Kubernetes provides:","o":["Hardware memory isolation","Interleaved sharing with no memory isolation and a shared fault domain","Encrypted memory","Exclusive access"],"a":1,"e":"Use MIG for isolation."},
+{"q":"Where does most of the overhead of GPU confidential computing come from, per the Hopper benchmark?","o":["Slower tensor cores","Encrypted CPU to GPU transfers over PCIe","Attestation on every token","Larger KV caches"],"a":1,"e":"Under 7% for most typical queries, near zero for large models and long sequences."}
+]</script>
+
+<h2 id="summary">10. Summary</h2>
+<ul>
+  <li>DeepSeek combines disaggregation, wide expert parallelism, overlapped communication, three load balancers and a disk KV cache; its fleet shrinks at night for training.</li>
+  <li>Cursor's real-time serving depends on new hardware, custom kernels and a fast, gated pipeline from new weights to NVFP4 production endpoints.</li>
+  <li>Kubernetes is the base for services; LeaderWorkerSet groups multi-node replicas; Slurm, dstack and SkyPilot cover batch, multi-cloud and on-premises work.</li>
+  <li>TEEs protect prompts from the host at modest cost, but not from the code inside; pair them with signed images, egress control and checked attestation.</li>
+</ul>
+
+<h2 id="refs">11. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">DeepSeek, Day 6: DeepSeek-V3/R1 Inference System Overview</a></td><td>Deployment layout, overlap and load balancing, and 24 hours of production statistics.</td></tr>
+<tr><td><a href="https://www.together.ai/blog/learn-how-cursor-partnered-with-together-ai-to-deliver-real-time-low-latency-inference-at-scale">Together AI, How Cursor partnered with Together AI for real-time inference</a></td><td>Blackwell deployment, ARM hosts, custom kernels and an NVFP4 release pipeline.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, chapter 0 and section 7.2</td><td>How infrastructure problems change with scale, and Kubernetes' control and worker planes.</td></tr>
+<tr><td><a href="https://github.com/kubernetes-sigs/lws">Kubernetes SIGs, LeaderWorkerSet and DisaggregatedSet</a></td><td>Multi-node inference replicas, gang scheduling and disaggregated roles.</td></tr>
+<tr><td><a href="https://github.com/NVIDIA/k8s-device-plugin">NVIDIA Kubernetes device plugin</a></td><td>GPUs as a Kubernetes resource, time-slicing and MPS sharing.</td></tr>
+<tr><td><a href="https://github.com/dstackai/migrate-from-slurm/blob/main/guide.md">dstack, Migration guide: Slurm to dstack</a> and <a href="https://dstack.ai/blog/0_20/">dstack 0.20</a></td><td>How Slurm and a container-first orchestrator compare; fleets as explicit capacity.</td></tr>
+<tr><td><a href="https://rocm.blogs.amd.com/ecosystems-and-partners/democratizing-multicloud-skypi/README.html">AMD ROCm blog, Democratizing AI Compute with AMD Using SkyPilot</a></td><td>Multi-cloud orchestration over Kubernetes clusters, including AMD GPUs.</td></tr>
+<tr><td><a href="https://chutes.ai/news/confidential-compute-for-ai-inference-how-chutes-delivers-verifiable-privacy-with-trusted-execution-environments">Chutes, Confidential Compute for AI Inference</a></td><td>A full confidential inference stack: TDX, protected PCIe, attestation, signed images, egress control and weight checks.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2409.03992">Zhu et al., Confidential Computing on NVIDIA Hopper GPUs: A Performance Benchmark Study</a></td><td>Measured overhead of GPU confidential mode for LLM inference.</td></tr>
+</table></div>
+<h3>Sources considered and not used</h3>
+<ul>
+  <li>Turbopuffer's ANN v3 (vector search over 100 billion vectors) and the Theseus GPU query processing summary are good systems reading but are about search and databases, not model inference.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Part A computed with Python 3.13; Parts B and C are design exercises.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$,el,css}=IE;
+function ds(){const s=$('dsSvg');s.innerHTML='';
+  const box=(x,y,w,h,f,st,t)=>{el('rect',{x,y,width:w,height:h,rx:4,fill:css(f),stroke:css(st)},s);if(t)el('text',{x:x+w/2,y:y+h/2+4,'text-anchor':'middle','font-size':10,fill:css('--ink')},s,t);};
+  el('text',{x:10,y:18,'font-size':12,'font-weight':600,fill:css('--ink')},s,'Prefill: 4 nodes, 32 GPUs');
+  for(let i=0;i<4;i++)box(10+i*38,28,34,40,'--pre-s','--pre','8');
+  el('text',{x:10,y:88,'font-size':10.5,fill:css('--ink2')},s,'EP32 + DP32: 9 routed experts');
+  el('text',{x:10,y:102,'font-size':10.5,fill:css('--ink2')},s,'+ 1 shared expert per GPU');
+  el('text',{x:236,y:18,'font-size':12,'font-weight':600,fill:css('--ink')},s,'Decode unit: 18 nodes, 144 GPUs');
+  for(let i=0;i<18;i++)box(230+(i%9)*48,28+Math.floor(i/9)*44,44,40,'--dec-s','--dec','8');
+  el('text',{x:230,y:132,'font-size':10.5,fill:css('--ink2')},s,'EP144 + DP144: 2 routed experts + 1 shared expert per GPU');
+  el('path',{d:'M 165 48 L 222 48',stroke:css('--kv'),'stroke-width':2,'marker-end':'url(#dsA)'},s);
+  const d=el('defs',{},s),m=el('marker',{id:'dsA',viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto'},d);el('path',{d:'M0,0 L10,5 L0,10 z',fill:css('--kv')},m);
+  el('text',{x:168,y:42,'font-size':9.5,fill:css('--kv')},s,'KV');
+  box(10,150,660,44,'--panel2','--line','');
+  el('text',{x:20,y:168,'font-size':10.5,fill:css('--ink')},s,'Each step: two micro-batches; one computes while the other exchanges tokens with experts.');
+  el('text',{x:20,y:184,'font-size':10.5,fill:css('--ink')},s,'Load balancers even out attention work, KV use and expert work. 32 redundant hot experts per unit.');}
+IE.onTheme(ds);
+const P=['Cloud staff, host OS','Hypervisor','PCIe bus snooping','Serving code in the VM','Logs and traces','Client device (yours)'];
+const ST=[[1,1,1,1,1,3],[0,0,0,1,1,3],[0,0,0,2,2,3]];
+const NOTE=['Anyone with root on the host, the hypervisor or physical access can read memory and traffic.','Memory is encrypted and the host is outside the trust boundary, but code running inside the VM still sees every prompt, and anything it logs or sends out leaks.','Only signed images run, outbound traffic is blocked and the client checks attestation, so leaking from inside is much harder. The client device and the model output remain your responsibility.'];
+const LBL=['blocked','can read','risk reduced','sees it'];
+function tee(){const m=+$('teeM').value,s=$('teeSvg');s.innerHTML='';
+  el('rect',{x:250,y:10,width:420,height:150,rx:8,fill:'none',stroke:css(m?'--good':'--line'),'stroke-width':2,'stroke-dasharray':m?'':'4 4'},s);
+  el('text',{x:262,y:30,'font-size':11,fill:css(m?'--good':'--ink2')},s,m?'Trust boundary: confidential VM + GPU':'No hardware trust boundary');
+  const pos=[[10,10],[10,60],[10,110],[262,46],[462,46],[10,160]];
+  P.forEach((p,i)=>{const v=ST[m][i];const col=['--good','--bad','--dec','--mute'][v];const [x,y]=pos[i];const w=i===3||i===4?196:220;
+    el('rect',{x,y,width:w,height:38,rx:5,fill:v===3?css('--panel2'):css(col+'-s'),stroke:css(col)},s);
+    el('text',{x:x+10,y:y+16,'font-size':11,fill:css('--ink')},s,p);
+    el('text',{x:x+10,y:y+31,'font-size':10.5,'font-weight':600,fill:css(col)},s,LBL[v]);});
+  el('text',{x:262,y:120,'font-size':10.5,fill:css('--ink2')},s,'Model weights and KV cache in GPU memory');
+  $('teeNote').textContent=NOTE[m];}
+$('teeM').addEventListener('input',tee);IE.onTheme(tee);
+})();
+</script>
