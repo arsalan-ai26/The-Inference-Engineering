@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>7.5 Distillation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="7.5">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 7 · Chapter 7.5</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 7 · Fine-tuning and post-training · Chapter 7.5</div>
+<h1>Distillation</h1>
+<p class="lede">Distillation trains a small student model to behave like a large teacher. For inference engineers it is one of the most valuable tools there is: a student a tenth of the size serves at a fraction of the cost and latency (Part 2's arithmetic), and for one well-defined task it can come close to the teacher. This chapter explains off-policy distillation (training on the teacher's outputs), logit distillation, and on-policy distillation, where the student writes and the teacher grades every token, which Thinking Machines and the Qwen team found reaches RL-level reasoning scores at about a tenth of the cost.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 2 hours with the lab</span>
+  <span class="chip">Needs: 1.2, 7.2, 7.4</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What is the difference between training a student on a teacher's sampled answers and on-policy distillation?</li>
+    <li>Why is reverse KL called "mode seeking"?</li>
+    <li>When does fine-tuning a small model on human data beat distilling from a large one?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Off-policy: the student imitates text the teacher wrote, so it never learns to recover from its own mistakes. On-policy: the student generates, and the teacher scores each of the student's tokens, so the training signal covers the states the student actually reaches.</li>
+    <li>Minimizing KL(student ‖ teacher) punishes the student for putting probability where the teacher has little, but not for missing some of the teacher's modes. So the student concentrates on one good mode rather than spreading thinly across all of them (the lab shows it).</li>
+    <li>When no teacher does the task well (a proprietary domain, new internal knowledge), when the teacher's licence forbids using its outputs for training, or when you have abundant high-quality labelled data.</li>
+  </ol></details>
+</div>
+
+<h2 id="kinds">1. Three kinds of distillation</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Teacher and student:</strong> the larger model whose behaviour is copied, and the smaller model being trained.</p>
+  <p><strong>Off-policy (sequence-level) distillation:</strong> SFT on answers sampled from the teacher. Simple, works with API-only teachers.</p>
+  <p><strong>Logit distillation:</strong> train the student to match the teacher's full next-token distribution (or its top-k) at each position, instead of only the sampled token. More signal per token; needs teacher logits and a shared tokenizer.</p>
+  <p><strong>On-policy distillation:</strong> the student samples answers; the teacher computes its log-probabilities on the student's tokens; the per-token difference is the training signal.</p>
+  <p><strong>Forward and reverse KL:</strong> KL(teacher ‖ student) penalizes the student for missing teacher probability (mode covering); KL(student ‖ teacher) penalizes it for putting probability where the teacher would not (mode seeking).</p>
+</div>
+<div class="tbl"><table>
+<tr><th></th><th>Data source</th><th>Signal per answer</th><th>Needs</th></tr>
+<tr><td>SFT on human data</td><td>Humans (off-policy)</td><td>Dense</td><td>Labelled data</td></tr>
+<tr><td>Off-policy distillation</td><td>Teacher (off-policy)</td><td>Dense (one token per position)</td><td>Teacher samples</td></tr>
+<tr><td>Logit distillation</td><td>Teacher (off-policy)</td><td>Denser (a distribution per position)</td><td>Teacher logits, shared vocabulary</td></tr>
+<tr><td>RL</td><td>Student (on-policy)</td><td>Sparse (one reward per answer)</td><td>A reward</td></tr>
+<tr><td>On-policy distillation</td><td>Student (on-policy)</td><td>Dense (a grade per token)</td><td>Teacher forward passes on student samples</td></tr>
+</table></div>
+<p>Thinking Machines' framing: off-policy methods teach from states the student would rarely reach itself, so errors compound once the student leaves the teacher's path; RL trains on the student's own states but learns only a few bits per episode; on-policy distillation combines on-policy states with a dense signal, like a chess coach grading each of your moves.</p>
+
+<h2 id="opd">2. On-policy distillation</h2>
+<ol>
+  <li>The student samples an answer for a prompt.</li>
+  <li>The teacher runs one forward pass over the student's answer and returns log-probabilities for each student token.</li>
+  <li>Per-token reward = −(log p_student − log p_teacher), an estimate of the negative reverse KL.</li>
+  <li>Train the student with a policy-gradient update using that per-token advantage, as in RL.</li>
+</ol>
+<p>Reverse KL has useful properties here: it reaches zero only when the student behaves like the teacher, so it cannot be "hacked" the way a learned reward model can; it is mode seeking, so the student commits to one of the teacher's good behaviours; and grading needs only a forward pass from the large model while the cheap student does the generation.</p>
+<div class="box ex">
+  <span class="lbl">Worked example: the published numbers</span>
+  <p>The Qwen3 report (as summarized by Thinking Machines) starts from an off-policy-distilled 8B checkpoint scoring 55.0% on AIME'24: RL raised it to 67.6% using 17,920 GPU hours, and on-policy distillation to 74.4% using 1,800 GPU hours. Thinking Machines replicated the approach from their own 400,000-prompt SFT checkpoint of Qwen3-8B-Base (60%): on-policy distillation reached 70% in about 150 steps (about 77,000 prompts), which they estimate is 9 to 30 times cheaper than continuing off-policy distillation to the same score (9 times when the SFT data already exists, about 18 times in GPU hours, about 30 times including the cost of sampling the teacher).</p>
+</div>
+<div class="widget" id="klW">
+  <div class="wt">Interactive: forward vs reverse KL</div>
+  <div class="ws">The teacher (grey) has two good modes. A single-peak student is fitted by minimizing each KL. Forward KL spreads the student across both modes, putting much of its probability where the teacher has almost none; reverse KL picks one mode and fits it well.</div>
+  <div class="ctrls"><label>Distance between the teacher's modes <input type="range" id="klD" min="0" max="4" step="0.25" value="3"> <span id="klDv"></span></label></div>
+  <div class="svgwrap"><svg id="klSvg" viewBox="0 0 680 200" width="680" style="max-width:100%;height:auto" role="img" aria-label="Teacher distribution and two fitted students"></svg></div>
+  <div class="stats" id="klStats"></div>
+</div>
+
+<h2 id="uses">3. Where distillation fits</h2>
+<ul>
+  <li><strong>Serving cost:</strong> a 7B to 8B student for one task often replaces a frontier API at a much lower cost per token (chapters 6.5 and 7.1). The Smol playbook found on-policy distillation most effective for small and mid-sized models (under about 30B).</li>
+  <li><strong>Reasoning:</strong> the Qwen3 report used on-policy distillation from flagship models to train its models under 32B.</li>
+  <li><strong>Recovering lost behaviour:</strong> Thinking Machines fine-tuned a model on internal company documents, which raised knowledge but hurt instruction following, even with chat data mixed in; on-policy distillation from the original model then restored instruction following without losing the new knowledge. That makes it a tool for continual learning.</li>
+  <li><strong>Speculative decoding drafters</strong> (chapter 4.3) are distilled students too: a drafter trained to match the target's distribution raises the acceptance rate.</li>
+</ul>
+<p>Limits: the student's ceiling is the teacher, and it inherits the teacher's biases and errors (the lab's teacher gets one of its two puzzles wrong). Both models must share a tokenizer for per-token grading, or you need a token alignment step. And check the teacher's licence: some model providers forbid using outputs to train competing models.</p>
+
+<h2 id="plan">4. Planning a distillation for a client task</h2>
+<ol>
+  <li><strong>Define the task and the evaluation</strong> first (chapter 7.6): a held-out set scored the same way for teacher and student.</li>
+  <li><strong>Measure the teacher</strong> with its best prompt. If the teacher is not good enough, distillation will not fix it.</li>
+  <li><strong>Collect prompts</strong> that cover real traffic (thousands, not millions, for a narrow task).</li>
+  <li><strong>Off-policy first:</strong> SFT the student on teacher answers (filtered by the evaluation's checker where possible). Cheap and often enough.</li>
+  <li><strong>On-policy next</strong> if the student still makes characteristic errors: student samples, teacher grades, a few hundred steps.</li>
+  <li><strong>Compare cost:</strong> student serving cost at your SLO against the teacher's (chapter 6.5), including the training cost amortized over expected volume.</li>
+</ol>
+
+<h2 id="expert">5. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Why on-policy data matters: compounding errors</span>
+  <p>A student trained only on teacher text has never seen its own mistakes in context. At inference, one early error puts it in a state no training example covered, and errors compound over a long answer. On-policy training puts the student's own early errors in the context and teaches it what to do next, which matters most for long reasoning and agent trajectories.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Infrastructure for on-policy distillation</span>
+  <p>It is RL plumbing with a different reward: an inference engine for student rollouts, and a teacher served for log-probability scoring (a prefill-only workload, efficient with large batches). Prefix caching helps since the teacher re-reads the prompt for every sample. TRL and NeMo-RL support it, per the Smol playbook.</p>
+</div>
+
+<h2 id="mistakes">6. Common mistakes</h2>
+<ul>
+  <li>Distilling from a teacher that was never evaluated on the task.</li>
+  <li>Using a teacher whose terms forbid training on its outputs.</li>
+  <li>Mismatched tokenizers or chat templates between teacher and student.</li>
+  <li>Unfiltered teacher outputs, so the student copies the teacher's errors.</li>
+  <li>Comparing the distilled student with an unprompted teacher.</li>
+</ul>
+
+<h2 id="lab">7. Lab</h2>
+<h3>Part A: a teacher grades a student's tokens</h3>
+<p>The student (Qwen2.5-0.5B-Instruct) samples answers to two trick questions; the teacher (Qwen2.5-1.5B-Instruct, same tokenizer) scores each student token. Predict first: which tokens will the teacher penalize most?</p>
+<pre>import torch, torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForCausalLM
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+student = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct").eval()
+teacher = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct", dtype=torch.bfloat16).eval()
+torch.manual_seed(0)
+qs = ["A farmer has 17 sheep. All but 9 run away. How many sheep are left? Answer briefly.",
+      "If you put 3 ice cubes in a hot frying pan, how many whole ice cubes are there after 10 minutes? Answer briefly."]
+for q in qs:
+    ids = tok.apply_chat_template([{"role": "user", "content": q}], add_generation_prompt=True, return_tensors="pt")
+    with torch.no_grad():
+        out = student.generate(ids, max_new_tokens=40, do_sample=True, temperature=0.7)
+        n = ids.shape[1]; ans = out[0, n:]
+        ls = F.log_softmax(student(out).logits[0, n-1:-1].float(), -1)
+        lt = F.log_softmax(teacher(out).logits[0, n-1:-1].float(), -1)
+    rkl = (ls.gather(1, ans[:, None]) - lt.gather(1, ans[:, None]))[:, 0]   # per-token penalty
+    top = torch.topk(rkl, 4).indices.sort().values
+    print(tok.decode(ans, skip_special_tokens=True))
+    print([(tok.decode([ans[i]]), round(rkl[i].item(), 2)) for i in top],
+          "mean reverse KL", round((ls.exp() * (ls - lt)).sum(-1).mean().item(), 3))</pre>
+<details><summary>What we measured (CPU)</summary><pre class="out">Q: A farmer has 17 sheep. All but 9 run away. How many sheep are left? Answer briefly.
+student: 'There are 28 sheep left (17 total - 9 that ran away).'
+most penalized tokens: [('There', 3.03), (' are', 0.68), ('2', 12.13), ('8', 4.67)]
+mean per-token reverse KL 0.585, teacher's greedy answer: 'One sheep is left.'
+Q: If you put 3 ice cubes in a hot frying pan, how many whole ice cubes are there after 10 minutes? Answer briefly.
+student: 'After 10 minutes, there will be 4 whole ice cubes left because the number of remaining ice cubes doubles every minute.\n\nThe calculation:\n- Initial number of ice cubes: 3\n-'
+most penalized tokens: [('4', 6.58), (' number', 4.92), ('.\n\n', 3.58), (' calculation', 2.94)]
+mean per-token reverse KL 0.516, teacher's greedy answer: 'There would be no whole ice cubes left after 10 minutes because the ice will melt completely under the heat of the frying pan.'</pre>
+<p>The teacher concentrates its penalty on the tokens where the student goes wrong: "2" in "28" (12.1 nats) and the "4" in the ice cube answer. Most other tokens cost little. That is the dense, targeted signal on-policy distillation trains with. Note the teacher's own answers: right about the ice, wrong about the sheep (the answer is 9). A student distilled from it would inherit that error, which is why you evaluate the teacher first.</p></details>
+<h3>Part B: forward vs reverse KL</h3>
+<pre>import numpy as np
+x = np.linspace(-8, 8, 2001); dx = x[1] - x[0]
+g = lambda m, s: np.exp(-(x - m)**2 / (2 * s * s)) / (s * np.sqrt(2 * np.pi))
+p = 0.5 * g(-3, 0.7) + 0.5 * g(3, 0.7)                  # teacher with two modes
+for kind in ["forward", "reverse"]:
+    best = min(((p * np.log((p + 1e-12) / (g(m, s) + 1e-12))).sum() * dx if kind == "forward"
+                else ((g(m, s) + 1e-12) * np.log((g(m, s) + 1e-12) / (p + 1e-12))).sum() * dx, m, s)
+               for m in np.linspace(-4, 4, 81) for s in np.linspace(0.3, 4, 75))
+    print(kind, "best mean, std:", round(best[1], 2), round(best[2], 2))</pre>
+<details><summary>What we computed</summary><pre class="out">forward KL best fit mean, std = (0.0, 3.1) KL 0.789
+reverse KL best fit mean, std = (3.0, 0.7) KL 0.693</pre>
+<p>Forward KL centres a wide student between the modes, where the teacher has almost no probability; reverse KL fits one mode exactly. For text, a forward-KL student blends behaviours and can produce answers the teacher would never give.</p></details>
+<h3>Part C: plan a distillation</h3>
+<p>For one client task, write the six-step plan from section 4: the evaluation, the teacher and its measured score, the prompt source and count, the off-policy step, the condition for adding on-policy distillation, and the cost comparison with serving the teacher.</p>
+
+<h2 id="realworld">8. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Distillation in practice</span>
+  <ul>
+    <li><strong>Model families</strong> distill small models from flagships (the Qwen3 report describes on-policy distillation for models under 32B).</li>
+    <li><strong>Product teams</strong> distill frontier-model behaviour on one task into a self-hosted small model to cut cost and latency.</li>
+    <li><strong>Speculative decoding drafters</strong> and edge models are distilled students.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">9. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz75"></div>
+<script type="application/json" id="qz75">[
+{"q":"On-policy distillation is:","o":["Off-policy and sparse","On-policy and dense","Off-policy and dense","On-policy and sparse"],"a":1,"e":"Student samples; teacher grades every token."},
+{"q":"Reverse KL makes the student:","o":["Cover every teacher mode thinly","Commit to one of the teacher's modes","Ignore the teacher","Copy the data exactly"],"a":1,"e":"Mode seeking."},
+{"q":"Per-token reward in on-policy distillation:","o":["Human rating","−(log p_student − log p_teacher) on the student's token","Answer length","A unit test"],"a":1,"e":"An estimate of negative reverse KL."},
+{"q":"Qwen3's on-policy distillation reached 74.4% on AIME'24 with about how many GPU hours, against 17,920 for RL?","o":["18","1,800","18,000","180,000"],"a":1,"e":"About a tenth of the RL cost."},
+{"q":"Why evaluate the teacher before distilling?","o":["To pick a learning rate","The student inherits the teacher's errors and its ceiling","Teachers are always right","For licensing"],"a":1,"e":"The lab's teacher got one puzzle wrong."},
+{"q":"Per-token grading requires:","o":["The same tokenizer (or token alignment)","The same model size","A reward model","An API teacher"],"a":0,"e":"Log-probabilities must refer to the same tokens."}
+]</script>
+
+<h2 id="summary">10. Summary</h2>
+<ul>
+  <li>Distillation trains a small student to imitate a large teacher; for one task it can cut serving cost by multiples.</li>
+  <li>Off-policy (teacher samples or logits) is simple; on-policy distillation adds the student's own states with a dense per-token grade.</li>
+  <li>Reverse KL is mode seeking and hard to hack; on-policy distillation matched or beat RL on maths at about a tenth of the cost.</li>
+  <li>Evaluate the teacher first, share a tokenizer, filter outputs, check licences.</li>
+</ul>
+
+<h2 id="refs">11. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://thinkingmachines.ai/blog/on-policy-distillation/">Thinking Machines, On-Policy Distillation</a></td><td>The method, reverse KL, the AIME results and cost comparison, and continual learning without forgetting.</td></tr>
+<tr><td><a href="https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook">Hugging Face, The Smol Training Playbook</a></td><td>When to choose online DPO, on-policy distillation or RL, and the Qwen3 pipeline.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. Parts A and B run on CPU with PyTorch 2.15, Transformers 5.22 and NumPy 2.5.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {$,el,css}=IE;
+const N=401,xs=Array.from({length:N},(_,i)=>-8+16*i/(N-1)),dx=16/(N-1);
+const g=(x,m,s)=>Math.exp(-(x-m)*(x-m)/(2*s*s))/(s*Math.sqrt(2*Math.PI));
+function kl(){const D=+$('klD').value;$('klDv').textContent=D;
+  const p=xs.map(x=>0.5*g(x,-D,0.7)+0.5*g(x,D,0.7));
+  let bf=[1e9,0,1],br=[1e9,0,1];
+  for(let m=-4;m<=4.001;m+=0.1)for(let s=0.3;s<=4.001;s+=0.05){let f=0,r=0;for(let i=0;i<N;i++){const q=g(xs[i],m,s)+1e-12,pp=p[i]+1e-12;f+=pp*Math.log(pp/q);r+=q*Math.log(q/pp);}f*=dx;r*=dx;if(f<bf[0])bf=[f,m,s];if(r<br[0])br=[r,m,s];}
+  const s=$('klSvg');s.innerHTML='';const x0=20,x1=660,y0=180,y1=12,X=v=>x0+(v+8)/16*(x1-x0);const mx=Math.max(...p,...xs.map(x=>g(x,br[1],br[2])))*1.05,Y=v=>y0-v/mx*(y0-y1);
+  const path=(f,col,w,dash)=>{let d='';xs.forEach((x,i)=>{d+=(i?'L':'M')+X(x).toFixed(1)+','+Y(f(x,i)).toFixed(1);});el('path',{d,fill:'none',stroke:css(col),'stroke-width':w,'stroke-dasharray':dash||''},s);};
+  path((x,i)=>p[i],'--mute',3);path(x=>g(x,bf[1],bf[2]),'--dec',2);path(x=>g(x,br[1],br[2]),'--pre',2,'5 3');
+  el('line',{x1:x0,x2:x1,y1:y0,y2:y0,stroke:css('--ink2')},s);
+  [['teacher','--mute'],['forward-KL student','--dec'],['reverse-KL student','--pre']].forEach((l,i)=>{el('rect',{x:x0+i*170,y:188,width:12,height:8,fill:css(l[1])},s);el('text',{x:x0+16+i*170,y:196,'font-size':10,fill:css('--ink2')},s,l[0]);});
+  $('klStats').innerHTML=[['Forward-KL fit: mean, std',bf[1].toFixed(1)+', '+bf[2].toFixed(2)],['Reverse-KL fit: mean, std',br[1].toFixed(1)+', '+br[2].toFixed(2)]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+$('klD').addEventListener('input',kl);IE.onTheme(kl);
+})();
+</script>
+
+</body>
+</html>

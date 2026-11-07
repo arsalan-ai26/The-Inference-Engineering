@@ -347,7 +347,7 @@ window.IE_CHAPTERS = [
 "title": "Distillation",
 "slug": "7-5-distillation",
 "part": 7,
-"ready": false
+"ready": true
 },
 {
 "n": "7.6",
