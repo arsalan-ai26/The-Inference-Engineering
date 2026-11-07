@@ -305,7 +305,7 @@ window.IE_CHAPTERS = [
 "title": "Fault tolerance, security and incident response",
 "slug": "6-9-fault-tolerance-security",
 "part": 6,
-"ready": false
+"ready": true
 },
 {
 "n": "6.10",

@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>6.9 Fault tolerance, security and incident response</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="6.9">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 6 · Chapter 6.9</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 6 · Production inference infrastructure · Chapter 6.9</div>
+<h1>Fault tolerance, security and incident response</h1>
+<p class="lede">GPUs fail, networks drop, engines crash, and deploys go wrong. An inference service has to keep answering anyway, lose as little work as possible when a replica dies mid-stream, and recover quickly. It also has to keep tenants apart, protect prompts and model weights, and resist abuse. This chapter covers how GPU clusters actually fail, how to detect and remove bad nodes, what happens to in-flight requests and their KV caches when a replica dies, retry and degradation strategies, chaos testing, how to run an incident, and the security risks specific to LLM inference, including prompt-cache timing leaks.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 4.4, 6.2, 6.4, 6.6</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>A replica dies after streaming 60 of 100 tokens. What are the options for that request?</li>
+    <li>What does Xid 79 in a kernel log mean, and what should happen to the node?</li>
+    <li>How can a shared prefix cache leak one customer's prompt to another?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Fail it and let the client retry; restart it from scratch on another replica (the 60 tokens are wasted, and a streaming client must discard what it showed); or resume it elsewhere by sending the prompt plus the 60 tokens and generating the remaining 40 (costs a longer prefill; the KV itself died with the GPU unless it was copied to another tier).</li>
+    <li>"GPU has fallen off the bus": the GPU is no longer reachable over PCIe. Drain the node and take it out of service; NVIDIA's catalog recommends a bare-metal restart and contacting support if it repeats.</li>
+    <li>Cache hits return the first token faster. An attacker who sends prompts that share a prefix with someone else's cached prompt can tell from the timing whether that prefix was recently sent. Isolate caches per tenant (for example a per-tenant cache salt).</li>
+  </ol></details>
+</div>
+
+<h2 id="fail">1. How GPU clusters fail</h2>
+<p>Large operators publish their failure data, and the numbers are sobering:</p>
+<ul>
+  <li><strong>Llama 3 training</strong> (about 16,000 H100 GPUs, 54 days): 419 unexpected interruptions, about one per 50,000 GPU-hours. Faulty GPUs (148 interruptions) and GPU HBM3 memory (72) were the top two causes, followed by software bugs and network switches and cables.</li>
+  <li><strong>Meta's research clusters</strong> (RSC-1 and RSC-2): failure rates change constantly, from about 2.5 to 17.5 failures per node-day across the cluster in different periods; RSC-1's average was 6.5 failures per thousand node-days. Jobs of 4,000 GPUs saw a mean time to failure of about 10 hours. The most common attributed causes were the backend network, file system mounts and GPUs (mostly memory errors, PCIe errors and GPUs falling off the bus).</li>
+</ul>
+<p>For inference, the same rates apply per GPU. Mean time to failure scales as 1 ÷ (number of nodes × failure rate per node), so a 2-node replica fails about twice as often as a 1-node replica, and a fleet of hundreds of replicas sees failures daily.</p>
+<div class="tbl"><table>
+<tr><th>Failure</th><th>How it shows up</th><th>Typical response</th></tr>
+<tr><td>GPU fallen off the bus (Xid 79), PCIe errors</td><td>GPU unreachable, CUDA calls fail</td><td>Drain node, reboot, hardware ticket</td></tr>
+<tr><td>Uncorrectable memory errors (Xid 48 double-bit ECC; 94 contained, 95 uncontained), row-remap failure (Xid 64)</td><td>Process crash or corrupted results</td><td>94: restart the application; 95 and 64: reset the GPU; repeated: replace</td></tr>
+<tr><td>NVLink error (Xid 74)</td><td>Collective operations fail or hang</td><td>Drain; follow NVIDIA's NVLink workflow</td></tr>
+<tr><td>Memory page fault, graphics exception (Xid 31, 13)</td><td>Often a software or kernel bug</td><td>Restart the application; debug with compute-sanitizer</td></tr>
+<tr><td>GSP firmware timeout (Xid 119)</td><td>GPU stops responding</td><td>Reset the GPU; check driver version</td></tr>
+<tr><td>GPU out of memory</td><td>Engine refuses or crashes on large requests</td><td>Fix memory settings (chapter 3.3), cap context length</td></tr>
+<tr><td>NCCL timeout or hang</td><td>Multi-GPU replica stuck</td><td>Restart the whole replica; find the root cause (often a bad node or link)</td></tr>
+<tr><td>Node loss, network partition</td><td>Replica unreachable</td><td>Router removes it; autoscaler replaces it</td></tr>
+</table></div>
+<p>Xid messages appear in the kernel log (search for <code>NVRM: Xid</code>) and through DCGM (chapter 6.6). NVIDIA's Xid catalog lists a recommended action for each code.</p>
+
+<h2 id="detect">2. Detecting and removing bad nodes</h2>
+<p>Meta's clusters run health checks on every node every five minutes: GPU accessible, NVLink errors, uncorrectable ECC, failed row remaps, PCIe and InfiniBand link errors, missing file system mounts. A node that fails a check is removed from scheduling until fixed. Two of their lessons:</p>
+<ul>
+  <li><strong>One bad node spoils the bunch.</strong> Without checks, the same defective node is picked again and again, and jobs fail in a loop.</li>
+  <li><strong>New checks reveal hidden failures.</strong> Adding a check often makes the failure rate appear to rise, because a problem that was always there is now visible.</li>
+</ul>
+<p>For an inference service, layer the checks:</p>
+<ol>
+  <li><strong>Liveness:</strong> is the engine process alive? Restart it if not.</li>
+  <li><strong>Readiness:</strong> is the model loaded and is the replica accepting requests? Remove it from routing if not (chapter 6.2).</li>
+  <li><strong>Node health:</strong> Xid events, ECC counts, NVLink and PCIe errors from DCGM. Drain the node on critical errors.</li>
+  <li><strong>End-to-end probe:</strong> a tiny real generation (a few tokens of a fixed prompt) every few seconds. It catches a replica that is "ready" but stuck or producing garbage.</li>
+  <li><strong>Passive checks:</strong> the router stops sending to a replica as soon as requests to it fail, without waiting for the next probe.</li>
+</ol>
+
+<h2 id="inflight">3. What happens to in-flight requests</h2>
+<p>When a replica dies, everything in its GPU memory is gone: the weights (reloaded on restart) and the KV cache of every request it was serving. Each in-flight request has four possible fates:</p>
+<div class="tbl"><table>
+<tr><th>Strategy</th><th>How</th><th>Cost</th><th>Notes</th></tr>
+<tr><td>Fail</td><td>Return an error; client decides</td><td>None for the server</td><td>The user sees an error; fine for batch clients with their own retries</td></tr>
+<tr><td>Restart</td><td>Router resends the original request to another replica</td><td>All tokens already generated are wasted; full prefill again</td><td>A streaming client has already shown part of an answer; the new answer may differ (sampling)</td></tr>
+<tr><td>Resume by recompute</td><td>Resend prompt + tokens generated so far, ask for the rest</td><td>A longer prefill; no generated tokens wasted</td><td>The stream continues seamlessly; the continuation is a valid sample but not necessarily what the dead replica would have produced</td></tr>
+<tr><td>Resume by KV transfer</td><td>Another replica loads the request's KV from a copy outside the dead GPU</td><td>Transfer time; needs KV already written to CPU, disk or a remote store</td><td>Possible with tiered KV caches and connectors (chapter 4.4); cannot recover KV that existed only on the failed GPU</td></tr>
+</table></div>
+<p>Retries need care:</p>
+<ul>
+  <li><strong>Retry budgets and backoff.</strong> Limit retries per request (for example 2) and across the fleet (for example retries at most 10% of traffic), with exponential backoff and random jitter. Otherwise a partial outage turns into a retry storm that overloads the healthy replicas.</li>
+  <li><strong>Idempotency.</strong> Retrying a generation is safe; retrying an agent's tool call that sends an email or charges a card is not. Agent harnesses need idempotency keys for side effects.</li>
+  <li><strong>Multi-node replicas</strong> fail as a unit: one bad GPU takes down the whole tensor- or pipeline-parallel group. Restart the group together (LeaderWorkerSet's all-or-nothing restart, chapter 6.7) and keep spare capacity.</li>
+</ul>
+<div class="widget" id="frW">
+  <div class="wt">Interactive: how often does something break?</div>
+  <div class="ws">Expected replica failures from a per-node failure rate. Defaults use Meta RSC-1's average (6.5 failures per thousand node-days); Llama 3's rate, one per 50,000 GPU-hours, is about 3.8 per thousand node-days for 8-GPU nodes.</div>
+  <div class="ctrls">
+    <label>Failures per 1,000 node-days <input type="number" id="frR" value="6.5" step="0.5" min="0.1" style="width:84px"></label>
+    <label>Nodes per replica <input type="number" id="frN" value="2" step="1" min="1" style="width:84px"></label>
+    <label>Replicas <input type="number" id="frK" value="50" step="10" min="1" style="width:84px"></label>
+    <label>Replacement time (minutes) <input type="number" id="frT" value="15" step="5" min="1" style="width:84px"></label>
+  </div>
+  <div class="stats" id="frStats"></div>
+</div>
+
+<h2 id="degrade">4. Graceful degradation</h2>
+<p>When capacity drops faster than the autoscaler can replace it (chapter 6.3 showed GPU replicas take minutes), keep the most important traffic working:</p>
+<ul>
+  <li><strong>Shed load by priority</strong> (chapter 6.4): reject or queue batch and free-tier traffic first, with clear 429 or 503 responses and a <code>Retry-After</code> header.</li>
+  <li><strong>Reduce work per request:</strong> lower the maximum output length, disable expensive features, route long-context requests to a dedicated pool.</li>
+  <li><strong>Fall back</strong> to a smaller model or another region or provider, if the product can accept it (chapter 6.5).</li>
+  <li><strong>Circuit breakers:</strong> stop calling a dependency that keeps failing, so requests fail fast instead of piling up.</li>
+</ul>
+
+<h2 id="chaos">5. Chaos testing</h2>
+<p>Recovery that has never been tested usually does not work. Chaos engineering injects failures on purpose, in staging and then carefully in production. Chaos Mesh, a Kubernetes-native tool, defines failures as resources (killing pods, adding network delay or loss, stressing CPU and memory) and can orchestrate them in workflows with status checks. Inference-specific experiments:</p>
+<ul>
+  <li>Kill a replica mid-stream; measure failed requests, retry success and time to full capacity (the lab does this).</li>
+  <li>Add network delay between router and replicas, or between prefill and decode workers (chapter 4.6).</li>
+  <li>Force a GPU out-of-memory with a request near the context limit.</li>
+  <li><strong>Bad rollout:</strong> deploy a canary with a broken chat template; does chapter 6.6's correctness monitoring catch it, and does rollback work?</li>
+  <li><strong>Cache degradation:</strong> flush or disable the prefix cache; how far do TTFT and cost rise, and do autoscaling and alerts react?</li>
+</ul>
+
+<h2 id="incident">6. Running an incident</h2>
+<p>Google's incident management follows the Incident Command System, with clear roles:</p>
+<ul>
+  <li><strong>Incident commander:</strong> holds the overall state, assigns roles, decides. Holds every role not yet delegated.</li>
+  <li><strong>Operations lead:</strong> the only person (or team) changing the system during the incident.</li>
+  <li><strong>Communications lead:</strong> regular updates to stakeholders and users.</li>
+  <li><strong>Planning lead:</strong> longer-term tasks: bugs, handoffs, tracking temporary changes to revert later.</li>
+</ul>
+<p>The commander keeps a <strong>living incident document</strong> with a timeline. Declare incidents early (it is cheaper to cancel one than to start one late), hand off command explicitly at shift changes, and write a blameless postmortem afterwards.</p>
+<div class="box ex">
+  <span class="lbl">Worked example: a first-cause timeline</span>
+  <p>TTFT p99 alert fires at 14:05. Timeline built from metrics, deploy logs and Xid logs:</p>
+  <ul>
+    <li>13:40 config deploy lowers <code>gpu-memory-utilization</code> from 0.90 to 0.85 on all replicas (audit log).</li>
+    <li>13:41 to 13:50 replicas restart in a rolling update; the KV pool is about 7% smaller, because it gets what is left after weights and activations (for an 8B model on an 80 GB GPU; chapter 3.3).</li>
+    <li>13:55 afternoon traffic rises; <code>num_requests_waiting</code> climbs, preemptions start.</li>
+    <li>14:02 node 17 logs Xid 79; its replica drops out, remaining replicas take the extra load.</li>
+    <li>14:05 alert. First cause: the config change that shrank the KV pool; the GPU failure was a coincidental trigger that removed the remaining headroom.</li>
+  </ul>
+  <p>The first symptom (the alert) and the most visible event (the GPU failure) are not the first cause. Lining up changes, saturation metrics and hardware events on one timeline finds it.</p>
+</div>
+<p><strong>Runbooks:</strong> for each likely incident (replica crash loop, GPU failure, TTFT regression after a deploy, quality regression, traffic spike, provider outage), write the symptoms, the dashboards and queries to check, the safe mitigations (roll back, drain, shed load, scale out) and who to escalate to.</p>
+
+<h2 id="security">7. Security for inference</h2>
+<p>Securing an inference service is first like securing any containerized service: encryption in transit and at rest, container security, network and access controls, workload isolation and third-party penetration testing. Three assets need attention: <strong>user data</strong> (prompts and outputs), <strong>model weights</strong> (often a trade secret) and the <strong>infrastructure</strong> itself (GPUs and model access are targets for abuse). The simplest step: do not store prompts and outputs unless you need to. Compliance regimes such as SOC 2 Type II and HIPAA require your providers to be compliant too, and data residency rules can require processing in specific countries (chapter 6.5).</p>
+<h3>Risks specific to LLM serving</h3>
+<ul>
+  <li><strong>Prompt-cache timing leaks.</strong> A cache hit makes TTFT measurably faster. Gu et al. audited 17 API providers in late 2024: 8 cached prompts, and 7 shared the cache globally across all users, so an attacker could in principle detect whether another user had recently sent a prompt with a given prefix. They disclosed the results to the providers before publishing. Mitigation: per-tenant (per-organization or per-user) caches. vLLM supports a per-request <code>cache_salt</code> that is mixed into the hash of the first block, so only requests with the same salt share cached blocks.</li>
+  <li><strong>Tenant isolation</strong> beyond the cache: separate LoRA adapters and fine-tuned models per tenant, no cross-tenant data in logs or traces, rate limits and quotas per tenant.</li>
+  <li><strong>Unbounded consumption</strong> (OWASP LLM10): very long prompts, maximum output lengths and many parallel streams exhaust GPUs and budgets. Enforce limits on input length, output length, concurrency and tokens per minute per key.</li>
+  <li><strong>Supply chain</strong> (LLM03): load weights from safetensors, not pickle (chapter 3.1); avoid <code>trust_remote_code</code> for untrusted repositories; pin and sign container images.</li>
+  <li><strong>Weight protection:</strong> restrict who can read weight storage, encrypt it, log access; confidential computing (chapter 6.7) protects weights on hosts you do not control.</li>
+</ul>
+<div class="tbl"><table>
+<tr><th>OWASP Top 10 for LLM applications (2025)</th><th>Where the inference layer helps</th></tr>
+<tr><td>LLM01 Prompt injection</td><td>Mostly an application problem; the server can enforce structured output and tool masks</td></tr>
+<tr><td>LLM02 Sensitive information disclosure</td><td>Cache isolation, log and trace hygiene, output filtering</td></tr>
+<tr><td>LLM03 Supply chain</td><td>Safe weight formats, signed images, pinned dependencies</td></tr>
+<tr><td>LLM04 Data and model poisoning</td><td>Verify checkpoint hashes and provenance before deploy</td></tr>
+<tr><td>LLM05 Improper output handling</td><td>Application side; constrained decoding narrows outputs</td></tr>
+<tr><td>LLM06 Excessive agency</td><td>Agent harness permissions (chapter 6.8)</td></tr>
+<tr><td>LLM07 System prompt leakage</td><td>Do not put secrets in prompts; cache isolation</td></tr>
+<tr><td>LLM08 Vector and embedding weaknesses</td><td>Tenant isolation in retrieval stores</td></tr>
+<tr><td>LLM09 Misinformation</td><td>Model and application side</td></tr>
+<tr><td>LLM10 Unbounded consumption</td><td>Rate limits, quotas, length caps, load shedding</td></tr>
+</table></div>
+
+<h2 id="expert">8. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Why "resume by recompute" is usually the right default</span>
+  <p>Prefill is fast per token compared with decode (chapter 2.5), so re-prefilling the prompt plus 60 generated tokens costs much less than generating 60 tokens again, and the user sees no gap in the stream beyond one TTFT. KV transfer is faster still, but only if the KV was already copied off the GPU, which costs bandwidth on every request to protect against rare failures. Systems that already move KV (disaggregated prefill and decode, tiered caches) get it nearly for free.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Correlated failures</span>
+  <p>Failures are not independent: a top-of-rack switch takes out every node under it; a bad driver rollout hits every node at once; Meta saw a spike of InfiniBand link failures from a handful of nodes. Spread replicas across racks and failure domains, roll out drivers and firmware like code (canaries, chapter 6.5), and size headroom for the largest correlated loss, not one node.</p>
+</div>
+
+<h2 id="mistakes">9. Common mistakes</h2>
+<ul>
+  <li>Health checks that only test whether the process is alive.</li>
+  <li>Unlimited retries without backoff, turning a partial failure into a full outage.</li>
+  <li>Retrying agent tool calls with side effects.</li>
+  <li>Restarting one pod of a multi-node replica instead of the whole group.</li>
+  <li>A global prefix cache shared across tenants.</li>
+  <li>Logging full prompts by default, or sending them to third-party tracing tools.</li>
+  <li>Never testing recovery until a real failure.</li>
+</ul>
+
+<h2 id="lab">10. Lab</h2>
+<p><strong>Goal:</strong> kill a replica mid-stream and measure what three retry policies do. Then write runbooks.</p>
+<h3>Part A: fault injection with two replicas</h3>
+<p>Two fake engine replicas (FastAPI, streaming tokens, with prefill time that grows with prompt length) sit behind a client-side router with active health checks every 0.5 s and passive checks on errors. Requests arrive at 10 per second for 12 s (500-word prompts, 100 output tokens). At 4 s, replica B is killed with SIGKILL; at 7 s it restarts with a 2 s model-load delay. Three policies: <code>none</code> (fail), <code>restart</code> (resend from scratch to the other replica) and <code>resume</code> (send prompt plus the tokens received so far, ask for the rest).</p>
+<p>Predict first: how many requests fail with no retries, and which policy has the best p99?</p>
+<pre># replica.py: one fake engine replica
+import asyncio, json, os, time
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+time.sleep(float(os.environ.get("STARTUP_S", "0")))       # model load time on (re)start
+app = FastAPI(); active = 0
+@app.get("/health")
+async def health(): return {"ok": True}
+@app.post("/v1/completions")
+async def completions(req: Request):
+    body = await req.json()
+    n_in = len(body["prompt"].split()); n_out = body["max_tokens"]
+    async def gen():
+        global active
+        active += 1
+        try:
+            await asyncio.sleep(0.02 + n_in * 0.0002 * (1 + active / 8))   # prefill
+            for i in range(n_out):
+                await asyncio.sleep(0.01 * (1 + active / 16))                # decode step
+                yield f"data: {json.dumps({'choices': [{'text': ' tok'}]})}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            active -= 1
+    return StreamingResponse(gen(), media_type="text/event-stream")</pre>
+<pre># chaos.py: router, retry policies and the failure schedule (run next to replica.py)
+import asyncio, os, random, signal, subprocess, sys, time, httpx
+PORTS = [8101, 8102]
+def start(port, startup=0.0):
+    env = dict(os.environ, STARTUP_S=str(startup))
+    return subprocess.Popen([sys.executable, "-m", "uvicorn", "replica:app", "--port", str(port), "--log-level", "error"],
+                            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+async def wait_ready(port):
+    async with httpx.AsyncClient() as c:
+        while True:
+            try:
+                if (await c.get(f"http://127.0.0.1:{port}/health")).status_code == 200: return
+            except Exception: pass
+            await asyncio.sleep(0.1)
+
+class Router:
+    def __init__(self): self.healthy = set(PORTS); self.i = 0
+    def pick(self, avoid=None):
+        c = sorted(p for p in self.healthy if p != avoid) or sorted(self.healthy) or PORTS
+        self.i += 1; return c[self.i % len(c)]
+    async def prober(self):                                  # active health checks every 0.5 s
+        async with httpx.AsyncClient(timeout=0.3) as c:
+            while True:
+                for p in PORTS:
+                    try: ok = (await c.get(f"http://127.0.0.1:{p}/health")).status_code == 200
+                    except Exception: ok = False
+                    (self.healthy.add if ok else self.healthy.discard)(p)
+                await asyncio.sleep(0.5)
+
+async def request(client, router, policy, prompt_words=500, out=100):
+    prompt = " ".join(["w"] * prompt_words); got = wasted = tries = 0; t0 = time.perf_counter(); port = None
+    while tries < 3:
+        tries += 1; port = router.pick(avoid=port)
+        if policy == "resume" and got:
+            body = {"prompt": prompt + " tok" * got, "max_tokens": out - got}
+        else:
+            body = {"prompt": prompt, "max_tokens": out}; wasted += got; got = 0
+        try:
+            async with client.stream("POST", f"http://127.0.0.1:{port}/v1/completions", json=body) as r:
+                async for line in r.aiter_lines():
+                    if line.startswith("data: {"): got += 1
+            if got >= out: return True, time.perf_counter() - t0, wasted, tries
+        except Exception:
+            router.healthy.discard(port)                     # passive health check
+        if policy == "none": break
+    return False, time.perf_counter() - t0, wasted + got, tries
+
+async def scenario(policy, rate=10, duration=12, kill_at=4, restart_at=7, startup=2.0):
+    procs = {p: start(p) for p in PORTS}
+    for p in PORTS: await wait_ready(p)
+    router = Router(); probe = asyncio.create_task(router.prober()); random.seed(1)
+    async with httpx.AsyncClient(timeout=30) as client:
+        t_start = time.perf_counter(); tasks = []; killed = restarted = False
+        while (now := time.perf_counter() - t_start) < duration:
+            if now > kill_at and not killed: procs[8102].send_signal(signal.SIGKILL); killed = True
+            if now > restart_at and not restarted: procs[8102] = start(8102, startup); restarted = True
+            tasks.append(asyncio.create_task(request(client, router, policy)))
+            await asyncio.sleep(random.expovariate(rate))
+        res = await asyncio.gather(*tasks)
+    probe.cancel()
+    for p in procs.values(): p.kill()
+    ok = [r for r in res if r[0]]; lat = sorted(r[1] for r in ok)
+    print(f"{policy:7s} requests {len(res)}  failed {len(res)-len(ok):3d}  retried {sum(r[3]>1 for r in res):3d}  "
+          f"tokens wasted {sum(r[2] for r in res):5d}  p50 {lat[len(lat)//2]:.2f} s  p99 {lat[int(.99*len(lat))]:.2f} s")
+    await asyncio.sleep(1)
+
+async def main():
+    for policy in ["none", "restart", "resume"]:
+        await scenario(policy)
+asyncio.run(main())</pre>
+<details><summary>What we measured (CPU, about 45 s)</summary><pre class="out">none    requests 122  failed  12  retried   0  tokens wasted   583  p50 2.49 s  p99 3.27 s
+restart requests 122  failed   0  retried  12  tokens wasted   580  p50 3.20 s  p99 5.20 s
+resume  requests 122  failed   0  retried  12  tokens wasted     0  p50 2.74 s  p99 3.53 s</pre>
+<p>The 12 requests in flight on replica B when it died failed with no retries; their 583 already-streamed tokens were lost. The passive check removed B immediately, so no new requests failed. Restarting from scratch saved all 12 but wasted the same tokens and raised p99 to 5.2 s (those requests started over, on a replica now carrying all the load). Resuming saved all 12, wasted nothing, and kept p99 at 3.5 s. (The <code>none</code> latencies look best only because the 12 failures are excluded.) Try next: remove the passive check and count how many extra requests fail before the active probe notices; set <code>startup</code> to 30 s; double the rate so one replica cannot carry the load alone.</p></details>
+<h3>Part B: on real GPUs</h3>
+<p>Repeat Part A with two vLLM replicas of a small model behind a router (chapter 6.4) on one or two GPUs. Kill one with <code>kill -9</code> mid-stream, and measure recovery time (until the restarted replica passes readiness: its cold start, chapter 6.2). Then run a request near the context limit to provoke an out-of-memory error and observe how the engine reports it. Expect the restart to take tens of seconds to minutes, dominated by weight loading and CUDA graph capture.</p>
+<h3>Part C: runbooks and a seeded incident</h3>
+<p>Write runbooks for the three incidents you consider most likely for your deployment. Then have a partner seed one (for example: lower <code>gpu-memory-utilization</code> and kill a replica during a load test) without telling you, and run the incident with roles, a living document and a first-cause timeline.</p>
+<h3>Part D: a cache timing test</h3>
+<p>On your own vLLM server with prefix caching on: send a random 2,000-token prompt from "user A", then from "user B" send prompts that share the first 1,000 tokens or none, 20 times each, and compare TTFT. Repeat with a different <code>cache_salt</code> per user. Expect a clear TTFT gap without salts and none with them.</p>
+
+<h2 id="realworld">11. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Reliability and security in practice</span>
+  <ul>
+    <li><strong>Large clusters</strong> run node health checks every few minutes and drain nodes automatically.</li>
+    <li><strong>Inference gateways</strong> retry with budgets and backoff; some resume streams on another replica.</li>
+    <li><strong>API providers</strong> scope prompt caches to an organization or user after the timing audits.</li>
+    <li><strong>Regulated customers</strong> require zero retention of prompts, regional processing and compliant providers.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">12. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz69"></div>
+<script type="application/json" id="qz69">[
+{"q":"Meta's RSC-1 cluster averaged 6.5 failures per thousand node-days. Roughly what is the mean time to failure of a 512-node job?","o":["About 7 hours","About 7 days","About 7 minutes","About 70 days"],"a":0,"e":"512 × 6.5 / 1,000 ≈ 3.3 failures per day, one every ~7 hours (Meta observed about 10 hours at 4,000 GPUs)."},
+{"q":"What does an end-to-end probe catch that a readiness check misses?","o":["Process crashes","A replica that reports ready but is stuck or generating garbage","Network partitions only","Nothing"],"a":1,"e":"It generates real tokens."},
+{"q":"Which retry strategy wastes no generated tokens?","o":["Fail","Restart from scratch","Resume by recompute","None of them"],"a":2,"e":"It sends prompt + generated tokens and asks for the rest."},
+{"q":"Why are retry budgets important?","o":["They reduce cost","Without them, retries can overload the healthy replicas during a partial outage","They are required by HTTP","They speed up prefill"],"a":1,"e":"Retry storms turn partial failures into full outages."},
+{"q":"In incident command, who changes the system during an incident?","o":["Anyone","The communications lead","Only the operations lead and their team","The planning lead"],"a":2,"e":"One group makes changes, so actions do not collide."},
+{"q":"How does vLLM isolate prefix caches between tenants?","o":["It cannot","A per-request cache_salt mixed into the first block's hash","Separate GPUs","Disabling caching"],"a":1,"e":"Only requests with the same salt can share cached blocks."}
+]</script>
+
+<h2 id="summary">13. Summary</h2>
+<ul>
+  <li>Expect failures: about one per 50,000 GPU-hours in Llama 3 training; failure rates vary over time and scale with the number of nodes.</li>
+  <li>Layer health checks (liveness, readiness, node health, end-to-end probes, passive) and drain bad nodes automatically.</li>
+  <li>A replica's death loses its KV; resume by recompute is a good default, KV transfer if KV is already tiered; use retry budgets, backoff and idempotency.</li>
+  <li>Degrade gracefully, test recovery with chaos experiments, and run incidents with clear roles and first-cause timelines.</li>
+  <li>Isolate prompt caches per tenant, limit consumption, keep prompts out of logs, and protect weights and the supply chain.</li>
+</ul>
+
+<h2 id="refs">14. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2410.21680">Kokolis et al., Revisiting Reliability in Large-Scale Machine Learning Research Clusters</a></td><td>Failure rates and causes on Meta's research clusters, health checks, MTTF projections.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2407.21783">Grattafiori et al., The Llama 3 Herd of Models</a> (infrastructure reliability section), via Kiely 7.3.3 and Fregly's <em>AI Systems Performance Engineering</em></td><td>Interruption counts and root causes over 54 days on 16,000 GPUs.</td></tr>
+<tr><td><a href="https://docs.nvidia.com/deploy/xid-errors/index.html">NVIDIA Xid errors</a> and its Xid catalog</td><td>What each Xid code means and the recommended action.</td></tr>
+<tr><td><a href="https://sre.google/sre-book/managing-incidents/">Google SRE book: Managing incidents</a></td><td>Incident command roles, the living incident document and handoffs.</td></tr>
+<tr><td><a href="https://chaos-mesh.org/docs/">Chaos Mesh documentation</a></td><td>Kubernetes-native fault injection and experiment orchestration.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2502.07776">Gu et al., Auditing Prompt Caching in Language Model APIs</a></td><td>Timing side channels from prompt caching and an audit of 17 providers.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/design/prefix_caching.html">vLLM: Automatic prefix caching</a></td><td>Block hashing and per-request cache salts for isolation.</td></tr>
+<tr><td><a href="https://genai.owasp.org/llm-top-10/">OWASP Top 10 for LLM Applications (2025)</a></td><td>The main security risks for LLM applications.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 7.3.3 and 7.3.4</td><td>Building for hardware failure; security and compliance for inference.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The Llama 3 paper's root-cause table lists faulty GPUs as 148 interruptions and 30.1%; 148 is 35% of the 419 unexpected interruptions, so one of the two figures is inconsistent. This chapter quotes the counts.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Part A run on CPU with Python 3.13, FastAPI, uvicorn and httpx; Parts B to D are exercises with expected behaviour.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {$}=IE;
+function fr(){const R=+$('frR').value/1000,N=+$('frN').value,K=+$('frK').value,T=+$('frT').value;
+  const perRep=R*N;const fleet=perRep*K;const mttfRep=1/perRep;const mttfFleet=1/fleet;
+  const lost=fleet*T/60/24/K*100;
+  const fmt=d=>d>=2?d.toFixed(1)+' days':(d*24>=2?(d*24).toFixed(1)+' hours':(d*1440).toFixed(0)+' minutes');
+  $('frStats').innerHTML=[['Mean time between failures, one replica',fmt(mttfRep)],['Failures per day, whole fleet',fleet.toFixed(2)],['Mean time between failures, fleet',fmt(mttfFleet)],['Average capacity missing while replacing',lost.toFixed(2)+'%'],['Failures per year, fleet',IE.int(fleet*365)]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['frR','frN','frK','frT'].forEach(id=>$(id).addEventListener('input',fr));fr();
+})();
+</script>
+
+</body>
+</html>
