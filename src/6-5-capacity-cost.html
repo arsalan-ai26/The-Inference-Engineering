@@ -1,0 +1,212 @@
+<div class="kicker">Part 6 · Production inference infrastructure · Chapter 6.5</div>
+<h1>Capacity, deployment and cost</h1>
+<p class="lede">At scale, inference becomes a capacity business: getting enough of the right GPUs in the right places, keeping them running, changing models and engines without downtime, and knowing what each token costs. This chapter covers where GPUs come from and how they are bought, multi-region and multi-cloud serving, the reliability you should plan for, how to roll out a new model or engine safely, and how to build a cost model that compares dedicated deployments with per-token APIs honestly.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 5.5, 6.1, 6.3, 6.4</span>
+  <span class="chip">Compute: none required</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>A GPU costs $2.90 per hour and serves 8,500 output tokens per second at full use. What is the cost per million output tokens at 30% average utilization?</li>
+    <li>Why is blue-green deployment expensive for large inference fleets?</li>
+    <li>Roughly how often did GPUs fail during Llama 3's training, per GPU-hour?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>2.90 ÷ (8,500 × 3,600 × 0.3) × 10⁶ ≈ $0.32. At 90% it would be about $0.11: utilization matters as much as the GPU price.</li>
+    <li>It needs a full second fleet before cutover. With hundreds of GPUs that doubles cost during every deploy, if the capacity can be found at all.</li>
+    <li>About one interruption per 50,000 GPU-hours (419 unexpected interruptions over 54 days on about 16,000 GPUs). One 8-GPU node running for a year is about 70,000 GPU-hours.</li>
+  </ol></details>
+</div>
+
+<h2 id="procure">1. Where GPUs come from</h2>
+<div class="tbl"><table>
+<tr><th>Provider type</th><th>Examples</th><th>Trade-offs</th></tr>
+<tr><td>Hyperscalers</td><td>AWS, Google Cloud, Azure, Oracle</td><td>Integration with everything else, compliance, global regions; usually higher prices and quotas</td></tr>
+<tr><td>GPU clouds (neoclouds)</td><td>CoreWeave, Nebius, Lambda, RunPod and others</td><td>GPU-focused, often better prices and newer hardware; fewer surrounding services</td></tr>
+<tr><td>Marketplaces and resellers</td><td>Vast.ai, SF Compute and others</td><td>Cheapest, most variable reliability and terms</td></tr>
+<tr><td>Own hardware</td><td>On-premises or colocation</td><td>Lowest cost at high, steady utilization; capital, operations and lead times</td></tr>
+</table></div>
+<p>Capacity is bought three ways:</p>
+<ul>
+  <li><strong>Reserved:</strong> committed blocks for months or years at a discount. Cheapest per hour, but you pay whether you use them or not.</li>
+  <li><strong>On-demand:</strong> by the hour, up to a quota. Flexible and expensive; scarce for the newest GPUs.</li>
+  <li><strong>Spot (preemptible):</strong> discounted spare capacity that can be taken back at short notice. Good for batch jobs and extra replicas that can be lost.</li>
+</ul>
+<p>Large deployments blend them: reserved capacity for the baseline load, on-demand for predictable peaks, spot for batch and burst. Live prices for common GPUs are in the compute guide; check them before each decision.</p>
+
+<h2 id="multi">2. Multi-region and multi-cloud</h2>
+<p>A single cluster eventually runs out of GPUs, sits too far from some users, and fails as a unit. Serving from several regions and providers adds:</p>
+<ul>
+  <li><strong>Capacity:</strong> pool GPUs wherever they are available.</li>
+  <li><strong>Latency:</strong> run near users. Network round trips between continents are tens to hundreds of milliseconds, a real share of a TTFT budget.</li>
+  <li><strong>Redundancy:</strong> survive a region or provider outage.</li>
+  <li><strong>Compliance:</strong> keep data in its required country (data residency) and on certified providers.</li>
+</ul>
+<p>The common architecture separates a <strong>control plane</strong> (deployments, global scaling, placement) from <strong>workload planes</strong> (one per cluster, serving traffic and scaling locally). Workload planes must keep serving if the control plane is down. A <strong>global load balancer</strong> sends each request to the nearest healthy region with spare capacity, and spills over to farther regions under load.</p>
+<p>Two reliability postures: <strong>active-active</strong> (several regions serve at once; losing one shifts load to the others) and <strong>active-passive</strong> (a warm standby takes over on failure; cheaper but slower to switch and easy to let rot).</p>
+
+<h2 id="reliability">3. Plan for hardware failure</h2>
+<p>GPUs fail more often than most server hardware. The Llama 3 paper reports 419 unexpected interruptions during a 54-day training run on about 16,000 GPUs, mostly hardware (GPUs, HBM and related components), about one per 50,000 GPU-hours. A fleet of 1,000 inference GPUs at that rate sees roughly one failure every two days. Practices:</p>
+<ul>
+  <li>Health checks at the node level (driver errors, ECC errors, NVLink faults), not just the process level; cordon and drain unhealthy nodes.</li>
+  <li>Replicas spread across nodes and zones, so one failure removes one replica, not a service.</li>
+  <li>Retries for requests that fail mid-stream (with care: retrying a long generation doubles its cost), and multi-node replicas that restart as a group (chapter 6.9).</li>
+</ul>
+
+<h2 id="deploy">4. Changing models and engines safely</h2>
+<p>Model checkpoints, quantization recipes, engine versions and configurations change often, and each change can alter speed, cost or outputs. Test before shipping:</p>
+<ul>
+  <li><strong>Offline:</strong> quality evaluations (chapter 4.1) and benchmarks on representative traffic (chapter 6.1).</li>
+  <li><strong>Shadow traffic:</strong> copy a sample of live requests to the new version and compare latency, errors and outputs without serving its answers.</li>
+  <li><strong>Load test</strong> at expected peak before cutover.</li>
+</ul>
+<div class="tbl"><table>
+<tr><th>Strategy</th><th>How it works</th><th>Extra capacity</th><th>Rollback</th></tr>
+<tr><td>Blue-green</td><td>A full new fleet; switch all traffic at once</td><td>A complete second fleet</td><td>Instant (switch back)</td></tr>
+<tr><td>Rolling update</td><td>Replace replicas a few at a time</td><td>Small (one or a few replicas)</td><td>Slow (roll forward or back again)</td></tr>
+<tr><td>Canary</td><td>Send a small share of traffic to the new version, watch metrics, raise the share in steps</td><td>Small; the old fleet scales down as traffic moves</td><td>Fast (move traffic back)</td></tr>
+</table></div>
+<p>For large GPU fleets, canaries are the usual choice: blue-green doubles GPU needs during the overlap. Two cautions: make sure the canary has enough replicas warm before it receives traffic (an autoscaled new deployment starts at its minimum), and watch the right metrics (TTFT, TPOT, errors, output length, quality signals) per version during the ramp. Combine with graceful draining (chapter 6.2) so no stream is cut.</p>
+
+<h2 id="cost">5. Cost models</h2>
+<p>With a per-token API, cost is simple: tokens × price (with discounts for cached input and batch use). With dedicated GPUs, cost is GPU-hours × price, and the cost per token depends on throughput per GPU at your SLO and on how busy the GPUs are:</p>
+<div class="formula">$ per million output tokens = GPU $/hour ÷ (output tokens/s per GPU at the SLO × 3,600 × average utilization) × 10⁶</div>
+<p>Three levers move it by multiples: the GPU price, the throughput per GPU (hardware, quantization, batching, every optimization in Part 4), and utilization (traffic shape, autoscaling, headroom). Utilization is often the biggest and least visible: a fleet sized for peak traffic and idle at night may average 30%.</p>
+<div class="box ex">
+  <span class="lbl">Worked example: size and price a service</span>
+  <p>50 requests per second, 2,000 input and 300 output tokens, p95 TTFT under 1 s, on H100s. A load test shows one H100 replica meets the SLO up to 48 concurrent requests, with about 0.5 s TTFT and 30 ms TPOT. Time per request: 0.5 + 300 × 0.03 = 9.5 s; in flight: 50 × 9.5 = 475; at 80% headroom 38.4 per replica: 13 replicas. Cost: 13 × 24 × $2.90 = $905 per day for 1.3 billion output tokens: about $0.70 per million output tokens, or about $0.09 per million total (input plus output) tokens. Add the night-time trough and the autoscaler's behaviour (chapter 6.3) to refine it.</p>
+</div>
+<div class="widget" id="ctW">
+  <div class="wt">Interactive: per-token API vs dedicated GPUs</div>
+  <div class="ws">Monthly cost of the same traffic on a per-token API and on dedicated GPUs. Throughput per GPU must come from your own load test at your SLO; the default is an idealized estimate for an 8B model in FP8 on an H100. Dedicated cost includes headroom and an engineering cost you set.</div>
+  <div class="ctrls">
+    <label>Requests per second (average) <input type="number" id="ctR" value="5" step="0.5" min="0.1" style="width:70px"></label>
+    <label>Peak ÷ average <input type="number" id="ctPk" value="2.5" step="0.5" min="1" style="width:60px"></label>
+    <label>Input tokens <input type="number" id="ctI" value="2000" step="100" style="width:70px"></label>
+    <label>Output tokens <input type="number" id="ctO" value="300" step="50" style="width:70px"></label>
+    <label>API $/M input <input type="number" id="ctAi" value="0.20" step="0.05" style="width:60px"></label>
+    <label>API $/M output <input type="number" id="ctAo" value="0.60" step="0.05" style="width:60px"></label>
+    <label>GPU $/hour <input type="number" id="ctG" value="2.90" step="0.1" style="width:60px"></label>
+    <label>Output tok/s per GPU at SLO <input type="number" id="ctT" value="8500" step="500" style="width:80px"></label>
+    <label>Engineering $/month <input type="number" id="ctE" value="5000" step="1000" style="width:80px"></label>
+  </div>
+  <div class="stats" id="ctStats"></div>
+</div>
+<p>Run the widget at 0.5, 5 and 50 requests per second. Below some volume the API wins because you pay for idle GPUs and engineering; above it dedicated wins. Where the line falls depends on API prices, your throughput per GPU and your peak-to-average ratio. Compare total costs over at least a week of real traffic, not per-token prices reverse-engineered from GPU hours.</p>
+<h3>Total cost of ownership</h3>
+<p>Beyond GPU hours: engineering time to build and operate the stack, storage and network egress, observability, idle headroom, failed and retried requests, and the opportunity cost of slower model updates. Dedicated serving buys control (latency, privacy, custom models, predictable cost at scale); it is not automatically cheaper.</p>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Bin packing across heterogeneous fleets</span>
+  <p>With many models and GPU types, capacity planning becomes bin packing: which model runs on which GPU type, at what parallelism, in which region, so that every SLO holds at minimum cost. Platforms solve this continuously as traffic and availability change; small models on MIG slices (chapter 5.5) and spare capacity used for batch jobs raise overall utilization.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Batch and offline traffic as a utilization tool</span>
+  <p>Requests that can wait hours (evaluations, embedding a corpus, synthetic data) fill the troughs of interactive traffic. Async and batch APIs with low priority (chapters 6.2 and 6.4) turn idle GPU-hours into useful work, raising average utilization and lowering the effective cost of the interactive service.</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Computing cost per token at 100% utilization.</li>
+  <li>Comparing an API's list price with a dedicated deployment's GPU cost and ignoring engineering, headroom and idle time.</li>
+  <li>Blue-green rollouts on large fleets without the capacity to run both.</li>
+  <li>Canary releases watched only for error rates, not latency, output length and quality.</li>
+  <li>Assuming one region is enough for global users.</li>
+  <li>No plan for GPU failure because "inference is stateless".</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<p><strong>Goal:</strong> build a cost model across GPUs and utilization levels, and size a real service end to end.</p>
+<h3>Part A: the 100 Days notebooks</h3>
+<p>Run days 25 (multi-cloud capacity) and 26 (zero-downtime deployment and cost estimation) of <em>100 Days of Inference</em>. Check their network latency and quantization cost claims against the notes in References.</p>
+<h3>Part B: cost per million tokens, three GPUs × three utilizations</h3>
+<pre>gpus = {                    # $/GPU-hour, output tokens/s per GPU at your SLO (from YOUR load test)
+    "A100 80GB": (1.38, 5_000),
+    "H100 SXM":  (2.90, 8_500),
+    "B200":      (8.79, 20_000),
+}
+for util in [0.3, 0.6, 0.9]:
+    print(f"utilization {util:.0%}: " + "   ".join(
+        f"{name} ${price / (tps * 3600 * util) * 1e6:5.3f}" for name, (price, tps) in gpus.items()))</pre>
+<details><summary>What we computed, and why</summary><pre class="out">utilization 30%: A100 80GB $0.256   H100 SXM $0.316   B200 $0.407
+utilization 60%: A100 80GB $0.128   H100 SXM $0.158   B200 $0.203
+utilization 90%: A100 80GB $0.085   H100 SXM $0.105   B200 $0.136</pre>
+<p>With these placeholder throughputs (idealized estimates for an 8B FP8 model; replace them with your measurements), the cheapest GPU per token is the A100, but going from 30% to 90% utilization saves more than any GPU choice. Real throughput per GPU differs from these idealized numbers, and the larger GPUs win for larger models that do not fit, or fit poorly, on smaller ones.</p></details>
+<h3>Part C: size and price a service</h3>
+<p>Reproduce the worked example in section 5 in code, then change one input at a time: double the output length; require p95 TTFT under 300 ms (which lowers the concurrency per replica, say to 24); move to FP8 on H200s (assume 1.6 times the H100's throughput at the same SLO and $5.29 per hour). Which change costs most?</p>
+<details><summary>Starting point</summary>
+<pre>rate, isl, osl = 50, 2000, 300
+conc_per_replica, tpot, ttft = 48, 0.030, 0.5
+in_flight = rate * (ttft + osl * tpot)
+replicas = -(-in_flight // (conc_per_replica * 0.8))
+cost_day = replicas * 24 * 2.90
+print(in_flight, replicas, cost_day, cost_day / (rate * osl * 86400 / 1e6))</pre>
+<p>Measured: 475 in flight, 13 replicas, $905 per day, $0.70 per million output tokens.</p></details>
+<h3>Part D: a rollout plan</h3>
+<p>Write a canary plan for moving that service from a BF16 to an FP8 checkpoint: offline evals and their pass criteria, the shadow-traffic step, traffic shares and durations for each canary step, the metrics and thresholds that trigger rollback, and how many replicas the canary needs warm at each step.</p>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Capacity and cost in practice</span>
+  <ul>
+    <li><strong>Inference platforms</strong> run multi-cloud control planes that place replicas wherever GPUs are available, with global routing and failover.</li>
+    <li><strong>Large consumers</strong> reserve baseline capacity a year or more ahead and burst into on-demand and spot.</li>
+    <li><strong>Teams moving from APIs to dedicated serving</strong> usually start with one high-volume use case where cost or latency justifies it, and keep APIs for the long tail.</li>
+    <li><strong>Releases</strong> of new checkpoints and engine versions go through evals, shadow traffic and staged canaries.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz65"></div>
+<script type="application/json" id="qz65">[
+{"q":"Which purchase type suits batch jobs that can be interrupted?","o":["Reserved","Spot","On-demand only","None"],"a":1,"e":"Spot is cheap but can be reclaimed; restartable work tolerates that."},
+{"q":"Workload planes should:","o":["Stop serving if the control plane fails","Keep serving traffic independently of the control plane","Share one database with all regions","Run no autoscaling"],"a":1,"e":"The control plane orchestrates; the request path must not depend on it."},
+{"q":"Why do canary deployments suit large GPU fleets better than blue-green?","o":["They are faster","They need little extra capacity because traffic moves gradually","They avoid testing","They skip rollbacks"],"a":1,"e":"Blue-green needs a full duplicate fleet during the switch."},
+{"q":"Doubling average utilization changes cost per token by:","o":["Nothing","About half","About double","Only for B200"],"a":1,"e":"Cost per token is inversely proportional to utilization."},
+{"q":"Below a certain volume, per-token APIs usually win because:","o":["They are faster","Dedicated GPUs and engineering cost money even when idle","GPUs are free","APIs have no limits"],"a":1,"e":"Fixed costs dominate at low volume."},
+{"q":"How often should you expect a GPU interruption in a 1,000-GPU fleet, using the Llama 3 rate?","o":["Once a year","About every two days","Every minute","Never in inference"],"a":1,"e":"1,000 GPUs × 24 h ÷ 50,000 GPU-hours ≈ 0.5 per day."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>Buy a blend of reserved, on-demand and spot capacity from hyperscalers, GPU clouds and markets; check live prices.</li>
+  <li>Serve from several regions and providers for capacity, latency, redundancy and compliance, with a control plane separate from workload planes.</li>
+  <li>Expect GPU failures and design health checks, spreading and retries for them.</li>
+  <li>Ship changes through evals, shadow traffic and canaries, with warm canary capacity and graceful draining.</li>
+  <li>Cost per token = GPU price ÷ (throughput at SLO × utilization); utilization and throughput matter as much as price; compare total costs with APIs over real traffic.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 7.3 and 7.4</td><td>Multi-cloud capacity, procurement, geo-aware load balancing, reliability, security and compliance, testing, zero-downtime deployment and cost estimation.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2407.21783">Grattafiori et al., The Llama 3 Herd of Models</a></td><td>Measured interruption rates and root causes on a 16,000-GPU cluster.</td></tr>
+<tr><td><a href="https://sre.google/workbook/canarying-releases/">Google SRE workbook: Canarying releases</a></td><td>How to run canaries, choose metrics and decide on rollback.</td></tr>
+<tr><td>Compute guide (this book)</td><td>Current GPU prices and the cost-per-token calculator.</td></tr>
+<tr><td>Chip Huyen, <em>Designing Machine Learning Systems</em>, chapter 9 (test in production)</td><td>Shadow deployment, canaries and A/B testing for ML systems.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, days 25 and 26</td><td>Procurement cost models, geo routing, deployment simulators and a cost model.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The Kiely book and the day 25 README of <em>100 Days of Inference</em> estimate about 5 ms per time zone and 15 ms one way from New York to San Francisco. Light in fiber alone needs about 20 ms one way over that distance, and real network round trips between the US coasts are typically 60 to 80 ms. Measure from your users' regions.</li>
+  <li>The day 26 README says INT4 is roughly 4 times cheaper per token than FP16 because each token reads a quarter of the weight bytes. That holds only where decode is memory-bound and dominated by weights; at large batches and long contexts the KV cache and compute limit the gain (chapter 4.1).</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Lab computations run with Python 3.13; GPU prices from the compute guide (6 November 2026).</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$}=IE;
+function ct(){const R=+$('ctR').value,PK=+$('ctPk').value,I=+$('ctI').value,O=+$('ctO').value,Ai=+$('ctAi').value,Ao=+$('ctAo').value,G=+$('ctG').value,T=+$('ctT').value,E=+$('ctE').value;
+  const sec=30*86400;const api=(R*I*sec/1e6)*Ai+(R*O*sec/1e6)*Ao;
+  const peakTok=R*PK*O;const gpus=Math.max(1,Math.ceil(peakTok/(T*0.8)));const ded=gpus*G*24*30+E;
+  const util=R*O/(gpus*T);
+  const be=api>0?ded/api:0;
+  $('ctStats').innerHTML=[['API, per month','$'+IE.int(api)],['GPUs needed at peak (80% target)',gpus],['Dedicated, per month','$'+IE.int(ded)],['Average GPU utilization',Math.round(util*100)+'%'],['Cheaper',api<ded?'API ('+(ded/api).toFixed(1)+'× cheaper)':'Dedicated ('+(api/ded).toFixed(1)+'× cheaper)']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['ctR','ctPk','ctI','ctO','ctAi','ctAo','ctG','ctT','ctE'].forEach(id=>$(id).addEventListener('input',ct));ct();
+})();
+</script>

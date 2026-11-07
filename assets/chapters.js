@@ -277,7 +277,7 @@ window.IE_CHAPTERS = [
 "title": "Capacity, deployment and cost",
 "slug": "6-5-capacity-cost",
 "part": 6,
-"ready": false
+"ready": true
 },
 {
 "n": "6.6",
