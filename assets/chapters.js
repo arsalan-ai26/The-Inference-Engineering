@@ -389,7 +389,7 @@ window.IE_CHAPTERS = [
 "title": "Reproduce an inference systems paper",
 "slug": "8-4-reproduce-a-paper",
 "part": 8,
-"ready": false
+"ready": true
 },
 {
 "n": "8.5",

@@ -1,0 +1,182 @@
+<div class="kicker">Part 8 · Specialized workloads, engine internals and research · Chapter 8.4</div>
+<h1>Reproduce an inference systems paper</h1>
+<p class="lede">Systems papers make claims of the form "our technique gives X times more capacity under a latency constraint". Reproducing one teaches you more than reading ten: you must rebuild the baseline, recreate the workload, isolate the mechanism, and find where the technique stops working. This chapter gives a method for reading and reproducing a systems paper, then does it: it reproduces the core result of Sarathi-Serve (chunked prefills and stall-free scheduling) at small scale on the mini engine from chapter 8.3, with ablations and a regime where the technique does not help.</p>
+<div class="meta">
+  <span class="chip">Level: expert</span>
+  <span class="chip">Time: 1 to 2 weeks for your own reproduction</span>
+  <span class="chip">Needs: 3.2, 6.1, 8.3</span>
+  <span class="chip">Compute: Colab CPU for the worked example</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What is the difference between reproducing a paper's numbers and reproducing its claim?</li>
+    <li>Why is an ablation more convincing than an end-to-end comparison?</li>
+    <li>Sarathi-Serve reports 2.6 times higher serving capacity than vLLM for Mistral-7B on one A100. Does that still hold against today's vLLM?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>The numbers depend on the paper's hardware, software versions and workload; the claim is the mechanism and its direction (chunking prefills bounds decode stalls at a small cost to prefill latency). At small scale you reproduce the claim and check that its shape matches.</li>
+    <li>An end-to-end comparison changes many things at once. An ablation removes one component and shows how much of the effect it causes.</li>
+    <li>No, not against a modern baseline: vLLM adopted chunked prefill and now enables it by default (chapter 3.2). The comparison was against vLLM as it was then. Comparing against modern engines is part of a reproduction.</li>
+  </ol></details>
+</div>
+
+<h2 id="read">1. Read the paper in three passes</h2>
+<p>S. Keshav's "How to Read a Paper" gives a method that fits systems papers well:</p>
+<ol>
+  <li><strong>First pass (5 to 10 minutes):</strong> title, abstract, introduction, headings, conclusions, glance at the references. Answer the five Cs: <em>category</em> (measurement, analysis, new system), <em>context</em> (related papers), <em>correctness</em> (do the assumptions look valid?), <em>contributions</em>, and <em>clarity</em>.</li>
+  <li><strong>Second pass (up to an hour):</strong> read with care, but skip proofs; study the figures and graphs (axes, error bars, what is compared); note unread references.</li>
+  <li><strong>Third pass (four to five hours for beginners):</strong> virtually re-implement the paper: make the same assumptions as the authors and re-create the work, then compare with the paper. Here you find hidden assumptions and the weak points.</li>
+</ol>
+<p>For a systems paper, write down during the second pass: the workload (models, input and output lengths, arrival process), the hardware, the baseline and its version, the metric and its constraint (for example capacity at a P99 latency limit), and the single mechanism the claim rests on.</p>
+
+<h2 id="method">2. The reproduction method</h2>
+<div class="tbl"><table>
+<tr><th>Step</th><th>Question</th><th>Output</th></tr>
+<tr><td>1. Reconstruct the baseline</td><td>What exactly was compared, at which version and settings?</td><td>A baseline you can run, with its config</td></tr>
+<tr><td>2. Recreate the workload</td><td>Which lengths, rates and arrival pattern produce the effect?</td><td>A workload manifest (chapter 6.1)</td></tr>
+<tr><td>3. Reproduce the main result</td><td>Does the effect appear, in the same direction and shape?</td><td>The headline plot at your scale, labelled measured</td></tr>
+<tr><td>4. Profile</td><td>Is the mechanism the one the paper says?</td><td>Traces showing where time goes in both systems</td></tr>
+<tr><td>5. Ablate</td><td>How much of the effect does each component cause?</td><td>At least three ablations</td></tr>
+<tr><td>6. Find the limit</td><td>Where does the technique stop helping, or hurt?</td><td>One or more regimes with no gain</td></tr>
+<tr><td>7. Compare with modern engines</td><td>Is the gap still there with today's defaults?</td><td>The same workload on current vLLM or SGLang</td></tr>
+<tr><td>8. Publish</td><td>Can someone else rerun it?</td><td>Configs, scripts, raw data, a short write-up</td></tr>
+</table></div>
+<p>Candidate papers already covered in this book: vLLM and PagedAttention (chapter 3.3), Sarathi-Serve (3.2), SGLang and RadixAttention (3.5), DistServe (4.6) and Flash-Decoding (4.2). Pick one whose mechanism you can isolate at small scale.</p>
+
+<h2 id="sarathi">3. Worked example: Sarathi-Serve at small scale</h2>
+<h3>The claim</h3>
+<p>Sarathi-Serve observes that prefill iterations are long and saturate compute, while decode iterations are short and underuse it. When a new request's whole prefill runs in one iteration, every ongoing decode stalls for that iteration: a "generation stall" that shows up as a spike in time between tokens. Its fix: split prefills into near-equal chunks and build <strong>stall-free</strong> batches that add new requests without pausing ongoing decodes. Under tail latency constraints the paper reports 2.6 times higher serving capacity for Mistral-7B on one A100 and up to 3.7 times for Yi-34B on two A100s, compared with vLLM at the time.</p>
+<h3>Our setup</h3>
+<p>The mini engine already has the mechanism: a token budget per step, running requests served first, and chunked prefill. The experiment: 4 requests are decoding; at step 6 a 1,554-token prompt arrives. We measure the largest gap between consecutive tokens of the decoding requests (max ITL), the median gap, and the long prompt's TTFT, for token budgets from 4,096 (no chunking: the whole prompt in one step) down to 64. Qwen2.5-0.5B-Instruct in FP32 on 2 CPU cores, prefix caching off.</p>
+<div class="widget" id="srW">
+  <div class="wt">Measured: decode stalls and prefill latency against the token budget</div>
+  <div class="ws">Four decoding requests while a 1,554-token prompt arrives (mini engine, CPU). Smaller budgets cut the decode stall; below some point they cost prefill latency.</div>
+  <div class="ctrls"><label>Show <select id="srM"><option value="max">Max ITL of decoding requests</option><option value="med">Median ITL</option><option value="ttft">TTFT of the long prompt</option></select></label></div>
+  <div class="svgwrap"><svg id="srSvg" viewBox="0 0 680 220" width="680" style="max-width:100%;height:auto" role="img" aria-label="Measured latency against token budget"></svg></div>
+</div>
+<div class="tbl"><table>
+<tr><th>Token budget</th><th>Decoding requests</th><th>Max ITL</th><th>Median ITL</th><th>TTFT of the long prompt</th><th>Steps</th></tr>
+<tr><td>4,096 (no chunking)</td><td>4</td><td>10.95 s</td><td>0.22 s</td><td>10.95 s</td><td>24</td></tr>
+<tr><td>512</td><td>4</td><td>3.12 s</td><td>0.25 s</td><td>8.23 s</td><td>24</td></tr>
+<tr><td>256</td><td>4</td><td>1.62 s</td><td>0.24 s</td><td>8.73 s</td><td>24</td></tr>
+<tr><td>128</td><td>4</td><td>0.96 s</td><td>0.59 s</td><td>9.80 s</td><td>25</td></tr>
+<tr><td>64</td><td>4</td><td>0.66 s</td><td>0.46 s</td><td>12.34 s</td><td>35</td></tr>
+<tr><td>4,096</td><td>0</td><td>-</td><td>-</td><td>12.40 s</td><td>4</td></tr>
+<tr><td>128</td><td>0</td><td>-</td><td>-</td><td>8.57 s</td><td>16</td></tr>
+<tr><td>128</td><td>8</td><td>1.14 s</td><td>0.71 s</td><td>10.86 s</td><td>26</td></tr>
+<tr><td>4,096</td><td>8</td><td>10.61 s</td><td>0.26 s</td><td>10.61 s</td><td>24</td></tr>
+</table></div>
+<h3>What reproduced</h3>
+<ul>
+  <li><strong>The generation stall:</strong> without chunking, all four decoding requests waited 10.95 s for one token while the whole prompt ran; with 8 decoders, 10.61 s. That is the paper's stall, 50 times the normal gap.</li>
+  <li><strong>Chunking bounds it:</strong> the stall fell to 3.1 s at budget 512, 1.6 s at 256, 0.96 s at 128 and 0.66 s at 64, roughly in proportion to the chunk size.</li>
+</ul>
+<h3>Ablations</h3>
+<ol>
+  <li><strong>Chunk size</strong> (the rows above): the main knob, trading the stall against the median ITL, which rose from 0.22 s to about 0.5 to 0.6 s once every step carried a large chunk.</li>
+  <li><strong>No concurrent decodes</strong> (decoders = 0): chunking has no stall to remove; it only changes how the prefill is split.</li>
+  <li><strong>More concurrent decodes</strong> (8 instead of 4): the unchunked stall is the same size; with chunking at 128, the stall and the median ITL both rose a little because each step also carries more decode tokens.</li>
+</ol>
+<h3>Where it stops helping</h3>
+<ul>
+  <li><strong>Very small chunks hurt prefill:</strong> at budget 64 the long prompt's TTFT grew to 12.3 s (from 8.2 s at 512) and the run took 35 steps instead of 24, because each step pays fixed overhead (weight reads, Python work). The paper picks chunk sizes against a latency target for the same reason.</li>
+  <li><strong>No decodes, no benefit for ITL</strong> (ablation 2).</li>
+</ul>
+<h3>A surprise, and what it means</h3>
+<p>Without concurrent decodes, the chunked prefill (budget 128) finished in 8.6 s, faster than the unchunked one (12.4 s). On a GPU you would expect the opposite or no difference, since one big prefill uses the hardware well. On our CPU engine, the unchunked attention materializes a 14 × 1,554 × 1,554 score matrix per layer, which is slow to allocate and does not fit in cache, while chunks keep it small. This is an artefact of our attention implementation, not a property of chunked prefill: exactly the kind of result a reproduction must label and explain rather than report as a finding.</p>
+<h3>Against modern engines</h3>
+<p>vLLM has since adopted chunked prefill and enables it by default, with <code>max_num_batched_tokens</code> as the budget (chapter 3.2). So the paper's headline comparison no longer holds against current vLLM; the mechanism, however, is now standard, which is the strongest kind of confirmation. A full reproduction would rerun the workload on a GPU with vLLM at several budgets and with chunked prefill disabled, measuring capacity at a P99 TBT limit.</p>
+
+<h2 id="expert">4. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Measuring capacity under a constraint</span>
+  <p>Systems papers usually report capacity: the highest request rate at which a latency percentile stays under a limit. To reproduce it, sweep the arrival rate with an open-loop generator (chapter 6.1), compute the percentile at each rate, and find where it crosses the limit, with repeated runs for the spread. A single latency number at one load is not comparable to a capacity claim.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Small-scale validity</span>
+  <p>Mechanisms that depend on ratios (prefill time to decode time, KV transfer time to compute) transfer to small scale if you keep the ratios. Mechanisms that depend on absolute hardware limits (NVLink bandwidth, HBM capacity) may not. State which kind your reproduction is, and what would have to hold for the result to transfer.</p>
+</div>
+
+<h2 id="mistakes">5. Common mistakes</h2>
+<ul>
+  <li>Comparing against today's engine and calling the paper wrong, or against an old one and calling it right, without saying which.</li>
+  <li>Reproducing one number at one load instead of the curve.</li>
+  <li>Changing several things at once and calling it an ablation.</li>
+  <li>Reporting implementation artefacts (like our CPU attention) as properties of the technique.</li>
+  <li>Dropping the regime where the technique does not help.</li>
+</ul>
+
+<h2 id="lab">6. Lab</h2>
+<h3>Part A: rerun the worked example</h3>
+<pre># r84.py, next to mini_engine.py from chapter 8.3
+def run(budget, n_decoders=4, inject_at=6, out=24):
+    e = Engine(m, num_blocks=1024, token_budget=budget, prefix_caching=False)
+    reqs = [Request(i, short[i], out) for i in range(n_decoders)]
+    for r in reqs: e.add(r)
+    stamps = {r.rid: [] for r in reqs}; L = None; step = 0
+    if not n_decoders: inject_at = 0
+    while e.waiting or e.running or L is None:
+        if step == inject_at:
+            L = Request(99, long_prompt, 4); e.add(L); stamps[99] = []
+        for rid, tok_ in e.step(): stamps[rid].append(time.perf_counter())
+        step += 1
+    gaps = sorted(b - a for rid in stamps if rid != 99 for a, b in zip(stamps[rid], stamps[rid][1:]))
+    return dict(max_itl=gaps[-1] if gaps else 0, p50_itl=gaps[len(gaps) // 2] if gaps else 0,
+                ttft_long=L.t_first - L.t_arrive, steps=e.steps)
+for budget, nd in [(4096, 4), (512, 4), (256, 4), (128, 4), (64, 4), (4096, 0), (128, 0), (128, 8), (4096, 8)]:
+    print(budget, nd, run(budget, nd))</pre>
+<p>Predict first: by how much does the max ITL fall from budget 4,096 to 128? The table in section 3 is our measurement (about 4 minutes on 2 CPU cores). Then replace the attention loop with <code>scaled_dot_product_attention</code> and check whether the "surprise" disappears.</p>
+<h3>Part B: your own reproduction</h3>
+<p>Pick one paper from section 2. Do the three passes and write the five Cs. Then follow the eight steps: reproduce the main result at small scale, profile it, run at least three ablations, find one workload where the technique stops helping, compare with a current engine, and publish configs, raw data and a two-page write-up with every number labelled (chapter 8.5).</p>
+
+<h2 id="realworld">7. In the real world</h2>
+<div class="box real">
+  <span class="lbl">In practice</span>
+  <ul>
+    <li><strong>Engine teams</strong> reproduce promising papers at small scale before porting them, which is how chunked prefill, prefix caching and disaggregation reached vLLM and SGLang.</li>
+    <li><strong>Artifact evaluation</strong> at systems conferences checks that papers' code reproduces their claims.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">8. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz84"></div>
+<script type="application/json" id="qz84">[
+{"q":"In Keshav's method, the third pass aims to:","o":["Read the abstract","Virtually re-implement the paper","Check the references only","Skim figures"],"a":1,"e":"Re-create the work with the authors' assumptions."},
+{"q":"What is a generation stall?","o":["A slow tokenizer","Decodes paused while a whole prefill runs in one iteration","A KV eviction","A network timeout"],"a":1,"e":"Sarathi-Serve's chunked prefills remove it."},
+{"q":"In our reproduction, max ITL with 4 decoders fell from 10.95 s (no chunking) to:","o":["10 s","0.96 s at budget 128","0.01 s","It rose"],"a":1,"e":"And to 0.66 s at 64."},
+{"q":"Where did chunking stop helping?","o":["Never","With no concurrent decodes, and with very small chunks that raised TTFT","Only on GPUs","With 8 decoders"],"a":1,"e":"Budget 64 raised TTFT to 12.3 s."},
+{"q":"Why did unchunked prefill take longer than chunked on our CPU engine?","o":["Chunking is always faster","An artefact: the unchunked attention materializes a huge score matrix","The GPU was busy","Prefix caching"],"a":1,"e":"Label artefacts; do not report them as findings."},
+{"q":"Does Sarathi-Serve's 2.6× still hold against current vLLM?","o":["Yes, unchanged","No: vLLM now has chunked prefill on by default","It was never true","Only for MoE"],"a":1,"e":"The mechanism became standard."}
+]</script>
+
+<h2 id="summary">9. Summary</h2>
+<ul>
+  <li>Read in three passes; record workload, hardware, baseline, metric and mechanism.</li>
+  <li>Reproduce the claim's shape at small scale, profile it, ablate it, find its limits, compare with current engines, publish.</li>
+  <li>Sarathi-Serve's core claim reproduced on the mini engine: chunking cut the decode stall from 11 s to under 1 s, with a cost in median ITL and, for tiny chunks, in TTFT; it does nothing without concurrent decodes.</li>
+</ul>
+
+<h2 id="refs">10. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="http://ccr.sigcomm.org/online/files/p83-keshavA.pdf">S. Keshav, How to Read a Paper</a></td><td>The three-pass method and the five Cs.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2403.02310">Agrawal et al., Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve</a></td><td>Generation stalls, chunked prefills, stall-free scheduling and the capacity results.</td></tr>
+<tr><td>Chapters 3.2, 3.3, 3.5, 4.2 and 4.6</td><td>The other candidate papers and their mechanisms.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. The worked example was measured on 2 CPU cores with the chapter 8.3 engine, PyTorch 2.15 and Transformers 5.22.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$,el,css}=IE;
+const B=[4096,512,256,128,64];const D={max:[10.95,3.12,1.62,0.96,0.66],med:[0.22,0.25,0.24,0.59,0.46],ttft:[10.95,8.23,8.73,9.80,12.34]};
+const L={max:'max ITL (s)',med:'median ITL (s)',ttft:'TTFT of long prompt (s)'};
+function sr(){const k=$('srM').value,v=D[k],s=$('srSvg');s.innerHTML='';const x0=60,x1=640,y0=180,y1=14;const mx=Math.max(...v)*1.15;const X=i=>x0+i*(x1-x0)/(B.length-1),Y=t=>y0-t/mx*(y0-y1);
+  for(let t=0;t<=mx;t+=mx>6?2:(mx>2?0.5:0.1)){el('line',{x1:x0,x2:x1,y1:Y(t),y2:Y(t),stroke:css('--line')},s);el('text',{x:x0-6,y:Y(t)+4,'text-anchor':'end','font-size':10,fill:css('--ink2')},s,+t.toFixed(1));}
+  let d='';v.forEach((t,i)=>{d+=(i?'L':'M')+X(i)+','+Y(t);});el('path',{d,fill:'none',stroke:css(k==='ttft'?'--dec':'--pre'),'stroke-width':2.5},s);
+  v.forEach((t,i)=>{el('circle',{cx:X(i),cy:Y(t),r:5,fill:css(k==='ttft'?'--dec':'--pre')},s);el('text',{x:X(i)+(i?0:10),y:Y(t)-(i?10:-4),'text-anchor':i?'middle':'start','font-size':10.5,fill:css('--ink')},s,t.toFixed(2));el('text',{x:X(i),y:y0+16,'text-anchor':'middle','font-size':10.5,fill:css('--ink2')},s,i?B[i]:'4096 (none)');});
+  el('text',{x:(x0+x1)/2,y:y0+34,'text-anchor':'middle','font-size':10.5,fill:css('--ink2')},s,'token budget per step (chunk size) → '+L[k]);}
+$('srM').addEventListener('input',sr);IE.onTheme(sr);
+})();
+</script>
