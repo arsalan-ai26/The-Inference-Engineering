@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>7.2 Supervised fine-tuning and data</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="7.2">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 7 · Chapter 7.2</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 7 · Fine-tuning and post-training · Chapter 7.2</div>
+<h1>Supervised fine-tuning and data</h1>
+<p class="lede">Supervised fine-tuning is next-token training on example conversations, with one twist: the loss counts only the tokens the model should learn to write. Most SFT failures are not algorithm problems but data and formatting problems: the wrong chat template, the loss computed on the user's text, too few good examples or too many bad ones, a learning rate that wipes out what the model knew. This chapter covers the data format, chat templates, loss masking, packing, the few hyperparameters that matter, and how to avoid overfitting and forgetting.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 2 to 3 hours with the lab</span>
+  <span class="chip">Needs: 2.1, 7.1</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why mask the user's turns out of the loss?</li>
+    <li>You fine-tune with one chat template and serve with another. What happens?</li>
+    <li>Your SFT model scores better after 5 epochs on your task but worse on general instruction following. What happened, and what are two fixes?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>So the model learns to write assistant replies, not to imitate users. Gradient spent on predicting the user's text is wasted at best, and teaches the wrong behaviour at worst.</li>
+    <li>The model sees token patterns it was never trained on: it may not stop, may leak role markers into answers, or may lose the behaviour you trained. Train and serve with the same template, from the same tokenizer files (chapter 6.6).</li>
+    <li>Overfitting and catastrophic forgetting of general skills. Fixes: fewer epochs or a lower learning rate; mix general chat data into the training set; or use LoRA (chapter 7.3), which tends to forget less.</li>
+  </ol></details>
+</div>
+
+<h2 id="format">1. The data format</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Conversational dataset:</strong> each example is a list of messages with roles (<code>system</code>, <code>user</code>, <code>assistant</code>, sometimes <code>tool</code>).</p>
+  <p><strong>Prompt-completion dataset:</strong> each example is one prompt and one target completion.</p>
+  <p><strong>Chat template:</strong> the rule (a Jinja template stored with the tokenizer) that turns a list of messages into the exact token sequence the model was trained on, with its special tokens.</p>
+  <p><strong>Loss mask:</strong> a per-token flag that says whether a token's prediction counts in the loss. Masked tokens get the label <code>-100</code> in PyTorch and Hugging Face code.</p>
+  <p><strong>Packing:</strong> concatenating several short examples into one training sequence up to a maximum length, so batches contain no padding.</p>
+</div>
+<p>The model never sees roles; it sees tokens. Qwen-family models use ChatML-style markers: <code>&lt;|im_start|&gt;assistant</code>, the reply, then <code>&lt;|im_end|&gt;</code>. The end-of-turn token matters most: if the model never learns to produce it, generation does not stop. Reasoning models add <code>&lt;think&gt;...&lt;/think&gt;</code> blocks, and tool-using models add tool-call and tool-result formats (chapter 3.5). The Smol playbook recommends ChatML or Qwen's templates as a starting point when designing your own; when fine-tuning an existing instruct model, keep its template.</p>
+
+<h2 id="mask">2. Loss masking</h2>
+<p>SFT minimizes the average negative log probability of the target tokens. With assistant-only loss, the targets are the assistant tokens plus their end-of-turn token; system and user tokens are context only.</p>
+<div class="widget" id="lmW">
+  <div class="wt">Interactive: which tokens does the model learn from?</div>
+  <div class="ws">A two-turn conversation rendered with Qwen2.5's chat template and split into its real tokens. Highlighted tokens count in the loss.</div>
+  <div class="ctrls"><label>Loss on <select id="lmM"><option value="all">All tokens</option><option value="asst" selected>Assistant turns only</option><option value="last">Last assistant turn only</option></select></label></div>
+  <div id="lmT" style="line-height:2.1;font-family:var(--mono, monospace);font-size:.82rem"></div>
+  <div class="stats" id="lmStats"></div>
+</div>
+<p>In TRL, set <code>assistant_only_loss=True</code> for conversational data; the chat template must mark assistant spans with <code>{% generation %}</code> tags, which TRL adds automatically for known families such as Qwen3. For prompt-completion data, TRL trains on the completion only by default. How much it matters: Hugging Face found masking user turns gave a few points on most evaluations, with the biggest effect on instruction following (IFEval). "Last turn only" is useful when earlier assistant turns in your data came from a weaker model you do not want to imitate.</p>
+
+<h2 id="data">3. Data: quality, quantity and mixture</h2>
+<ul>
+  <li><strong>Quality first.</strong> LIMA showed strong alignment from 1,000 carefully chosen examples (chapter 7.1). A few hundred to a few thousand clean, consistent examples of your task usually beat a large noisy set.</li>
+  <li><strong>Match the deployment distribution:</strong> real input lengths, real edge cases, the same system prompt and tools you will serve with.</li>
+  <li><strong>Consistent targets.</strong> If two annotators format answers differently, the model learns an average of both.</li>
+  <li><strong>Mix in general data</strong> when training on a narrow task, to limit forgetting of general skills. Thinking Machines found that mixing chat data into domain training preserved instruction following only partly, and that on-policy distillation afterwards restored it (chapter 7.5).</li>
+  <li><strong>Synthetic data</strong> from a stronger model is common (it is distillation, chapter 7.5). Check its licence terms and filter it like any other data.</li>
+  <li><strong>Hold out an evaluation set</strong> before training, from the same distribution, and never train on it (chapter 7.6).</li>
+</ul>
+
+<h2 id="hparams">4. The hyperparameters that matter</h2>
+<div class="tbl"><table>
+<tr><th>Setting</th><th>Guidance from the sources</th></tr>
+<tr><td>Learning rate</td><td>The most important setting after the data. For full fine-tuning, typically an order of magnitude or more below the pretraining rate; Hugging Face used 1e-5 for SmolLM3 and suggests scanning 1e-6, 3e-6, 1e-5, 3e-5, 1e-4. LoRA's best rate is about 10 times the full fine-tuning rate (chapter 7.3).</td></tr>
+<tr><td>Epochs</td><td>Start with one. More epochs can add a few points on the task but often hurt other skills; Raschka found multiple epochs on a static dataset often made results worse.</td></tr>
+<tr><td>Batch size and packing</td><td>Packing raised SFT throughput 3 to 5 times in Hugging Face's runs, and lets each step contain many more tokens; for small datasets, fewer optimizer steps can hurt, so compare evaluations with and without it.</td></tr>
+<tr><td>Maximum sequence length</td><td>Cover your real inputs; truncated examples teach truncated answers.</td></tr>
+<tr><td>Optimizer</td><td>AdamW is the default; Raschka saw little difference between AdamW and SGD with a schedule for LoRA.</td></tr>
+</table></div>
+<div class="box ex">
+  <span class="lbl">Worked example: how much padding does packing remove?</span>
+  <p>10,000 examples with a median length of about 400 tokens and a long tail (the lab's distribution), in random batches of 8: 61% of all token positions are padding, so most compute is wasted. Sorting by length before batching cuts the waste to under 1%. Packing into 4,096-token rows fills the rows completely. Packing needs attention that does not cross example boundaries (position IDs reset and a block-diagonal mask, or a padding-free kernel), otherwise one example attends to another.</p>
+</div>
+
+<h2 id="forget">5. Overfitting and forgetting</h2>
+<p><strong>Overfitting:</strong> training loss keeps falling while held-out loss and quality stop improving. <strong>Catastrophic forgetting:</strong> skills not in the fine-tuning data degrade, such as general instruction following, safety behaviour or other languages. Watch for both with a held-out task set <em>and</em> a small general evaluation (chapter 7.6). Remedies, cheapest first: lower learning rate, fewer epochs, LoRA instead of full fine-tuning, mixing general data, and on-policy distillation from the original model to restore lost behaviour.</p>
+
+<h2 id="tools">6. Tools</h2>
+<ul>
+  <li><strong>TRL's SFTTrainer</strong> (Hugging Face): conversational and prompt-completion data, assistant-only loss, packing, PEFT integration.</li>
+  <li><strong>Unsloth:</strong> optimized kernels for LoRA and QLoRA fine-tuning on a single GPU, with free Colab notebooks; it claims about 2 times faster training with 70% less memory.</li>
+  <li><strong>LLaMA-Factory:</strong> a unified CLI and web UI for fine-tuning 100+ models with SFT, reward modelling, PPO, DPO, KTO and ORPO.</li>
+</ul>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Tokenization traps at the template boundary</span>
+  <p>Tokenizing the prompt and the answer separately and concatenating them can give different tokens from tokenizing the full text (a space or newline merges differently at the boundary). Build training examples by tokenizing the rendered conversation once and computing the mask from token positions, as the lab does, or use the template's assistant mask. A mismatch here means the model trains on token sequences it never sees at inference.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Per-token loss averaging</span>
+  <p>With packing or variable lengths, averaging the loss per sequence weights short answers more than long ones; averaging per token weights every token equally. Frameworks differ in their default, which changes what the model favours (short or long answers). Check which one your trainer uses when results differ between frameworks.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Training on user and system tokens by accident.</li>
+  <li>Dropping the end-of-turn token from the targets, so the model never stops.</li>
+  <li>Training with one chat template and serving with another.</li>
+  <li>Several epochs at a high learning rate on a few hundred examples.</li>
+  <li>No held-out task evaluation and no general evaluation.</li>
+  <li>Packing without resetting attention between examples.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<h3>Part A: render a conversation and build the mask</h3>
+<pre>from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+conv = [{"role": "system", "content": "You are a support agent for Acme Bank."},
+        {"role": "user", "content": "I lost my card. What should I do?"},
+        {"role": "assistant", "content": "Block it now in the app under Cards > Block. Then order a new one."},
+        {"role": "user", "content": "How long does a new card take?"},
+        {"role": "assistant", "content": "Usually 5 to 7 working days."}]
+text = tok.apply_chat_template(conv, tokenize=False)
+print(text)
+ids = tok(text, add_special_tokens=False)["input_ids"]
+start, end = tok.convert_tokens_to_ids("&lt;|im_start|&gt;"), tok.convert_tokens_to_ids("&lt;|im_end|&gt;")
+labels = [-100] * len(ids); i = 0
+while i < len(ids):
+    if ids[i] == start and tok.decode(ids[i+1:i+3]).startswith("assistant"):
+        j = i + 1
+        while tok.decode([ids[j]]) != "\n": j += 1          # skip the "assistant\n" header
+        k = j + 1
+        while ids[k] != end: k += 1
+        for p in range(j + 1, k + 1): labels[p] = ids[p]    # reply tokens + &lt;|im_end|&gt;
+        i = k
+    i += 1
+trained = [t for t, l in zip(ids, labels) if l != -100]
+print(f"tokens {len(ids)}, trained on {len(trained)} ({len(trained)/len(ids):.0%})")
+print(repr(tok.decode(trained)))</pre>
+<details><summary>What we measured</summary><pre class="out">tokens 79, trained on 28 (35%)
+trained text: 'Block it now in the app under Cards > Block. Then order a new one.&lt;|im_end|&gt;Usually 5 to 7 working days.&lt;|im_end|&gt;'</pre>
+<p>Only 35% of the tokens are targets. Check by eye that both replies and both end-of-turn tokens are included, and nothing from the system prompt or the user. Then compare with TRL: build an <code>SFTTrainer</code> with <code>assistant_only_loss=True</code> on the same conversation and confirm its mask selects the same 28 tokens.</p></details>
+<h3>Part B: padding and packing</h3>
+<pre>import numpy as np
+rng = np.random.default_rng(0)
+lens = rng.lognormal(np.log(400), 0.8, 10_000).astype(int).clip(20, 4096)
+waste = lambda order: 1 - lens.sum() / sum(order[i:i+8].max() * len(order[i:i+8]) for i in range(0, len(order), 8))
+print("median", int(np.median(lens)), "random batches", f"{waste(lens):.0%}", "sorted batches", f"{waste(np.sort(lens)):.1%}")
+rows = []                                    # first-fit decreasing packing into 4,096-token rows
+for l in sorted(lens, reverse=True):
+    for i, r in enumerate(rows):
+        if r + l <= 4096: rows[i] += l; break
+    else: rows.append(l)
+print(len(rows), "packed rows, fill", f"{lens.sum() / (len(rows) * 4096):.1%}")</pre>
+<details><summary>What we computed</summary><pre class="out">median 396 random batches 61% sorted batches 0.3%
+1342 packed rows, fill 100.0%</pre></details>
+<h3>Part C: audit a dataset</h3>
+<p>Take 50 examples from a dataset you plan to use. For each, check: template correct, target answer consistent in format, no truncation at your maximum length, no evaluation items leaked in, no personal data that should not be there. Count the problems per category; a problem rate above a few percent is worth fixing before any training.</p>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">SFT in practice</span>
+  <ul>
+    <li><strong>Model releases</strong> use large, curated SFT mixtures (instruction following, code, maths, multilingual, tool use, reasoning traces) with assistant-only loss.</li>
+    <li><strong>Product teams</strong> fine-tune on hundreds to tens of thousands of in-house examples, usually with LoRA, and mix in general data to protect broad skills.</li>
+    <li><strong>Data work dominates:</strong> most of the time goes into collecting, cleaning and evaluating examples, not training.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz72"></div>
+<script type="application/json" id="qz72">[
+{"q":"Which label value tells PyTorch's cross-entropy to ignore a token?","o":["0","-1","-100","None"],"a":2,"e":"-100 is the default ignore index."},
+{"q":"Which token must stay in the targets so the model learns to stop?","o":["The system prompt","The end-of-turn token","The user's question","The BOS token"],"a":1,"e":"Without it, generation runs on."},
+{"q":"In TRL, assistant-only loss on conversational data needs:","o":["A reward model","Generation tags in the chat template, added automatically for known families","Packing off","A DPO dataset"],"a":1,"e":"{% generation %} marks assistant spans."},
+{"q":"Packing raised SFT throughput in Hugging Face's runs by about:","o":["10%","3 to 5 times","100 times","Nothing"],"a":1,"e":"Padding is removed."},
+{"q":"A first sensible SFT run uses:","o":["10 epochs","One epoch and a learning-rate scan","The pretraining learning rate","No evaluation"],"a":1,"e":"Then increase epochs if evaluations improve."},
+{"q":"Catastrophic forgetting means:","o":["Loss goes to zero","Skills outside the fine-tuning data degrade","The tokenizer changes","Training crashes"],"a":1,"e":"Mix general data, lower the rate, or use LoRA."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Render conversations with the model's own chat template; train and serve with the same one.</li>
+  <li>Compute loss on assistant tokens and their end-of-turn token only.</li>
+  <li>A few thousand clean, consistent, representative examples beat a large noisy set; hold out an evaluation.</li>
+  <li>Tune the learning rate first; start with one epoch; pack sequences with attention reset between examples.</li>
+  <li>Watch for overfitting and forgetting with task and general evaluations.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://huggingface.co/docs/trl/sft_trainer">Hugging Face TRL: SFT Trainer</a></td><td>Dataset formats, assistant-only and completion-only loss, packing.</td></tr>
+<tr><td><a href="https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook">Hugging Face, The Smol Training Playbook</a></td><td>Chat template choice, masking user turns, packing throughput, learning rate scans and epochs for SmolLM3.</td></tr>
+<tr><td><a href="https://magazine.sebastianraschka.com/p/practical-tips-for-finetuning-llms">Sebastian Raschka, Practical Tips for Finetuning LLMs Using LoRA</a></td><td>Consistency across runs, optimizer choice, multi-epoch overfitting.</td></tr>
+<tr><td><a href="https://github.com/hiyouga/LLaMA-Factory">LLaMA-Factory</a></td><td>A unified fine-tuning framework for 100+ models with a web UI.</td></tr>
+<tr><td><a href="https://docs.unsloth.ai/">Unsloth documentation</a></td><td>Efficient single-GPU fine-tuning and Colab notebooks.</td></tr>
+<tr><td><a href="https://thinkingmachines.ai/blog/on-policy-distillation/">Thinking Machines, On-Policy Distillation</a></td><td>Forgetting when training on domain documents, and how mixing and distillation recover it.</td></tr>
+</table></div>
+<h3>Sources considered and not used</h3>
+<ul><li>The Unsloth GPT-OSS 500K-context notebook and the TRL Ministral3-VL SFT notebook are runnable examples rather than new concepts; use them as practice templates once Part A works.</li></ul>
+<p class="note">Facts checked on 7 November 2026. Lab run on CPU with Transformers 5.22 and NumPy 2.5.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {$}=IE;
+const T=["<|im_start|>","system","\n","You"," are"," a"," support"," agent"," for"," Ac","me"," Bank",".","<|im_end|>","\n","<|im_start|>","user","\n","I"," lost"," my"," card","."," What"," should"," I"," do","?","<|im_end|>","\n","<|im_start|>","assistant","\n","Block"," it"," now"," in"," the"," app"," under"," Cards"," >"," Block","."," Then"," order"," a"," new"," one",".","<|im_end|>","\n","<|im_start|>","user","\n","How"," long"," does"," a"," new"," card"," take","?","<|im_end|>","\n","<|im_start|>","assistant","\n","Usually"," ","5"," to"," ","7"," working"," days",".","<|im_end|>","\n"];
+const A1=[33,50],A2=[68,77];
+const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'\\n').replace(/ /g,'·');
+function lm(){const m=$('lmM').value;let n=0;
+  $('lmT').innerHTML=T.map((t,i)=>{const inA=(i>=A1[0]&&i<=A1[1])||(i>=A2[0]&&i<=A2[1]);const on=m==='all'||(m==='asst'&&inA)||(m==='last'&&i>=A2[0]&&i<=A2[1]);if(on)n++;
+    return `<span style="display:inline-block;padding:0 3px;margin:1px;border-radius:3px;border:1px solid var(--line);background:${on?'var(--good-s)':'var(--panel2)'};color:${on?'var(--ink)':'var(--ink2)'}">${esc(t)}</span>`+(t==='\n'?'<br>':'');}).join('');
+  $('lmStats').innerHTML=[['Tokens in the example',T.length],['Tokens in the loss',n],['Share trained',Math.round(n/T.length*100)+'%']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+$('lmM').addEventListener('input',lm);lm();
+})();
+</script>
+
+</body>
+</html>

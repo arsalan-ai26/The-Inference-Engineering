@@ -326,7 +326,7 @@ window.IE_CHAPTERS = [
 "title": "Supervised fine-tuning and data",
 "slug": "7-2-sft-data",
 "part": 7,
-"ready": false
+"ready": true
 },
 {
 "n": "7.3",
