@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>5.8 Expert depth: writing high-performance kernels and kernel compilers</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="5.8">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 5 · Chapter 5.8</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 5 · GPUs, hardware and kernels · Chapter 5.8</div>
+<h1>Expert depth: writing high-performance kernels and kernel compilers</h1>
+<p class="lede">Most inference engineers select kernels; some write them. This chapter is for when you need to: a new GPU generation, a new number format, a new attention variant or MoE layout that no library supports yet. It explains how a fast matrix multiply is built, layer by layer, from a naive kernel at 1% of peak to one within a few percent of cuBLAS; the patterns specific to inference kernels; the tools and languages used to write them today; how kernel compilers such as Triton turn short programs into GPU code; and how to test and benchmark kernels so you can trust the result.</p>
+<div class="meta">
+  <span class="chip">Level: expert</span>
+  <span class="chip">Time: 5 hours or more with the lab</span>
+  <span class="chip">Needs: 5.2, 5.3, 5.4, 5.6</span>
+  <span class="chip">Compute: Colab CPU (Triton interpreter), then T4</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why does computing a larger output tile per block make a GEMM faster?</li>
+    <li>What problem does split-K solve?</li>
+    <li>Why is a decode-time GEMM (a few rows times a large weight matrix) hard to make fast?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>A BM × BN tile loads BM + BN rows and columns per K step but does BM × BN multiply-adds with them: arithmetic intensity grows with tile size, so the tensor cores wait less for memory.</li>
+    <li>When M and N are small, there are too few output tiles to fill all SMs. Split-K also divides the K dimension among blocks, which compute partial sums that are then added.</li>
+    <li>It is memory-bound: the whole weight matrix must be read for very little math. Speed comes from reading weights at full bandwidth with enough blocks in flight (and from quantized weights), not from tensor-core tricks.</li>
+  </ol></details>
+</div>
+
+<h2 id="when">1. When to write a kernel</h2>
+<p>Writing and maintaining kernels is expensive: they are tied to GPU generations, shapes and formats (chapter 5.4). Good reasons to do it:</p>
+<ul>
+  <li>A new operation with no fast implementation: a new attention variant, a quantization format, a routing scheme for MoE.</li>
+  <li>A fusion that compilers cannot find and that matters at your scale (for example dequantize + GEMM, or all-reduce + norm).</li>
+  <li>A new GPU generation whose features libraries do not yet use.</li>
+  <li>A profile (chapter 5.6) showing one kernel far from its roofline on your real shapes.</li>
+</ul>
+<p>Before writing one, check the engine's existing kernels, recent releases of FlashInfer, CUTLASS, DeepGEMM and similar libraries, and whether <code>torch.compile</code> already fuses the pattern.</p>
+
+<h2 id="gemm">2. Anatomy of a fast GEMM</h2>
+<p>A matrix multiply C = A × B of shape [M, K] × [K, N] does 2MNK FLOPs. At large sizes it is compute-bound in principle; the whole art is to keep the math units fed. Simon Boehm's worklog makes the steps concrete for an FP32 GEMM of size 4,092 on an A6000 (about 30 TFLOP/s FP32 peak):</p>
+<div class="tbl"><table>
+<tr><th>Step</th><th>Idea</th><th class="n">Reported speed</th></tr>
+<tr><td>1. Naive</td><td>One thread per output element; reads rows and columns straight from global memory</td><td class="n">about 0.3 TFLOP/s</td></tr>
+<tr><td>2. Coalesced loads</td><td>Arrange threads so a warp reads consecutive addresses (chapter 5.2)</td><td class="n">about 2.0</td></tr>
+<tr><td>3. Shared-memory tiling</td><td>Each block loads tiles of A and B into shared memory and reuses them</td><td class="n">about 2.2</td></tr>
+<tr><td>4. 1D block tiling</td><td>Each thread computes several outputs, reusing values held in registers</td><td class="n">about 8.6</td></tr>
+<tr><td>5. 2D block tiling</td><td>Each thread computes an 8 × 8 patch: much higher arithmetic intensity per load</td><td class="n">about 16</td></tr>
+<tr><td>6. Vectorized loads</td><td>Wide (128-bit) loads; transpose A in shared memory</td><td class="n">about 19</td></tr>
+<tr><td>9. Autotuning</td><td>Search tile sizes per GPU</td><td class="n">about 20</td></tr>
+<tr><td>10. Warp tiling</td><td>An extra tiling level per warp for register and scheduling locality</td><td class="n">within a few % of cuBLAS at sizes 2,048 and 4,096</td></tr>
+</table></div>
+<p>The lesson behind the numbers: each step raises reuse at one level of the memory hierarchy (global memory, shared memory, registers), which raises arithmetic intensity at that level (chapter 2.5). A production tensor-core GEMM on Hopper or Blackwell adds:</p>
+<ul>
+  <li><strong>Tensor-core MMA instructions</strong> (mma on Ampere, wgmma on Hopper, tcgen05 with tensor memory on Blackwell) instead of FMA on CUDA cores.</li>
+  <li><strong>Asynchronous copies and pipelining:</strong> TMA (or cp.async) copies the next K tiles into shared memory while tensor cores work on the current ones, using several buffers ("stages").</li>
+  <li><strong>Warp specialization:</strong> producer warps load, consumer warpgroups compute.</li>
+  <li><strong>Swizzled layouts</strong> in shared memory to avoid bank conflicts, and <strong>tile rasterization</strong> (the order in which output tiles are visited) to improve L2 reuse.</li>
+  <li><strong>Persistent kernels with tile schedulers</strong> (including Stream-K) to balance work across SMs and avoid wave quantization (chapter 5.1).</li>
+  <li><strong>Epilogues</strong> that apply bias, activation, scaling or quantization before writing the output (chapter 5.4).</li>
+</ul>
+<p>cuBLAS itself is not one kernel but hundreds: it picks among many implementations by shape, and adds split-K plus a reduction kernel when the output is too small to fill the GPU.</p>
+<div class="widget" id="tiW">
+  <div class="wt">Interactive: tile size and arithmetic intensity</div>
+  <div class="ws">For one block computing a BM × BN output tile, each K step loads BM × BK values of A and BK × BN of B and does 2 × BM × BN × BK FLOPs. The intensity with respect to global memory (ignoring cache reuse between blocks) must exceed the GPU's ops:byte ratio for the tile to be compute-bound.</div>
+  <div class="ctrls">
+    <label>BM <select id="tiM"><option>16</option><option>32</option><option selected>64</option><option>128</option><option>256</option></select></label>
+    <label>BN <select id="tiN"><option>16</option><option>32</option><option selected>64</option><option>128</option><option>256</option></select></label>
+    <label>Bytes per value <select id="tiB"><option value="2" selected>2 (BF16)</option><option value="1">1 (FP8)</option><option value="4">4 (FP32)</option></select></label>
+    <label>GPU <select id="tiG"><option value="295">H100 BF16 (295 FLOPs/byte)</option><option value="590">H100 FP8 (590)</option><option value="200">T4 FP16 (about 200)</option></select></label>
+  </div>
+  <div class="stats" id="tiStats"></div>
+</div>
+
+<h2 id="inference">3. Kernel patterns specific to inference</h2>
+<div class="tbl"><table>
+<tr><th>Pattern</th><th>Challenge</th><th>Typical techniques</th><th>Examples</th></tr>
+<tr><td>Skinny GEMM (decode, small M)</td><td>Memory-bound; too few output tiles</td><td>Split-K, small M tiles, many blocks in flight, full-bandwidth weight reads</td><td>cuBLAS heuristics, custom GEMV kernels</td></tr>
+<tr><td>Mixed-precision GEMM (4-bit or 8-bit weights, 16-bit activations)</td><td>Dequantizing without slowing the read</td><td>Weights pre-arranged for fast unpacking; dequantize in registers; pipelined loads</td><td>Marlin, Machete, AWQ kernels (chapter 4.1)</td></tr>
+<tr><td>Grouped GEMM for MoE</td><td>Many small GEMMs of different sizes, one per expert</td><td>One launch over all experts with per-group problem sizes; token sorting by expert</td><td>Fused MoE kernels in vLLM and SGLang, DeepGEMM grouped GEMMs</td></tr>
+<tr><td>Paged decode attention</td><td>Ragged lengths, KV in pages, one query per sequence</td><td>Split along KV (chapter 4.2), page-table indirection, load balancing</td><td>FlashInfer, FlashAttention paged variants</td></tr>
+<tr><td>Fused norm, rotary, quantize</td><td>Many small memory-bound ops</td><td>Fusion with the neighbouring GEMM epilogue or with each other</td><td>Engine custom kernels, compiler passes (chapter 5.7)</td></tr>
+<tr><td>Communication + compute</td><td>All-reduce or all-to-all on the critical path</td><td>Overlap, fused all-reduce + norm, GPU-initiated communication</td><td>Custom all-reduce, DeepEP</td></tr>
+<tr><td>Megakernels</td><td>Hundreds of launches per decode step</td><td>One persistent kernel running a whole forward pass with an on-GPU scheduler</td><td>Research systems for low-latency decode</td></tr>
+</table></div>
+
+<h2 id="tools">4. Languages and libraries</h2>
+<ul>
+  <li><strong>CUDA C++</strong>, with inline PTX for the newest instructions: full control, most effort. Read the SASS (the GPU's machine code) with <code>cuobjdump</code> when performance surprises you.</li>
+  <li><strong>CUTLASS 3 and CuTe:</strong> NVIDIA's C++ template library for GEMMs and convolutions, built on CuTe's layout algebra, which describes how tensors map to threads, warps and memory. FlashAttention-3 uses it.</li>
+  <li><strong>CuTe-DSL:</strong> the same concepts from Python, with much faster compile times; FlashAttention-4 is written in it.</li>
+  <li><strong>Triton:</strong> block-level programming in Python with an MLIR-based compiler; the default for portable kernels and the target of <code>torch.compile</code> (chapter 5.4).</li>
+  <li><strong>Tile-based DSLs from research groups</strong>, such as ThunderKittens (tiles of registers and shared memory as first-class objects) and TileLang, aim for near-hand-written performance with much less code.</li>
+  <li><strong>Other ecosystems:</strong> HIP and Composable Kernel on AMD (Triton also targets AMD), Pallas for TPUs and GPUs in JAX.</li>
+</ul>
+
+<h2 id="compilers">5. How a kernel compiler works: Triton as an example</h2>
+<p>A Triton kernel is a short Python function. Getting from it to fast GPU code takes several stages:</p>
+<ol>
+  <li><strong>Front end:</strong> the decorated Python function is parsed into Triton IR (an MLIR dialect) with block-level operations: loads, stores, dot, reductions.</li>
+  <li><strong>Specialization:</strong> <code>tl.constexpr</code> values (block sizes, flags) and argument properties (for example pointer alignment) are baked in; each combination is a separate compiled kernel, cached on disk.</li>
+  <li><strong>GPU lowering:</strong> TritonGPU IR assigns layouts: which thread and warp holds which part of each block, how data is staged through shared memory, where to insert asynchronous copies and software pipelining (the <code>num_stages</code> parameter), and how <code>tl.dot</code> maps to the target's MMA instructions.</li>
+  <li><strong>Back end:</strong> LLVM IR, then PTX, then the GPU binary (cubin) via NVIDIA's assembler; on AMD, the AMDGPU backend.</li>
+  <li><strong>Autotuning</strong> (<code>@triton.autotune</code>): run several configurations (block sizes, <code>num_warps</code>, <code>num_stages</code>) on the real shapes and keep the fastest.</li>
+</ol>
+<p>Graph compilers sit one level up: TorchInductor decides <em>what</em> to fuse in a whole model and emits Triton for each fused group (chapter 5.7). AI-assisted kernel writing (benchmarks such as KernelBench evaluate models on producing correct, fast kernels) is an active area; generated kernels need the same testing discipline as hand-written ones.</p>
+
+<h2 id="testing">6. Testing and benchmarking kernels</h2>
+<ul>
+  <li><strong>Correctness first:</strong> compare against a high-precision reference (FP32 or FP64 PyTorch) on many shapes, including odd sizes that exercise masks, with tolerances appropriate to the precision. Test edge cases: zero-length inputs, maximum sizes, unusual strides.</li>
+  <li><strong>Benchmark carefully:</strong> warm up; time many runs with CUDA events or <code>triton.testing.do_bench</code>; flush the L2 cache between runs when measuring memory-bound kernels, or the second run reads from cache; report achieved bandwidth or FLOP/s against the roofline, not just milliseconds.</li>
+  <li><strong>Use real shapes:</strong> the shapes of your models at your batch sizes, for both prefill and decode. A kernel that wins at 4,096 × 4,096 may lose at 8 × 4,096.</li>
+  <li><strong>Check numerics end to end:</strong> run a model-level evaluation (perplexity or task accuracy, chapter 4.1) with the new kernel, not only unit tests.</li>
+</ul>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Layouts are the heart of modern kernels</span>
+  <p>Most of the difficulty in Hopper and Blackwell kernels is not math but layout: how a tile is arranged in global memory, how TMA copies it into a swizzled shared-memory layout, how MMA instructions expect operands, and where accumulators live (registers or tensor memory). CuTe's layout algebra (shape, stride and composition) exists to make these mappings composable and checkable.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Low-precision GEMMs need careful accumulation</span>
+  <p>FP8 and FP4 GEMMs apply block scales and must accumulate in higher precision. DeepSeek promoted partial sums to FP32 every 128 elements on H800 (chapter 4.1); Blackwell applies microscaling scales in hardware. Kernel authors decide where scales are applied (per tile, in the epilogue) and how to keep accuracy without losing speed.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">From kernels to megakernels</span>
+  <p>As individual kernels approach their rooflines, the remaining time in small-batch decode is between kernels: launches, synchronizations and pipeline bubbles at kernel boundaries. Megakernels fuse an entire forward pass into one persistent kernel that schedules its own work on the GPU, overlapping the end of one layer with the start of the next. They are hard to write and maintain, but research systems have shown sizable latency reductions for small-batch decode.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Benchmarking a memory-bound kernel without flushing L2, so data comes from cache.</li>
+  <li>Testing only power-of-two sizes and missing mask bugs.</li>
+  <li>Comparing against an eager PyTorch baseline instead of the best existing kernel.</li>
+  <li>Tuning tile sizes on one GPU and shipping them to another.</li>
+  <li>Accumulating in low precision to save registers.</li>
+  <li>Writing a kernel for a pattern the compiler or engine already fuses.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p><strong>Goal:</strong> build a tiled matrix multiply in Triton, reason about its intensity, and benchmark it honestly.</p>
+<h3>Part A: a tiled matmul (CPU interpreter, then T4)</h3>
+<pre>import torch, triton, triton.language as tl
+dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+@triton.jit
+def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn,
+                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    pid_m, pid_n = tl.program_id(0), tl.program_id(1)        # which output tile
+    rm = pid_m * BM + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)               # accumulator stays on chip
+    for k0 in range(0, K, BK):                               # march along K
+        # TODO: load the [BM, BK] tile of A and the [BK, BN] tile of B with masks
+        #       (other=0.0 so padding adds nothing), then acc += tl.dot(a, b)
+        pass
+    tl.store(c_ptr + rm[:, None] * scm + rn[None, :] * scn, acc.to(c_ptr.dtype.element_ty),
+             mask=(rm[:, None] &lt; M) &amp; (rn[None, :] &lt; N))
+
+def matmul(a, b, BM=64, BN=64, BK=32):
+    M, K = a.shape; _, N = b.shape
+    c = torch.empty(M, N, device=a.device, dtype=a.dtype)
+    grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
+    matmul_kernel[grid](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+                        c.stride(0), c.stride(1), BM=BM, BN=BN, BK=BK)
+    return c
+
+a, b = torch.randn(150, 200, device=dev), torch.randn(200, 130, device=dev)   # odd sizes on purpose
+print("max error", (matmul(a, b) - a @ b).abs().max().item())</pre>
+<details><summary>Solution</summary>
+<pre>        a = tl.load(a_ptr + rm[:, None] * sam + (k0 + rk)[None, :] * sak,
+                    mask=(rm[:, None] &lt; M) &amp; ((k0 + rk)[None, :] &lt; K), other=0.0)
+        b = tl.load(b_ptr + (k0 + rk)[:, None] * sbk + rn[None, :] * sbn,
+                    mask=((k0 + rk)[:, None] &lt; K) &amp; (rn[None, :] &lt; N), other=0.0)
+        acc += tl.dot(a, b)</pre>
+<p>Measured in the interpreter (FP32 on CPU): maximum error about 3 × 10⁻⁵. On a T4, use FP16 inputs (the T4 has no TF32), sizes from 512 to 4,096, and <code>triton.testing.do_bench</code>. Compare with <code>torch.matmul</code> (cuBLAS). Then try BM = BN = 128, BK = 32, and add <code>num_warps=8, num_stages=3</code> to the launch. Report TFLOP/s against the T4's 65 TFLOP/s FP16 peak.</p></details>
+<h3>Part B: intensity by hand</h3>
+<p>For BM = BN = 128, BK = 32 in BF16, compute the bytes loaded and FLOPs per K step, and the intensity. Is this tile compute-bound on an H100 in BF16? In FP8? What about BM = 16 (a decode-like M)?</p>
+<details><summary>Answer</summary><p>Loads: (128 × 32 + 32 × 128) × 2 bytes = 16,384 bytes. FLOPs: 2 × 128 × 128 × 32 = 1,048,576. Intensity 64 FLOPs per byte with respect to global memory, below the H100's 295 for BF16: the kernel relies on L2 reuse between neighbouring tiles (good rasterization) and on larger tiles (for example 128 × 256) to approach peak. With FP8 values the bytes halve (128 FLOPs per byte) but the target ratio doubles (590). With BM = 16 the intensity is about 14: hopelessly memory-bound, which is why decode GEMMs are optimized for bandwidth instead.</p></details>
+<h3>Part C: benchmark a memory-bound kernel honestly (T4)</h3>
+<p>Benchmark the fused softmax from chapter 5.4 with <code>triton.testing.do_bench</code> on a 4 × 4,096 input (32 KB, fits in L2) and a 4,096 × 4,096 input (64 MB), and compute GB/s. Then repeat the small case with an L2 flush between runs (for example, write to a 32 MB buffer before each call, or use the flush option of your benchmark helper). Which result reflects real decode conditions, and why?</p>
+<h3>Part D: read a production kernel</h3>
+<p>Pick one: a FlashAttention forward kernel, a CUTLASS example GEMM for your GPU generation, or a fused MoE Triton kernel in vLLM or SGLang. Identify its tile sizes, how it pipelines loads, where the accumulator lives, what the epilogue does, and how it handles shapes that are not multiples of the tile. Write a one-page summary with a diagram.</p>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Who writes kernels</span>
+  <ul>
+    <li><strong>Hardware vendors</strong> (cuBLAS, cuDNN, CUTLASS, TensorRT-LLM kernels; AMD's AITER and Composable Kernel).</li>
+    <li><strong>Model labs</strong> release kernels with their models (DeepSeek's FlashMLA, DeepGEMM and DeepEP).</li>
+    <li><strong>Engine teams</strong> write Triton and CUDA kernels for new models, formats and fusions.</li>
+    <li><strong>Research groups</strong> build attention kernels (FlashAttention, FlashInfer) and new DSLs (ThunderKittens, TileLang).</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz58"></div>
+<script type="application/json" id="qz58">[
+{"q":"In Simon Boehm's GEMM worklog, which step gave the biggest single jump after coalescing?","o":["Autotuning","Computing multiple outputs per thread (block tiling)","Vectorized loads","Using shared memory alone"],"a":1,"e":"1D and then 2D block tiling raised reuse in registers: 2.2 to 8.6 to 16 TFLOP/s."},
+{"q":"Why do production GEMMs use several shared-memory buffers (stages)?","o":["To store more weights","To load the next K tiles while tensor cores compute on the current ones","For FP8","To avoid masks"],"a":1,"e":"Pipelining overlaps memory and compute."},
+{"q":"cuBLAS picks among hundreds of kernels mainly by:","o":["Random choice","Problem shape (and GPU)","Model name","Time of day"],"a":1,"e":"Different shapes need different tilings and split-K."},
+{"q":"A grouped GEMM is used for:","o":["Attention","Running many experts' GEMMs of different sizes in one launch","Embedding lookup","Sampling"],"a":1,"e":"MoE layers route different numbers of tokens to each expert."},
+{"q":"When benchmarking a small memory-bound kernel, why flush L2?","o":["To save power","Otherwise inputs may be served from cache and the bandwidth looks unrealistically high","Triton requires it","To reset clocks"],"a":1,"e":"Real decode reads weights from HBM, not L2."},
+{"q":"Which stage of the Triton compiler decides which threads hold which parts of a block?","o":["The Python front end","TritonGPU IR (layouts and pipelining)","PTX assembly","Autotuning"],"a":1,"e":"Layout assignment happens in the GPU-specific IR."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Write kernels for new operations, formats, hardware or fusions that matter at your scale, and only after checking existing libraries and compilers.</li>
+  <li>Fast GEMMs climb the memory hierarchy: coalescing, shared-memory tiles, register tiles, vectorized loads, warp tiles, then tensor-core MMAs, asynchronous pipelines, warp specialization and persistent scheduling.</li>
+  <li>Inference adds its own patterns: skinny and mixed-precision GEMMs, grouped GEMMs for MoE, paged decode attention, communication fusion, and megakernels.</li>
+  <li>Triton compiles block-level Python through MLIR stages to GPU code, with specialization and autotuning; CUTLASS, CuTe and CuTe-DSL give finer control.</li>
+  <li>Test against high-precision references on real and odd shapes, benchmark with warm-up and cache flushes, and report results against the roofline.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://siboehm.com/articles/22/CUDA-MMM">Simon Boehm: How to optimize a CUDA matmul kernel for cuBLAS-like performance</a></td><td>The step-by-step GEMM progression, measured on an A6000, with profiling at each step.</td></tr>
+<tr><td><a href="https://triton-lang.org/main/getting-started/tutorials/index.html">Triton tutorials</a>, especially matrix multiplication</td><td>Block-level GEMM, L2-friendly tile ordering and autotuning.</td></tr>
+<tr><td><a href="https://github.com/NVIDIA/cutlass">NVIDIA CUTLASS and CuTe</a></td><td>Templates, layout algebra and examples for every recent GPU generation.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2407.08608">FlashAttention-3</a> and <a href="https://arxiv.org/abs/2603.05451">FlashAttention-4</a></td><td>Warp specialization, pipelining and Blackwell-specific techniques in a real kernel.</td></tr>
+<tr><td><a href="https://jax-ml.github.io/scaling-book/gpus/">How to Scale Your Model: GPUs</a></td><td>Tensor core feeding requirements across generations (warpgroups, TMEM, 2-SM MMA).</td></tr>
+<tr><td>Hwu, Kirk and El Hajj, <em>Programming Massively Parallel Processors</em></td><td>Tiling, reductions, and performance considerations in CUDA.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em></td><td>Kernel optimization and tooling in production performance engineering.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 technical report</a></td><td>FP8 GEMM accumulation strategy and communication kernels.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. The Part A kernel was checked with Triton 3.9 in interpreter mode.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {$}=IE;
+function ti(){const M=+$('tiM').value,N=+$('tiN').value,b=+$('tiB').value,R=+$('tiG').value,BK=32;
+  const bytes=(M*BK+BK*N)*b,fl=2*M*N*BK,I=fl/bytes;
+  $('tiStats').innerHTML=[['Bytes loaded per K step',IE.int(bytes)],['FLOPs per K step',IE.int(fl)],['Intensity (FLOPs per byte)',I.toFixed(1)],['Versus GPU ratio '+R,I>=R?'compute-bound':'needs L2 reuse or larger tiles'],['Accumulator (FP32) size',IE.int(M*N*4/1024)+' KB']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['tiM','tiN','tiB','tiG'].forEach(id=>$(id).addEventListener('input',ti));ti();
+})();
+</script>
+
+</body>
+</html>

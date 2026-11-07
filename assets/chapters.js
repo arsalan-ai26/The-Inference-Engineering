@@ -242,7 +242,7 @@ window.IE_CHAPTERS = [
 "title": "Expert depth: writing high-performance kernels and kernel compilers",
 "slug": "5-8-high-performance-kernels",
 "part": 5,
-"ready": false
+"ready": true
 },
 {
 "n": "6.1",
