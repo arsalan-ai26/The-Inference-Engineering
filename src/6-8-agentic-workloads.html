@@ -1,0 +1,238 @@
+<div class="kicker">Part 6 · Production inference infrastructure · Chapter 6.8</div>
+<h1>Expert depth: agentic workloads and tooling</h1>
+<p class="lede">An agent calls a model in a loop: decide on an action, run a tool, append the result, call again. That loop produces traffic very unlike a chatbot's: dozens of calls per task, contexts that grow with every step, outputs of a few dozen tokens, long pauses while tools run, and bursts when agents start sub-agents. This chapter shows how agent traffic changes the serving problem, the context engineering practices that make agents fast and cheap (most of them are about the KV cache), how agent harnesses and tool protocols fit around the model, and how agents are now used to write and tune the kernels from Part 5.</p>
+<div class="meta">
+  <span class="chip">Level: expert</span>
+  <span class="chip">Time: 2 to 3 hours with the lab</span>
+  <span class="chip">Needs: 3.5, 4.4, 6.4</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why can putting the current time (to the second) at the top of an agent's system prompt multiply its cost several times?</li>
+    <li>In an agent loop, which phase dominates: prefill or decode?</li>
+    <li>What does programmatic tool calling change about the tokens that enter the context?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Prefix caching only reuses tokens up to the first difference. A timestamp at the top changes on every call, so no part of the context is ever reused and every call pays full price and full prefill time.</li>
+    <li>Prefill. Each call re-reads a long, growing context and writes a short action. Manus reports an average input-to-output ratio of about 100 to 1.</li>
+    <li>The model writes code that calls tools in a sandbox and processes their results there; only the final, small result returns to the context, instead of every raw tool output.</li>
+  </ol></details>
+</div>
+
+<h2 id="loop">1. The agent loop, seen from the server</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Agent:</strong> a program that uses a model to choose actions (tool calls) step by step until a task is done.</p>
+  <p><strong>Tool call:</strong> a structured request from the model, such as <code>{"name": "shell_run", "arguments": {...}}</code>, which the program executes; the result (the <strong>observation</strong>) is added to the context.</p>
+  <p><strong>Trajectory:</strong> the full sequence of model calls, actions and observations for one task.</p>
+  <p><strong>Harness:</strong> the software around the model that runs the loop: prompts, tool handling, context management, sub-agents, hooks.</p>
+</div>
+<p>Each step sends the whole context so far, and the model returns a short action. Manus, a general-purpose agent, reports about 50 tool calls per typical task and an average of roughly 100 input tokens per output token. For the server this means:</p>
+<div class="tbl"><table>
+<tr><th>Property</th><th>Chat</th><th>Agent</th><th>Consequence for serving</th></tr>
+<tr><td>Calls per task</td><td>1 to a few</td><td>Tens to hundreds</td><td>Per-call overhead (network, queueing, TTFT) multiplies</td></tr>
+<tr><td>Input : output</td><td>Often similar order</td><td>Around 100 : 1</td><td>Prefill-heavy; TTFT and prefill cost dominate (chapter 4.6)</td></tr>
+<tr><td>Prefix shared with previous call</td><td>The chat history</td><td>Almost everything</td><td>Prefix caching is decisive (chapter 4.4)</td></tr>
+<tr><td>Gap between calls</td><td>Human reading time</td><td>Tool run time: milliseconds to minutes</td><td>Cached KV must survive the gap or be reloaded</td></tr>
+<tr><td>Output format</td><td>Free text</td><td>Structured tool calls</td><td>Constrained decoding and parser quality matter (chapter 3.5)</td></tr>
+<tr><td>Concurrency shape</td><td>Smooth</td><td>Bursts when agents fan out to sub-agents</td><td>Queueing and autoscaling headroom (chapters 6.3, 6.4)</td></tr>
+</table></div>
+<p>Users feel the total time of the loop, which is roughly the number of steps × (TTFT + output time + tool time). With 50 steps, saving 300 ms of TTFT per call saves 15 s per task.</p>
+
+<h2 id="kv">2. Design around the KV cache</h2>
+<p>Manus calls the KV cache hit rate "the single most important metric for a production-stage AI agent", because it sets both latency and cost. Cached input is also much cheaper through APIs: Manus cites $0.30 versus $3 per million input tokens on Claude Sonnet, a factor of 10. Their practices:</p>
+<ol>
+  <li><strong>Keep the prefix stable.</strong> One changed token invalidates the cache from that point on. A timestamp at the top of the system prompt breaks every call.</li>
+  <li><strong>Make the context append-only.</strong> Do not edit earlier actions or observations. Serialize deterministically: many JSON libraries do not guarantee key order, which silently changes bytes.</li>
+  <li><strong>Mark cache breakpoints</strong> where the provider requires explicit ones, at least at the end of the system prompt.</li>
+  <li><strong>Do not add or remove tools mid-task.</strong> Tool definitions sit near the front of the context, so changing them invalidates everything after. Manus keeps all tools defined and instead <em>masks</em> the logits of tools that are not allowed in the current state, using constrained decoding (chapter 3.5) and consistent name prefixes such as <code>browser_</code> and <code>shell_</code>.</li>
+  <li><strong>Self-hosting:</strong> enable prefix caching and route each session to the same replica (session affinity, or prefix-aware routing, chapter 6.4).</li>
+</ol>
+<div class="widget" id="agW">
+  <div class="wt">Interactive: one agent task, token by token</div>
+  <div class="ws">Each bar is one model call: green is input served from the prefix cache, purple is input prefilled from scratch. Change the agent's design and watch the cost. Prices default to the $3 / $0.30 / $15 per million tokens of the Manus example and a common frontier API.</div>
+  <div class="ctrls">
+    <label>Steps <input type="range" id="agN" min="5" max="100" step="5" value="50"> <span id="agNv"></span></label>
+    <label>Observation tokens per step <input type="range" id="agO" min="100" max="5000" step="100" value="1000"> <span id="agOv"></span></label>
+    <label>Design <select id="agB"><option value="">Stable prefix, append-only</option><option value="start">Timestamp at the top</option><option value="tools">Tool list changes each step</option><option value="trunc">Keep only the last 20K tokens of history</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="agSvg" viewBox="0 0 680 200" width="680" style="max-width:100%;height:auto" role="img" aria-label="Input tokens per call, cached and uncached"></svg></div>
+  <div class="stats" id="agStats"></div>
+</div>
+<p>Note the last design: dropping the oldest observations to keep the context short also breaks the prefix, because everything after the dropped part shifts. That is why Manus prefers <strong>restorable compression</strong>: replace a web page's content with its URL, or a file's content with its path, so the agent can fetch it again; and why it treats the file system as external memory.</p>
+<h3>Keeping the cache warm between calls</h3>
+<p>While a tool runs, the engine serves other requests and may evict the agent's KV blocks. On return, the agent pays full prefill again. Defences from earlier chapters: enough KV capacity for the number of concurrent agent sessions; offloading idle sessions' KV to CPU memory or disk instead of dropping it (chapter 4.4, as DeepSeek's on-disk cache in chapter 6.7); and routing that sends the next call to the replica holding the prefix. API providers keep cached prefixes only for a limited time, so very slow tools can lose the cache.</p>
+
+<h2 id="context">3. Context engineering beyond the cache</h2>
+<ul>
+  <li><strong>Recitation:</strong> Manus agents keep a <code>todo.md</code> file and rewrite it as they go, which puts the plan at the end of the context, where the model attends to it most, during a 50-step task.</li>
+  <li><strong>Keep errors in the context.</strong> A failed action and its error message steer the model away from repeating it; hiding failures removes that evidence.</li>
+  <li><strong>Avoid self-imposed few-shot patterns.</strong> Many near-identical steps make the model copy the pattern; small, structured variation in formatting breaks it.</li>
+  <li><strong>Programmatic tool calling.</strong> Instead of one JSON tool call per step with every raw result returned to the context, the model writes code that calls tools inside a sandbox, filters and aggregates the data, and returns only the final result. For data-heavy tasks (for example a year of daily prices for ten tickers, over 2,500 data points) this keeps tens of thousands of tokens out of the context. Anthropic introduced it in its API; open-source versions exist (open-ptc-agent).</li>
+  <li><strong>Fewer tools.</strong> Large tool lists confuse models and lengthen the prefix. Phil Schmid cites Vercel removing 80% of an agent's tools and getting fewer steps, fewer tokens and faster responses.</li>
+</ul>
+
+<h2 id="harness">4. Harnesses, frameworks and protocols</h2>
+<p>A useful analogy from Phil Schmid: the model is the CPU, the context window is the RAM, the <strong>harness</strong> is the operating system (it curates the context, starts up with the right prompts and hooks, and provides drivers for tools), and the agent is the application. Coding CLIs such as Claude Code and Codex are specialized harnesses; SDKs such as the Claude Agent SDK, LangChain DeepAgents and Strands Agents (an open-source, model-agnostic agent loop for Python and TypeScript) let you build your own.</p>
+<ul>
+  <li><strong>Model Context Protocol (MCP):</strong> an open standard for connecting models to tools and data. By December 2025 there were more than 10,000 active public MCP servers, and Anthropic donated MCP to the Agentic AI Foundation under the Linux Foundation, co-founded with Block and OpenAI.</li>
+  <li><strong>Asynchronous (background) agents:</strong> agents that run in cloud sandboxes without a human watching, started from chat or an issue tracker. One builder's design: an orchestrator container holds secrets and creates short-lived, single-repository credentials; each agent runs in its own container with only the keys it needs. For inference this means long, unattended trajectories, many in parallel: throughput and cost matter more than per-call latency.</li>
+  <li><strong>Durability over many steps:</strong> leaderboard scores barely separate models, but long tasks expose whether a model still follows instructions after 50 or 100 tool calls. Harnesses produce the logged trajectories that measure this, and that labs feed back into training.</li>
+</ul>
+<p>Serving implications: harness traffic is the most cacheable traffic there is (same system prompt and tools for every user), it depends on accurate tool-call parsing (chapter 6.6's provider comparison measured exactly this), and its bursts come from sub-agents started in parallel.</p>
+
+<h2 id="kernels">5. Agents that write kernels</h2>
+<p>Kernel work (Part 5) has a clear correctness check and a measurable score, which makes it well suited to agents that try, test and retry. AMD's AgentKernelArena is an environment for this:</p>
+<ul>
+  <li><strong>Kernel tasks:</strong> implement and optimize one operator (for example RMSNorm) in Triton, Gluon, HIP or FlyDSL. Correctness is checked against a high-precision PyTorch reference; speed is measured with cold caches and CUDA graphs (chapter 5.7) against a vendored baseline, on workloads taken from production.</li>
+  <li><strong>End-to-end tasks:</strong> change the kernels of a whole serving stack while weights, precision, parallelism and serving flags stay fixed; reward comes from model correctness and serving throughput.</li>
+  <li>The run configuration chooses the agent (for example Claude Code), the GPU, the language and a time budget, and the environment produces reward signals that can train kernel-writing agents with reinforcement learning.</li>
+</ul>
+<p>The design shows what any agent evaluation needs: a fixed task contract, an independent checker the agent cannot edit, and measurement methods that cannot be gamed (cold cache, fixed workloads).</p>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Why agents push toward disaggregation and tiered KV</span>
+  <p>With a 100 : 1 input ratio and mostly cached prefixes, the work per call is a modest prefill of new tokens plus a short decode, but the KV that must be kept is large and lives for minutes. That combination favours separate prefill capacity, large KV pools spread across GPU, CPU and disk, and routing by cache location: exactly the llm-d and Dynamo designs of chapters 4.4 and 4.6.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Masking tools without breaking the cache</span>
+  <p>Response prefill does the masking without touching the prefix. In the Hermes format: prefill <code>&lt;|im_start|&gt;assistant</code> to let the model choose; add <code>&lt;tool_call&gt;</code> to force a tool call; add <code>{"name": "browser_</code> to force a tool from one group. The tool definitions never change, so the cache survives.</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Timestamps, random IDs or per-user data at the top of the prompt.</li>
+  <li>Non-deterministic JSON serialization of tool results.</li>
+  <li>Loading tools dynamically mid-task.</li>
+  <li>Sliding-window truncation of agent context without counting the lost cache hits.</li>
+  <li>Round-robin routing of agent sessions across replicas.</li>
+  <li>Measuring agent speed by single-call TTFT rather than time per task.</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<p><strong>Goal:</strong> measure what KV reuse saves on a growing context, and estimate the cache hit rate and cost of an agent workload.</p>
+<h3>Part A: re-prefill everything, or only the new tokens?</h3>
+<p>Predict first: on a CPU, how much faster is prefilling only a new 400-token step than re-prefilling a 3,500-token context?</p>
+<pre>import torch, time
+from transformers import AutoModelForCausalLM, DynamicCache
+torch.set_num_threads(2)
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype=torch.float32).eval()
+V = model.config.vocab_size
+ctx = torch.randint(0, V, (1, 1500))         # system prompt + tools + task
+cache = DynamicCache()
+with torch.no_grad():
+    model(ctx, past_key_values=cache, use_cache=True)
+for step in range(1, 6):
+    new = torch.randint(0, V, (1, 400))      # one action + observation
+    full = torch.cat([ctx, new], 1)
+    with torch.no_grad():
+        t = time.perf_counter(); model(full, use_cache=False); t_full = time.perf_counter() - t
+        t = time.perf_counter(); model(new, past_key_values=cache, use_cache=True); t_new = time.perf_counter() - t
+    ctx = full
+    print(step, ctx.shape[1], round(t_full, 2), round(t_new, 2))</pre>
+<details><summary>What we measured (2 CPU cores)</summary><pre class="out"> step  context  full prefill  only new tokens
+    1     1900       10.70 s          3.50 s
+    2     2300       14.15 s          2.90 s
+    3     2700       16.62 s          2.68 s
+    4     3100       18.21 s          2.63 s
+    5     3500       22.74 s          3.24 s</pre>
+<p>Re-prefilling grows with the context (11 s to 23 s); prefilling only the new tokens stays around 3 s, a 7 times difference at 3,500 tokens that keeps widening as the context grows. On a GPU every number is much smaller, but the shape is the same.</p></details>
+<h3>Part B: token accounting for a whole task</h3>
+<pre>def run(steps=50, system=3000, tools=5000, user=200, action=100, obs=1000,
+        price_in=3.00, price_cached=0.30, price_out=15.00, breaks_at=None):
+    ctx_prev = fresh = cached = out = 0
+    ctx = system + tools + user
+    for _ in range(steps):
+        reusable = 0 if breaks_at == "start" else min(ctx_prev, system) if breaks_at == "tools" else ctx_prev
+        cached += reusable; fresh += ctx - reusable; out += action
+        ctx_prev = ctx + action
+        ctx += action + obs
+    return fresh, cached, out, (fresh*price_in + cached*price_cached + out*price_out) / 1e6
+
+for label, b in [("stable prefix", None), ("timestamp at top", "start"), ("tools change", "tools")]:
+    f, c, o, cost = run(breaks_at=b)
+    print(f"{label:17s} input {f+c:,}  cached {c/(f+c):.1%}  in:out {(f+c)/o:.0f}:1  ${cost:.2f}")</pre>
+<details><summary>What we computed</summary><pre class="out">stable prefix, append-only   input 1,757,500 (cached 96.7%)  output 5,000  in:out  352:1  cost $0.76
+timestamp at the top         input 1,757,500 (cached  0.0%)  output 5,000  in:out  352:1  cost $5.35
+tool list changes each step  input 1,757,500 (cached  8.4%)  output 5,000  in:out  352:1  cost $4.95</pre>
+<p>The same 50-step task costs $0.76 with a stable prefix and about seven times more when the cache breaks every step. With 1,000-token observations the input-to-output ratio here is 352 to 1, higher than Manus's average of 100 to 1; shorter observations or fewer steps lower it.</p></details>
+<h3>Part C: your own agent</h3>
+<p>Take one agent you use or build. Log (or estimate) for 10 tasks: steps per task, system prompt and tool definition size, tokens per action and per observation, and seconds per tool call. Fill them into Part B, then check: where in your prompt is the first token that changes between calls? Would a self-hosted engine keep your KV through the longest tool call, given your concurrency? Estimate the cache hit rate and the saving from fixing the first cache break you find.</p>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Agents in production</span>
+  <ul>
+    <li><strong>Agent products</strong> treat the cache hit rate as a top metric and design prompts to be append-only.</li>
+    <li><strong>Coding harnesses</strong> run long trajectories, increasingly as background agents in cloud sandboxes.</li>
+    <li><strong>Inference platforms</strong> add session-aware routing and KV offloading for agent traffic.</li>
+    <li><strong>Hardware vendors and labs</strong> build environments such as AgentKernelArena to train and evaluate kernel-writing agents.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz68"></div>
+<script type="application/json" id="qz68">[
+{"q":"Which phase dominates an agent's model calls?","o":["Decode","Prefill","Sampling","Detokenization"],"a":1,"e":"Long, growing inputs and short outputs: around 100 input tokens per output token at Manus."},
+{"q":"Why does changing the tool list mid-task hurt?","o":["Tools are slow","Tool definitions are near the front, so the cache is invalidated for everything after them","It breaks MCP","It changes the model"],"a":1,"e":"Manus masks tools with constrained decoding instead."},
+{"q":"Truncating the oldest observations to keep the context short:","o":["Always saves money","Shifts everything after the cut, so the prefix cache misses","Has no effect on caching","Is required by MCP"],"a":1,"e":"Prefer restorable compression: keep URLs or file paths."},
+{"q":"Programmatic tool calling reduces context size because:","o":["Tools run faster","Code in a sandbox processes raw tool results and only the final result returns","It uses a smaller model","It disables caching"],"a":1,"e":"Raw data stays out of the context."},
+{"q":"In the harness analogy, the context window is the:","o":["CPU","RAM","Operating system","Application"],"a":1,"e":"Model = CPU, context = RAM, harness = OS, agent = application."},
+{"q":"What makes kernel optimization a good task for agents?","o":["It needs no GPU","Correctness and speed can be checked automatically against a reference and baseline","Kernels are short","It needs no testing"],"a":1,"e":"AgentKernelArena checks against a high-precision reference and times with cold caches."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>Agent traffic is many calls per task, prefill-heavy, highly cacheable, bursty and structured.</li>
+  <li>The KV cache hit rate decides agent latency and cost: stable prefixes, append-only contexts, deterministic serialization, fixed tool lists with masking, session-aware routing.</li>
+  <li>Restorable compression, recitation and keeping errors in context improve long tasks without breaking the cache.</li>
+  <li>Harnesses and MCP standardize how agents use tools; programmatic tool calling keeps raw data out of the context.</li>
+  <li>Kernel optimization is now an agent task, evaluated with fixed references, baselines and measurement rules.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Yichao Ji, Context Engineering for AI Agents: Lessons from Building Manus</a></td><td>KV cache hit rate as the key metric, the 100 : 1 ratio, tool masking, file system as memory, recitation and error handling.</td></tr>
+<tr><td><a href="https://www.philschmid.de/agent-harness-2026">Phil Schmid, The Importance of Agent Harness in 2026</a></td><td>What a harness is, durability over long tasks, and building to delete.</td></tr>
+<tr><td><a href="https://benanderson.work/blog/async-coding-agents/">Ben Anderson, Async Coding Agents "From Scratch"</a></td><td>A design for background coding agents in serverless containers with scoped credentials.</td></tr>
+<tr><td><a href="https://github.com/Chen-zexi/open-ptc-agent">open-ptc-agent</a></td><td>An open-source implementation of programmatic tool calling.</td></tr>
+<tr><td><a href="https://www.anthropic.com/news/donating-the-model-context-protocol-and-establishing-of-the-agentic-ai-foundation">Anthropic, Donating MCP and establishing the Agentic AI Foundation</a></td><td>MCP's adoption and governance.</td></tr>
+<tr><td><a href="https://github.com/strands-agents/sdk-python">Strands Agents SDK</a> and <a href="https://github.com/NirDiamant/agents-towards-production">Agents Towards Production</a></td><td>A model-driven agent SDK, and tutorials for production agent concerns.</td></tr>
+<tr><td><a href="https://github.com/AMD-AGI/AgentKernelArena">AMD, AgentKernelArena</a></td><td>An environment for kernel-writing agents with independent correctness and timing checks.</td></tr>
+<tr><td><a href="https://steipete.me/posts/2025/shipping-at-inference-speed">Peter Steinberger, Shipping at Inference-Speed</a></td><td>A practitioner's account of software output limited by agent inference time.</td></tr>
+</table></div>
+<h3>Sources considered and not used</h3>
+<ul>
+  <li>The ATOM Project is about open-model policy, not serving. The agent-trace repository could not be retrieved. Microsoft's Fara-7B post could not be retrieved; the OML attribution talk is a video and was not reviewed.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Part A measured on 2 CPU cores with PyTorch 2.15 and Transformers 5.22; Part B computed with Python 3.13.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$,el,css}=IE;
+function sim(N,O,B){const sys=3000,tools=5000,user=200,act=100,W=20000;let prev=0,ctx=sys+tools+user,fr=0,ca=0,out=0;const bars=[];let hist=[];
+  for(let i=0;i<N;i++){let full=ctx,reuse=prev;
+    if(B==='start')reuse=0;if(B==='tools')reuse=Math.min(reuse,sys);
+    if(B==='trunc'){const body=ctx-(sys+tools+user);if(body>W){full=sys+tools+user+W;reuse=i>0&&bars[i-1].trunc?sys+tools+user:Math.min(prev,full);}}
+    reuse=Math.min(reuse,full);bars.push({c:reuse,f:full-reuse,trunc:B==='trunc'&&ctx-(sys+tools+user)>W});ca+=reuse;fr+=full-reuse;out+=act;
+    prev=full+act;ctx+=act+O;}
+  return {bars,fr,ca,out,cost:(fr*3+ca*0.3+out*15)/1e6};}
+function ag(){const N=+$('agN').value,O=+$('agO').value,B=$('agB').value;$('agNv').textContent=N;$('agOv').textContent=IE.int(O);
+  const r=sim(N,O,B),s=$('agSvg');s.innerHTML='';const x0=50,x1=670,y0=175,y1=10;const mx=Math.max(...r.bars.map(b=>b.c+b.f));const bw=(x1-x0)/N;
+  r.bars.forEach((b,i)=>{const hc=b.c/mx*(y0-y1),hf=b.f/mx*(y0-y1);const x=x0+i*bw;
+    el('rect',{x:x+0.5,y:y0-hc,width:Math.max(1,bw-1),height:hc,fill:css('--good')},s);
+    el('rect',{x:x+0.5,y:y0-hc-hf,width:Math.max(1,bw-1),height:hf,fill:css('--pre')},s);});
+  el('line',{x1:x0,x2:x1,y1:y0,y2:y0,stroke:css('--ink2')},s);
+  el('text',{x:x0-6,y:y1+8,'text-anchor':'end','font-size':10,fill:css('--ink2')},s,IE.int(mx/1000)+'K');
+  el('text',{x:x0-6,y:y0,'text-anchor':'end','font-size':10,fill:css('--ink2')},s,'0');
+  el('text',{x:(x0+x1)/2,y:194,'text-anchor':'middle','font-size':10,fill:css('--ink2')},s,'model call (step) →   input tokens per call');
+  const tot=r.fr+r.ca;
+  $('agStats').innerHTML=[['Input tokens',IE.int(tot)],['Served from cache',(r.ca/tot*100).toFixed(1)+'%'],['Prefilled from scratch',IE.int(r.fr)],['Input : output',Math.round(tot/r.out)+' : 1'],['Cost of the task','$'+r.cost.toFixed(2)]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['agN','agO','agB'].forEach(id=>$(id).addEventListener('input',ag));IE.onTheme(ag);
+})();
+</script>

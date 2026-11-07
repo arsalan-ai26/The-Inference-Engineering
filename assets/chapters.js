@@ -298,7 +298,7 @@ window.IE_CHAPTERS = [
 "title": "Expert depth: agentic workloads and tooling",
 "slug": "6-8-agentic-workloads",
 "part": 6,
-"ready": false
+"ready": true
 },
 {
 "n": "6.9",
