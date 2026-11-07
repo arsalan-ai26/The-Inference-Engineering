@@ -1,48 +1,507 @@
 [
-["Active parameters vs total parameters","See the two entries in chapter 2.6. Active sets FLOPs per token; total sets memory.","2.6"],
-["Arithmetic intensity","FLOPs an operation performs ÷ bytes it must read and write. Compared with the GPU's ops:byte ratio to decide whether it is memory-bound or compute-bound.","2.5"],
-["BF16 (bfloat16)","A 16-bit float with FP32's 8 exponent bits and 7 mantissa bits: same range as FP32, less precision. The default weight format for serving.","1.3"],
-["BPE (byte-pair encoding)","A tokenizer training method that starts from bytes or characters and repeatedly merges the most frequent adjacent pair into a new token.","2.1"],
-["Causal mask","A mask that stops each token attending to later tokens, so a token's output depends only on itself and earlier tokens.","2.2"],
-["Chunked prefill","Splitting a long prompt's prefill into chunks that run in the same steps as other requests' decodes, so long prompts do not stall token output for everyone.","3.2"],
-["Compute-bound","An operation whose time is set by arithmetic speed (FLOP/s), not memory speed. Large-batch prefill is the main example.","2.5"],
-["Constrained decoding (structured output)","Masking the logits at each step so only tokens that keep the output valid for a grammar or JSON schema can be sampled.","3.5"],
-["Continuous batching","Scheduling at the level of single token steps: finished requests leave and new ones join the running batch at every step, instead of waiting for a whole batch to finish.","3.2"],
-["CUDA graph","A recorded sequence of GPU kernel launches that can be replayed with one call, removing per-kernel CPU launch overhead in decode.","3.4"],
-["Decode","The phase that makes output tokens one at a time, each step reading all weights and the KV cache. Usually memory-bound.","2.4"],
-["Disaggregated serving","Running prefill and decode on separate GPU pools and moving the KV cache between them, so each phase can be sized and batched for its own bottleneck.","3.6"],
-["Embedding","The learned vector for a token ID, looked up from the embedding table at the start of the model.","2.1"],
-["FlashAttention","An attention kernel that computes attention in tiles held in on-chip memory, never writing the full score matrix to HBM. Same result, far less memory traffic.","2.2"],
-["FP8","8-bit floating point (E4M3 or E5M2). Used for weights, activations or the KV cache on GPUs with FP8 tensor cores (Ada, Hopper, Blackwell).","1.3"],
-["GGUF","The single-file model format used by llama.cpp, holding weights (often quantized) and metadata such as the tokenizer and chat template.","3.1"],
-["Goodput","Throughput counted only for requests that meet their latency targets (SLOs).","3.2"],
-["GQA (grouped-query attention)","Attention where groups of query heads share one key head and one value head, which shrinks the KV cache by the group factor.","2.2"],
-["HBM (high-bandwidth memory)","The GPU's main memory. Its bandwidth (for example about 3.35 TB/s on an H100 SXM) sets the decode speed limit.","2.4"],
-["KV cache","Stored key and value vectors of every past token in every layer, so each new token step computes only the new token's keys and values.","2.4"],
-["LoRA","A fine-tuning method that trains two small low-rank matrices per adapted weight instead of the full weight. Serving engines can load many LoRA adapters over one base model.","3.5"],
-["MBU (model bandwidth utilization)","Achieved memory bandwidth ÷ peak bandwidth during decode. Measures how close decode gets to the memory floor.","2.5"],
-["MFU (model FLOPs utilization)","Achieved FLOP/s ÷ peak FLOP/s. Used mostly for prefill and training.","2.5"],
-["Memory-bound","An operation whose time is set by how fast bytes move from memory, not by arithmetic. Small-batch decode is the main example.","2.5"],
-["MLA (multi-head latent attention)","Attention that caches one small compressed latent vector per token per layer instead of full keys and values, then expands it when needed. Used by DeepSeek V2 and V3.","2.4"],
-["MoE (mixture of experts)","A model whose feed-forward layers hold many experts; a router sends each token to a few of them. Memory follows total parameters; compute follows active parameters.","2.6"],
-["NVFP4","NVIDIA's 4-bit floating-point format for Blackwell GPUs, with a scale factor per block of 16 values.","1.3"],
-["OpenAI-compatible API","An HTTP API that copies OpenAI's chat completions and completions endpoints, so the same client code works with vLLM, SGLang and other servers.","3.1"],
-["PagedAttention","Storing the KV cache in fixed-size blocks anywhere in GPU memory, with a block table per request, and an attention kernel that reads through the table. Removes most fragmentation.","3.3"],
-["Prefill","The phase that processes the whole prompt in one parallel pass and writes its KV cache. Usually compute-bound; sets TTFT.","2.4"],
-["Prefix caching","Keeping the KV blocks of earlier requests and reusing them when a new request starts with the same tokens, skipping their prefill.","3.5"],
-["Preemption","Pausing a running request when KV memory runs out, by freeing its blocks (recompute later) or copying them to CPU memory (swap).","3.2"],
-["Quantization","Storing weights, activations or the KV cache in fewer bits (for example INT8, FP8, INT4) to cut memory and bandwidth, at some accuracy risk.","1.3"],
-["Radix tree (prefix tree)","A tree keyed by token sequences. SGLang's RadixAttention uses it to find the longest cached prefix of a new request.","3.5"],
-["RMSNorm","A normalization layer that divides a vector by its root mean square and multiplies by learned gains. Used instead of LayerNorm in most current LLMs.","1.5"],
-["RoPE (rotary position embedding)","Encoding position by rotating each pair of query and key dimensions by an angle proportional to the token's position, so attention scores depend on relative distance.","2.3"],
-["Roofline","A plot of attainable FLOP/s against arithmetic intensity: a sloped memory roof and a flat compute roof meeting at the ops:byte ratio.","2.5"],
-["safetensors","A simple, safe file format for tensors (a JSON header plus raw bytes), the standard for Hugging Face model weights.","3.1"],
-["Sampling (temperature, top-k, top-p)","Picking the next token from the probability distribution. Temperature sharpens or flattens it; top-k keeps the k most likely tokens; top-p keeps the smallest set whose probabilities reach p.","1.2"],
-["Sliding-window attention","Attention where each token sees only the last W tokens, which caps that layer's KV cache at W tokens.","2.2"],
-["SLO (service level objective)","A target for a latency or availability metric, for example p95 TTFT under 500 ms.","2.4"],
-["Softmax","The function that turns a list of logits into probabilities: exponentiate each, then divide by the sum.","1.2"],
-["Speculative decoding","A cheap draft proposes several tokens; the big model checks them all in one pass and keeps the accepted ones. Output distribution is unchanged; latency drops when acceptance is high.","2.7"],
-["State space model (linear attention, Mamba)","A layer that keeps a fixed-size state per sequence instead of a growing KV cache. Constant memory and per-token cost; weaker exact recall.","2.7"],
-["Tensor parallelism","Splitting each weight matrix across GPUs so every GPU computes part of every layer, with all-reduce communication after each split layer.","2.5"],
-["Throughput","Tokens produced per second across all requests on a server or GPU.","2.4"]
+ [
+  "Active parameters vs total parameters",
+  "See the two entries in chapter 2.6. Active sets FLOPs per token; total sets memory.",
+  "2.6"
+ ],
+ [
+  "Arithmetic intensity",
+  "FLOPs an operation performs ÷ bytes it must read and write. Compared with the GPU's ops:byte ratio to decide whether it is memory-bound or compute-bound.",
+  "2.5"
+ ],
+ [
+  "BF16 (bfloat16)",
+  "A 16-bit float with FP32's 8 exponent bits and 7 mantissa bits: same range as FP32, less precision. The default weight format for serving.",
+  "1.3"
+ ],
+ [
+  "BPE (byte-pair encoding)",
+  "A tokenizer training method that starts from bytes or characters and repeatedly merges the most frequent adjacent pair into a new token.",
+  "2.1"
+ ],
+ [
+  "Causal mask",
+  "A mask that stops each token attending to later tokens, so a token's output depends only on itself and earlier tokens.",
+  "2.2"
+ ],
+ [
+  "Chunked prefill",
+  "Splitting a long prompt's prefill into chunks that run in the same steps as other requests' decodes, so long prompts do not stall token output for everyone.",
+  "3.2"
+ ],
+ [
+  "Compute-bound",
+  "An operation whose time is set by arithmetic speed (FLOP/s), not memory speed. Large-batch prefill is the main example.",
+  "2.5"
+ ],
+ [
+  "Constrained decoding (structured output)",
+  "Masking the logits at each step so only tokens that keep the output valid for a grammar or JSON schema can be sampled.",
+  "3.5"
+ ],
+ [
+  "Continuous batching",
+  "Scheduling at the level of single token steps: finished requests leave and new ones join the running batch at every step, instead of waiting for a whole batch to finish.",
+  "3.2"
+ ],
+ [
+  "CUDA graph",
+  "A recorded sequence of GPU kernel launches that can be replayed with one call, removing per-kernel CPU launch overhead in decode.",
+  "3.4"
+ ],
+ [
+  "Decode",
+  "The phase that makes output tokens one at a time, each step reading all weights and the KV cache. Usually memory-bound.",
+  "2.4"
+ ],
+ [
+  "Disaggregated serving",
+  "Running prefill and decode on separate GPU pools and moving the KV cache between them, so each phase can be sized and batched for its own bottleneck.",
+  "3.6"
+ ],
+ [
+  "Embedding",
+  "The learned vector for a token ID, looked up from the embedding table at the start of the model.",
+  "2.1"
+ ],
+ [
+  "FlashAttention",
+  "An attention kernel that computes attention in tiles held in on-chip memory, never writing the full score matrix to HBM. Same result, far less memory traffic.",
+  "2.2"
+ ],
+ [
+  "FP8",
+  "8-bit floating point (E4M3 or E5M2). Used for weights, activations or the KV cache on GPUs with FP8 tensor cores (Ada, Hopper, Blackwell).",
+  "1.3"
+ ],
+ [
+  "GGUF",
+  "The single-file model format used by llama.cpp, holding weights (often quantized) and metadata such as the tokenizer and chat template.",
+  "3.1"
+ ],
+ [
+  "Goodput",
+  "Throughput counted only for requests that meet their latency targets (SLOs).",
+  "3.2"
+ ],
+ [
+  "GQA (grouped-query attention)",
+  "Attention where groups of query heads share one key head and one value head, which shrinks the KV cache by the group factor.",
+  "2.2"
+ ],
+ [
+  "HBM (high-bandwidth memory)",
+  "The GPU's main memory. Its bandwidth (for example about 3.35 TB/s on an H100 SXM) sets the decode speed limit.",
+  "2.4"
+ ],
+ [
+  "KV cache",
+  "Stored key and value vectors of every past token in every layer, so each new token step computes only the new token's keys and values.",
+  "2.4"
+ ],
+ [
+  "LoRA",
+  "A fine-tuning method that trains two small low-rank matrices per adapted weight instead of the full weight. Serving engines can load many LoRA adapters over one base model.",
+  "3.5"
+ ],
+ [
+  "MBU (model bandwidth utilization)",
+  "Achieved memory bandwidth ÷ peak bandwidth during decode. Measures how close decode gets to the memory floor.",
+  "2.5"
+ ],
+ [
+  "MFU (model FLOPs utilization)",
+  "Achieved FLOP/s ÷ peak FLOP/s. Used mostly for prefill and training.",
+  "2.5"
+ ],
+ [
+  "Memory-bound",
+  "An operation whose time is set by how fast bytes move from memory, not by arithmetic. Small-batch decode is the main example.",
+  "2.5"
+ ],
+ [
+  "MLA (multi-head latent attention)",
+  "Attention that caches one small compressed latent vector per token per layer instead of full keys and values, then expands it when needed. Used by DeepSeek V2 and V3.",
+  "2.4"
+ ],
+ [
+  "MoE (mixture of experts)",
+  "A model whose feed-forward layers hold many experts; a router sends each token to a few of them. Memory follows total parameters; compute follows active parameters.",
+  "2.6"
+ ],
+ [
+  "NVFP4",
+  "NVIDIA's 4-bit floating-point format for Blackwell GPUs, with a scale factor per block of 16 values.",
+  "1.3"
+ ],
+ [
+  "OpenAI-compatible API",
+  "An HTTP API that copies OpenAI's chat completions and completions endpoints, so the same client code works with vLLM, SGLang and other servers.",
+  "3.1"
+ ],
+ [
+  "PagedAttention",
+  "Storing the KV cache in fixed-size blocks anywhere in GPU memory, with a block table per request, and an attention kernel that reads through the table. Removes most fragmentation.",
+  "3.3"
+ ],
+ [
+  "Prefill",
+  "The phase that processes the whole prompt in one parallel pass and writes its KV cache. Usually compute-bound; sets TTFT.",
+  "2.4"
+ ],
+ [
+  "Prefix caching",
+  "Keeping the KV blocks of earlier requests and reusing them when a new request starts with the same tokens, skipping their prefill.",
+  "3.5"
+ ],
+ [
+  "Preemption",
+  "Pausing a running request when KV memory runs out, by freeing its blocks (recompute later) or copying them to CPU memory (swap).",
+  "3.2"
+ ],
+ [
+  "Quantization",
+  "Storing weights, activations or the KV cache in fewer bits (for example INT8, FP8, INT4) to cut memory and bandwidth, at some accuracy risk.",
+  "1.3"
+ ],
+ [
+  "Radix tree (prefix tree)",
+  "A tree keyed by token sequences. SGLang's RadixAttention uses it to find the longest cached prefix of a new request.",
+  "3.5"
+ ],
+ [
+  "RMSNorm",
+  "A normalization layer that divides a vector by its root mean square and multiplies by learned gains. Used instead of LayerNorm in most current LLMs.",
+  "1.5"
+ ],
+ [
+  "RoPE (rotary position embedding)",
+  "Encoding position by rotating each pair of query and key dimensions by an angle proportional to the token's position, so attention scores depend on relative distance.",
+  "2.3"
+ ],
+ [
+  "Roofline",
+  "A plot of attainable FLOP/s against arithmetic intensity: a sloped memory roof and a flat compute roof meeting at the ops:byte ratio.",
+  "2.5"
+ ],
+ [
+  "safetensors",
+  "A simple, safe file format for tensors (a JSON header plus raw bytes), the standard for Hugging Face model weights.",
+  "3.1"
+ ],
+ [
+  "Sampling (temperature, top-k, top-p)",
+  "Picking the next token from the probability distribution. Temperature sharpens or flattens it; top-k keeps the k most likely tokens; top-p keeps the smallest set whose probabilities reach p.",
+  "1.2"
+ ],
+ [
+  "Sliding-window attention",
+  "Attention where each token sees only the last W tokens, which caps that layer's KV cache at W tokens.",
+  "2.2"
+ ],
+ [
+  "SLO (service level objective)",
+  "A target for a latency or availability metric, for example p95 TTFT under 500 ms.",
+  "2.4"
+ ],
+ [
+  "Softmax",
+  "The function that turns a list of logits into probabilities: exponentiate each, then divide by the sum.",
+  "1.2"
+ ],
+ [
+  "Speculative decoding",
+  "A cheap draft proposes several tokens; the big model checks them all in one pass and keeps the accepted ones. Output distribution is unchanged; latency drops when acceptance is high.",
+  "2.7"
+ ],
+ [
+  "State space model (linear attention, Mamba)",
+  "A layer that keeps a fixed-size state per sequence instead of a growing KV cache. Constant memory and per-token cost; weaker exact recall.",
+  "2.7"
+ ],
+ [
+  "Tensor parallelism",
+  "Splitting each weight matrix across GPUs so every GPU computes part of every layer, with all-reduce communication after each split layer.",
+  "2.5"
+ ],
+ [
+  "Throughput",
+  "Tokens produced per second across all requests on a server or GPU.",
+  "2.4"
+ ],
+ [
+  "Zero point",
+  "An offset stored with a quantization scale so that an asymmetric range of values (for example −0.2 to 1.5) maps onto the integer grid without wasting levels.",
+  "4.1"
+ ],
+ [
+  "Per-channel and group-wise scales",
+  "One quantization scale per output channel, or per group of consecutive weights (for example 128). Smaller groups follow outliers better at the cost of storing more scales.",
+  "4.1"
+ ],
+ [
+  "GPTQ",
+  "A post-training weight quantization method that rounds weights one column at a time and adjusts the remaining weights to compensate for each rounding error, using second-order information from calibration data.",
+  "4.1"
+ ],
+ [
+  "AWQ (activation-aware weight quantization)",
+  "A weight-only quantization method that scales up the small share of weight channels that see large activations before rounding, protecting the weights that matter most.",
+  "4.1"
+ ],
+ [
+  "SmoothQuant",
+  "Moves the difficulty of quantizing activations into the weights: divides activation outliers by a per-channel factor and multiplies the matching weights by it, so both can be stored in 8 bits.",
+  "4.1"
+ ],
+ [
+  "MQA (multi-query attention)",
+  "Attention in which all query heads share one key head and one value head, shrinking the KV cache by the number of heads.",
+  "4.2"
+ ],
+ [
+  "Online softmax",
+  "Computing softmax in one pass over blocks of scores by keeping a running maximum and running sum and rescaling earlier partial results. The basis of FlashAttention.",
+  "4.2"
+ ],
+ [
+  "Flash-Decoding (split-KV attention)",
+  "Decode attention that splits the KV sequence into chunks processed in parallel and then merges the partial results, so one query can keep the whole GPU busy.",
+  "4.2"
+ ],
+ [
+  "Attention sink",
+  "The first few tokens of a sequence, which receive large attention weights regardless of content. Keeping them makes sliding-window attention stable.",
+  "4.2"
+ ],
+ [
+  "EAGLE",
+  "A speculative decoding drafter: a small head that predicts the next tokens from the target model's own hidden states.",
+  "4.3"
+ ],
+ [
+  "MTP (multi-token prediction)",
+  "Extra prediction heads trained with the model to predict several future tokens; at inference they can serve as a built-in drafter.",
+  "4.3"
+ ],
+ [
+  "KV offloading (tiered KV cache)",
+  "Keeping KV blocks that do not fit, or are idle, in CPU memory, local disk or a remote store, and loading them back instead of recomputing them.",
+  "4.4"
+ ],
+ [
+  "Cache-aware routing",
+  "Sending a request to the replica most likely to hold its prefix in the KV cache, balanced against that replica's load.",
+  "4.4"
+ ],
+ [
+  "Pipeline parallelism",
+  "Splitting a model by layers across GPUs or nodes; each stage passes activations to the next.",
+  "4.5"
+ ],
+ [
+  "Expert parallelism",
+  "Placing different experts of a mixture-of-experts model on different GPUs and sending each token to the GPUs that hold its chosen experts.",
+  "4.5"
+ ],
+ [
+  "Data parallelism",
+  "Running full copies of a model (or of some of its layers) on several GPUs, each serving different requests.",
+  "4.5"
+ ],
+ [
+  "Context parallelism",
+  "Splitting one long sequence across GPUs so each holds part of its tokens and KV cache.",
+  "4.5"
+ ],
+ [
+  "xPyD",
+  "Shorthand for a disaggregated deployment with x prefill workers and y decode workers.",
+  "4.6"
+ ],
+ [
+  "KV eviction (H2O, SnapKV)",
+  "Dropping the KV entries of tokens that receive little attention, to bound memory at long context. Unlike paging, the dropped information is lost.",
+  "4.7"
+ ],
+ [
+  "RULER",
+  "A long-context benchmark of synthetic retrieval, tracing and aggregation tasks at controlled lengths, used to measure the context a model really handles.",
+  "4.7"
+ ],
+ [
+  "Ring attention",
+  "Context-parallel attention in which GPUs pass blocks of keys and values around a ring while each computes attention for its own queries.",
+  "4.7"
+ ],
+ [
+  "SM (streaming multiprocessor)",
+  "The GPU's unit of execution: it holds tensor cores, registers and shared memory, and runs thread blocks.",
+  "5.2"
+ ],
+ [
+  "Occupancy",
+  "The share of an SM's maximum resident warps that are actually resident. Enough occupancy hides memory latency; more is not always faster.",
+  "5.2"
+ ],
+ [
+  "Tensor core",
+  "A GPU unit that multiplies small matrix tiles in one instruction, providing most of the GPU's FLOPs for matmuls.",
+  "5.2"
+ ],
+ [
+  "Kernel fusion",
+  "Combining several operations into one GPU kernel so intermediate results stay on chip instead of making round trips through HBM.",
+  "5.4"
+ ],
+ [
+  "Triton",
+  "A Python-embedded language and compiler for writing GPU kernels at the level of blocks of data rather than individual threads.",
+  "5.4"
+ ],
+ [
+  "MIG (Multi-Instance GPU)",
+  "Partitioning one NVIDIA data-center GPU into isolated slices, each with its own memory and compute.",
+  "5.5"
+ ],
+ [
+  "torch.compile",
+  "PyTorch's compiler: captures the model as a graph and generates fused kernels for it.",
+  "5.7"
+ ],
+ [
+  "Piecewise CUDA graphs",
+  "Capturing CUDA graphs for the parts of a model step between operations that cannot be captured (such as some attention kernels), as vLLM does.",
+  "5.7"
+ ],
+ [
+  "Tiling",
+  "Splitting a matmul or attention into tiles that fit in shared memory and registers, so each value loaded from HBM is reused many times.",
+  "5.8"
+ ],
+ [
+  "Split-K",
+  "A matmul strategy that splits the reduction dimension across thread blocks and adds the partial results, used when the output is too small to keep the GPU busy.",
+  "5.8"
+ ],
+ [
+  "Open-loop and closed-loop load",
+  "Open loop: requests arrive on a schedule (for example at a fixed rate) whatever the server does. Closed loop: a fixed number of clients each wait for a reply before sending again, which hides overload.",
+  "6.1"
+ ],
+ [
+  "Cold start",
+  "The time from deciding to add a replica to it serving traffic: getting a machine, pulling the image, loading weights, compiling and warming up.",
+  "6.2"
+ ],
+ [
+  "Readiness and liveness probes",
+  "Health checks: liveness asks whether the process should be restarted; readiness asks whether it can receive traffic now.",
+  "6.2"
+ ],
+ [
+  "Graceful draining",
+  "Stopping new requests to a replica while letting in-flight ones finish before it shuts down.",
+  "6.2"
+ ],
+ [
+  "Concurrency target",
+  "The number of simultaneous requests one replica should handle while meeting the SLO. Autoscalers scale on it.",
+  "6.3"
+ ],
+ [
+  "Scale to zero",
+  "Removing all replicas of an idle deployment, accepting a cold start for the next request.",
+  "6.3"
+ ],
+ [
+  "Power of two choices",
+  "A routing policy: pick two replicas at random and send the request to the less loaded one.",
+  "6.4"
+ ],
+ [
+  "Erlang C",
+  "The queueing formula for c identical servers with random arrivals, used to estimate waiting time at a given utilization.",
+  "6.4"
+ ],
+ [
+  "Reserved, on-demand and spot capacity",
+  "GPU purchasing models: committed blocks at a discount; pay-as-you-go up to a quota; discounted spare capacity that can be reclaimed at short notice.",
+  "6.5"
+ ],
+ [
+  "Canary deployment",
+  "Sending a small share of traffic to a new version, watching its metrics, and raising the share in steps or rolling back.",
+  "6.5"
+ ],
+ [
+  "Blue-green deployment",
+  "Running a full second fleet with the new version and switching all traffic at once.",
+  "6.5"
+ ],
+ [
+  "histogram_quantile",
+  "The PromQL function that estimates a percentile from histogram buckets by linear interpolation inside the bucket that holds it.",
+  "6.6"
+ ],
+ [
+  "DCGM (Data Center GPU Manager)",
+  "NVIDIA's tool for GPU health and performance metrics, exported to Prometheus with dcgm-exporter.",
+  "6.6"
+ ],
+ [
+  "LeaderWorkerSet",
+  "A Kubernetes API that treats a leader pod and its worker pods as one replica, for models sharded across nodes.",
+  "6.7"
+ ],
+ [
+  "TEE (trusted execution environment)",
+  "Hardware-protected execution whose memory the host cannot read, with attestation to prove what is running.",
+  "6.7"
+ ],
+ [
+  "Context engineering",
+  "Designing what goes into a model's context, and in what order, for quality, latency and cache reuse.",
+  "6.8"
+ ],
+ [
+  "Programmatic tool calling",
+  "The model writes code that calls tools inside a sandbox and returns only the processed result to the context.",
+  "6.8"
+ ],
+ [
+  "MCP (Model Context Protocol)",
+  "An open standard for connecting models and agents to tools and data sources.",
+  "6.8"
+ ],
+ [
+  "Xid error",
+  "An error code from the NVIDIA driver in the kernel log, identifying GPU faults such as memory errors or a GPU falling off the bus.",
+  "6.9"
+ ],
+ [
+  "MTTF (mean time to failure)",
+  "Average time between failures; for a group of nodes, 1 ÷ (nodes × failure rate per node).",
+  "6.9"
+ ],
+ [
+  "Retry budget",
+  "A limit on retries per request and across the fleet, so that a partial outage does not turn into a retry storm.",
+  "6.9"
+ ],
+ [
+  "Cache salt",
+  "A per-tenant value mixed into prefix-cache block hashes so only requests with the same salt can share cached KV blocks.",
+  "6.9"
+ ],
+ [
+  "Incident commander",
+  "The person who holds the overall state of an incident, assigns roles and makes decisions.",
+  "6.9"
+ ],
+ [
+  "Pareto curve (throughput vs interactivity)",
+  "An engine's throughput per GPU plotted against tokens per second per user across concurrency levels; a curve above and to the right is better at every operating point.",
+  "6.10"
+ ]
 ]

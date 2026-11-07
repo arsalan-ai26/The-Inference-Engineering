@@ -15,7 +15,7 @@
 <main><article>
 <div class="kicker">Guide</div>
 <h1>Formula sheet</h1>
-<p class="lede">The working formulas from Parts 1 to 3 on one page, with what each symbol means and the chapter that derives it. Below them, one calculator chains the most-used ones for any dense model.</p>
+<p class="lede">The working formulas from every part of the book on one page, with what each symbol means and the chapter that derives it. Below them, one calculator chains the most-used ones for any dense model.</p>
 <h2 id="basics">1. Linear algebra and numbers</h2><div class="tbl"><table><tr><th>What</th><th>Formula</th><th>Notes</th><th>Chapter</th></tr>
 <tr><td>FLOPs of a matmul [m, k] @ [k, n]</td><td class="mono">2 × m × n × k</td><td>One multiply and one add per pair.</td><td><a href="../chapters/1-1-linear-algebra.html">1.1</a></td></tr>
 <tr><td>Bytes a matmul moves</td><td class="mono">≈ (m × k + k × n + m × n) × bytes per number</td><td>Read both inputs, write the output once.</td><td><a href="../chapters/1-1-linear-algebra.html">1.1</a></td></tr>
@@ -59,7 +59,32 @@
 <tr><td>Prefix cache block hash</td><td class="mono">hash(parent hash, this block's token IDs, extra keys)</td><td>A block matches only if everything before it matches.</td><td><a href="../chapters/3-5-prefix-caching-structured-output.html">3.5</a></td></tr>
 <tr><td>Cost per million tokens</td><td class="mono">price per hour ÷ (tokens per second × 3,600 × utilization) × 10⁶</td><td>See the compute guide calculator.</td><td><a href="compute.html#tokens">Guide</a></td></tr>
 </table></div>
-<h2 id="calc">7. Calculator: weights, KV cache and decode floor</h2>
+<h2 id="opt">7. Optimizations (Part 4)</h2><div class="tbl"><table><tr><th>What</th><th>Formula</th><th>Notes</th><th>Chapter</th></tr>
+<tr><td>Symmetric INT4 scale</td><td class="mono">scale = max(|w|) ÷ 7; code = round(w ÷ scale); restored = code × scale</td><td>7 is the largest positive 4-bit signed code.</td><td><a href="../chapters/4-1-quantization.html">4.1</a></td></tr>
+<tr><td>Asymmetric (zero point) quantization</td><td class="mono">scale = (max − min) ÷ (2^bits − 1); z = round(−min ÷ scale); code = round(w ÷ scale) + z; restored = (code − z) × scale</td><td>Uses all levels for skewed ranges.</td><td><a href="../chapters/4-1-quantization.html">4.1</a></td></tr>
+<tr><td>SmoothQuant</td><td class="mono">Y = X W = (X ÷ s)(s W); sⱼ = max|Xⱼ|^α ÷ max|Wⱼ|^(1−α)</td><td>Moves activation outliers into the weights; α is often 0.5.</td><td><a href="../chapters/4-1-quantization.html">4.1</a></td></tr>
+<tr><td>Online softmax update</td><td class="mono">m_new = max(m, max(s)); c = e^(m − m_new); l = l × c + Σ e^(s − m_new); acc = acc × c + Σ e^(s − m_new) × v</td><td>Final output = acc ÷ l.</td><td><a href="../chapters/4-2-efficient-attention.html">4.2</a></td></tr>
+<tr><td>Tokens per target pass (speculative decoding)</td><td class="mono">E = (1 − α^(k+1)) ÷ (1 − α)</td><td>α acceptance rate, k draft length.</td><td><a href="../chapters/4-3-speculative-decoding.html">4.3</a></td></tr>
+<tr><td>Speculative decoding speedup</td><td class="mono">≈ (1 − α^(k+1)) ÷ ((1 − α) × (k × c + 1))</td><td>c = drafter cost per token ÷ target cost per token.</td><td><a href="../chapters/4-3-speculative-decoding.html">4.3</a></td></tr>
+<tr><td>Load or recompute a cached prefix</td><td class="mono">load time per token = KV bytes per token ÷ tier bandwidth; recompute ≈ 2 × parameters ÷ (GPU FLOP/s × MFU)</td><td>Load wins when it is the smaller of the two.</td><td><a href="../chapters/4-4-kv-reuse.html">4.4</a></td></tr>
+<tr><td>GPUs for a model</td><td class="mono">GPUs ≥ (parameters × bytes per parameter + KV budget) ÷ (memory per GPU × usable fraction)</td><td>Round up to a valid parallel layout.</td><td><a href="../chapters/4-5-model-parallelism.html">4.5</a></td></tr>
+<tr><td>KV transfer time (disaggregation)</td><td class="mono">≈ prompt tokens × KV bytes per token ÷ link bandwidth</td><td>Compare with the TTFT budget.</td><td><a href="../chapters/4-6-disaggregation.html">4.6</a></td></tr>
+</table></div>
+<h2 id="gpu">8. GPU programming (Part 5)</h2><div class="tbl"><table><tr><th>What</th><th>Formula</th><th>Notes</th><th>Chapter</th></tr>
+<tr><td>Global thread index</td><td class="mono">i = blockIdx.x × blockDim.x + threadIdx.x</td><td>Each thread handles element i (if i is in range).</td><td><a href="../chapters/5-3-cuda-execution-model.html">5.3</a></td></tr>
+<tr><td>Occupancy</td><td class="mono">resident warps per SM ÷ maximum warps per SM</td><td>Limited by registers, shared memory and block size.</td><td><a href="../chapters/5-2-gpu-architecture.html">5.2</a></td></tr>
+<tr><td>Time of a memory-bound kernel</td><td class="mono">≥ bytes read and written ÷ memory bandwidth</td><td>Fusion lowers the bytes, not the FLOPs.</td><td><a href="../chapters/5-4-kernels-fusion-triton.html">5.4</a></td></tr>
+</table></div>
+<h2 id="prod">9. Production (Part 6)</h2><div class="tbl"><table><tr><th>What</th><th>Formula</th><th>Notes</th><th>Chapter</th></tr>
+<tr><td>Requests in flight (Little's law)</td><td class="mono">in flight = arrival rate × (TTFT + output tokens × TPOT)</td><td>The concurrency to provision for.</td><td><a href="../chapters/6-3-autoscaling.html">6.3</a></td></tr>
+<tr><td>Replicas</td><td class="mono">⌈in flight ÷ (concurrency target × headroom)⌉</td><td>Headroom such as 0.8 covers spikes during cold starts.</td><td><a href="../chapters/6-3-autoscaling.html">6.3</a></td></tr>
+<tr><td>Utilization of c servers</td><td class="mono">ρ = arrival rate ÷ (c × service rate)</td><td>Waits grow steeply as ρ nears 1 (Erlang C).</td><td><a href="../chapters/6-4-routing-queueing.html">6.4</a></td></tr>
+<tr><td>Dedicated cost per million output tokens</td><td class="mono">GPU $/hour ÷ (output tokens/s per GPU at the SLO × 3,600 × average utilization) × 10⁶</td><td>Utilization often matters as much as the GPU price.</td><td><a href="../chapters/6-5-capacity-cost.html">6.5</a></td></tr>
+<tr><td>Percentile from a histogram</td><td class="mono">lower bound + (upper − lower) × (rank − count below) ÷ (count in bucket)</td><td>What histogram_quantile computes; merge buckets before computing.</td><td><a href="../chapters/6-6-observability-correctness.html">6.6</a></td></tr>
+<tr><td>Mean time to failure</td><td class="mono">MTTF = 1 ÷ (nodes × failures per node per unit time)</td><td>A 512-node job at 6.5 per 1,000 node-days: about 7 hours.</td><td><a href="../chapters/6-9-fault-tolerance-security.html">6.9</a></td></tr>
+<tr><td>Error budget</td><td class="mono">allowed failures = (1 − SLO) × requests</td><td>99.9% of 1,000,000 requests: 1,000 failures.</td><td><a href="../chapters/6-6-observability-correctness.html">6.6</a></td></tr>
+</table></div>
+<h2 id="calc">10. Calculator: weights, KV cache and decode floor</h2>
 <div class="widget">
 <div class="wt">Interactive: one dense model on one GPU</div>
 <div class="ws">Defaults are Llama 3.1 8B (32 layers, 8 KV heads, head size 128) on an H100 SXM (80 GB, 3.35 TB/s), matching chapter 2.4 Example C. Memory checks use a 0.92 memory fraction and a 2 GB runtime reserve, as in chapter 2.4. Step time is a lower bound, so real engines are slower.</div>
