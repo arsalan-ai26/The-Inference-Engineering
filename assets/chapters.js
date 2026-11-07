@@ -165,7 +165,7 @@ window.IE_CHAPTERS = [
 "title": "Prefix caching and KV reuse",
 "slug": "4-4-kv-reuse",
 "part": 4,
-"ready": false
+"ready": true
 },
 {
 "n": "4.5",

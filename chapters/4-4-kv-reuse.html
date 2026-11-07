@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>4.4 Prefix caching and KV reuse</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="4.4">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 4 · Chapter 4.4</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 4 · Model optimization · Chapter 4.4</div>
+<h1>Prefix caching and KV reuse at scale</h1>
+<p class="lede">Chapter 3.5 showed how one engine reuses the KV cache of a shared prefix: block hashes in vLLM, a radix tree in SGLang. This chapter treats reuse as a system-wide optimization. It covers what a cache hit is worth in time and money, how prompt design makes or breaks hits, where to keep the cache when GPU memory is full (CPU memory, SSD, a shared network store), when loading a saved cache beats recomputing it, and how routing across replicas decides whether the cache helps at all.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 4 hours with the lab</span>
+  <span class="chip">Needs: 2.4, 3.3, 3.5</span>
+  <span class="chip">Compute: Colab CPU; T4 for Part E</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Your system prompt starts with "Current time: {now}". What happens to the prefix cache?</li>
+    <li>Is it faster to reload 10,000 tokens of Llama 3.1 8B KV cache from CPU memory, or to recompute them on an H100?</li>
+    <li>Four replicas, round-robin routing, each user chats for ten turns. Roughly what share of turns can hit the cache?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Every request has a different first block, so nothing after it can ever match. The hit rate is close to zero.</li>
+    <li>Reload. 10,000 tokens × 128 KiB is about 1.3 GB, about 26 ms over a 50 GB/s host link. Recomputing is about 160 TFLOP, about 330 ms at half the H100's BF16 peak.</li>
+    <li>About one in four: a turn hits only if it lands on the replica that served an earlier turn of the same chat, and with round robin that is mostly luck.</li>
+  </ol></details>
+</div>
+
+<h2 id="worth">1. What a cache hit is worth</h2>
+<p>A prefix cache hit skips prefill for the matched tokens. That saves three things:</p>
+<ul>
+  <li><strong>Latency.</strong> TTFT drops roughly in proportion to the cached share of the prompt. The llm-d team measured a 10,000-token prompt to Qwen3-32B: 4.3 s TTFT the first time, 0.6 s the second time.</li>
+  <li><strong>GPU time, so throughput.</strong> Prefill compute that is skipped is free for other requests. Under load this raises total throughput, not only TTFT.</li>
+  <li><strong>Money.</strong> Hosted APIs price cached input tokens far below uncached ones (the llm-d post quotes a 10 times difference for one major API at the time it was written). Self-hosted, the saving shows up as fewer GPUs for the same traffic.</li>
+</ul>
+<div class="box ex">
+  <span class="lbl">Worked example: an agent loop</span>
+  <p>An agent makes 20 calls per task. Each call re-sends a 4,000-token system prompt with tool definitions plus a history that grows by 1,500 tokens per call, and produces about 150 tokens. Total prompt tokens over the task: 20 × 4,000 + 1,500 × (0 + 1 + ... + 19) = 80,000 + 285,000 = 365,000. With perfect prefix caching, each call prefills only its new tokens: 4,000 once plus 1,500 per call after the first, about 32,500 in total. Prefill work drops about 11 times. Production agent traces with input-to-output ratios above 100 to 1 are common, which is why the KV cache hit rate is often called the most important metric for agent serving.</p>
+</div>
+
+<h2 id="design">2. Prompt design decides the hit rate</h2>
+<p>A prefix match stops at the first token that differs (chapter 3.5). Everything after it is recomputed, even if the rest is identical. So the order of content in the prompt matters more than any engine setting.</p>
+<ol>
+  <li><strong>Stable first, variable last.</strong> System prompt, then tool definitions, then shared documents, then the conversation, then the new message. User names, timestamps and request IDs go at the end, or nowhere.</li>
+  <li><strong>Make "stable" truly byte-stable.</strong> Same whitespace, same tool order, same JSON key order, same document order. Serializing a dict whose key order changes between processes silently kills hits.</li>
+  <li><strong>Watch the chat template.</strong> Templates can insert content you did not write. Some insert today's date into the system prompt by default; the date changes once a day and every cache entry before it becomes useless at midnight. Many reasoning-model templates drop earlier turns' reasoning from the history. The engine cached turn 1 with its reasoning; turn 2's prompt shows turn 1 without it, so the cache matches only up to the end of turn 1's prompt. Part B of the lab shows this with a real template.</li>
+  <li><strong>Append, do not edit.</strong> Agent frameworks that rewrite or summarize the middle of the history break the prefix at the edit point. Editing at the end keeps the cache.</li>
+  <li><strong>RAG ordering.</strong> If retrieved documents change order between queries, the shared prefix ends at the first document. Sorting retrieved chunks in a stable order (for example by document ID) can help, when quality allows.</li>
+</ol>
+<div class="widget" id="pdW">
+  <div class="wt">Interactive: where the variable part goes</div>
+  <div class="ws">A 6,000-token prompt made of five parts. Choose the position of the part that changes per request (the user's details) and see how many tokens later requests can reuse. Blocks of 16 tokens.</div>
+  <div class="ctrls">
+    <label>Variable part position <select id="pdP"><option value="0">1st (before everything)</option><option value="1">2nd (after system prompt)</option><option value="2">3rd (after tools)</option><option value="3">4th (after documents)</option><option value="4" selected>5th (last)</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="pdSvg" viewBox="0 0 680 110" width="680" style="max-width:100%;height:auto" role="img" aria-label="Prompt parts and the reusable prefix"></svg></div>
+  <div class="stats" id="pdStats"></div>
+</div>
+
+<h2 id="measure">3. Measuring reuse</h2>
+<ul>
+  <li><strong>Hit rate in tokens, not requests.</strong> A request that hits 90% of a 10,000-token prompt saves far more than one that hits 50% of a 200-token prompt. vLLM reports cache queries and hits in tokens (chapter 3.1); hit tokens ÷ queried tokens is the hit rate.</li>
+  <li><strong>TTFT by cache state.</strong> A healthy cached workload shows two TTFT populations: hits (fast) and misses (slow). If p50 TTFT moves while the hit rate falls, check prompt changes first.</li>
+  <li><strong>Eviction pressure.</strong> Under load, free KV memory shrinks and cached blocks are evicted (chapter 3.5). The hit rate falls exactly when it matters most. That is the main reason to extend the cache beyond GPU memory.</li>
+</ul>
+
+<h2 id="tiers">4. Where the cache can live</h2>
+<p>GPU memory is the fastest place for KV blocks and the smallest. Below it are tiers that are slower but much larger:</p>
+<div class="tbl"><table>
+<tr><th>Tier</th><th>Memory</th><th>Bandwidth to the GPU (approximate)</th><th>Size (approximate)</th></tr>
+<tr><td>G1</td><td>GPU memory (HBM)</td><td>Terabytes per second</td><td>Tens to hundreds of GB</td></tr>
+<tr><td>G2</td><td>CPU memory (host DRAM)</td><td>Tens to hundreds of GB/s</td><td>Hundreds of GB to TB</td></tr>
+<tr><td>G3</td><td>Local SSD</td><td>About 5 to 10 GB/s</td><td>Terabytes</td></tr>
+<tr><td>G4</td><td>Networked storage</td><td>Gigabytes per second</td><td>Tens of TB and more; shared by all replicas</td></tr>
+</table></div>
+<p>The usual policy keeps hot blocks in G1, moves blocks that would otherwise be evicted down to G2 (and G3), and promotes them back on a hit. A shared G4 store adds something the others cannot: every replica can find a prefix any replica computed, and the cache survives a replica being restarted or scaled down. Systems with a fast CPU to GPU link (for example GB200, where the Grace CPU connects over NVLink-C2C) make G2 especially attractive.</p>
+<h3>Tools</h3>
+<ul>
+  <li><strong>vLLM's OffloadingConnector:</strong> copies completed KV blocks to pinned CPU memory (and optionally to secondary tiers such as a file system), and promotes them back on a hit. Configured through <code>--kv-transfer-config</code>.</li>
+  <li><strong>LMCache:</strong> a KV caching layer for vLLM and SGLang that stores caches in CPU memory, disk or remote stores, shares them across engine instances, and also moves KV for prefill/decode disaggregation (chapter 4.6).</li>
+  <li><strong>NVIDIA Dynamo's KV Block Manager (KVBM):</strong> APIs for moving KV blocks among G1 to G4 (chapter 3.6).</li>
+  <li><strong>Mooncake:</strong> Moonshot AI's KV-cache-centric architecture for its Kimi service, which pools the cluster's spare CPU memory and SSDs into a distributed KV cache. Its paper reports handling 75% more requests on real workloads.</li>
+</ul>
+<pre>vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --kv-transfer-config '{"kv_connector": "OffloadingConnector", "kv_role": "kv_both",
+                         "kv_connector_extra_config": {"cpu_bytes_to_use": 20000000000}}'</pre>
+
+<h2 id="load">5. Load or recompute?</h2>
+<p>Reusing a cache from a lower tier is only worth it if moving the bytes is faster than prefilling the tokens again. Both costs grow linearly with the number of tokens, so compare per token:</p>
+<div class="formula">load time per token = KV bytes per token ÷ tier bandwidth<br>recompute time per token ≈ 2 × parameters ÷ (GPU FLOP/s × MFU)</div>
+<div class="widget" id="lrW">
+  <div class="wt">Interactive: load from a tier, or recompute?</div>
+  <div class="ws">Per-token costs for one replica. Recompute uses an H100's BF16 peak (989 TFLOP/s) times the MFU you choose, per GPU. Attention FLOPs are ignored, so recompute is really even slower at long contexts.</div>
+  <div class="ctrls">
+    <label>Model <select id="lrM"><option value="8">Llama 3.1 8B on 1 H100</option><option value="70">Llama 3.1 70B on 4 H100s (TP 4)</option><option value="ds">DeepSeek-V3 (MLA) on 8 H200s</option></select></label>
+    <label>KV precision <select id="lrK"><option value="2">BF16</option><option value="1">FP8</option></select></label>
+    <label>Prefill MFU: <span class="mono" id="lrUv"></span><input type="range" id="lrU" min="0.2" max="0.7" step="0.05" value="0.5"></label>
+  </div>
+  <div class="svgwrap"><svg id="lrSvg" viewBox="0 0 680 210" width="680" style="max-width:100%;height:auto" role="img" aria-label="Load time per tier against recompute time"></svg></div>
+  <div class="ws" id="lrNote"></div>
+</div>
+<p>The pattern holds broadly: reloading from CPU memory beats recomputation by an order of magnitude; local SSD is roughly break-even to a few times better; a slow network store can lose to recomputation for small models but wins for large ones, where recomputing costs far more FLOPs per KV byte. Compact caches (GQA, MLA, FP8 KV) make every tier more attractive, because fewer bytes stand in for the same tokens. Real systems also overlap loading with computing other layers, which hides part of the load time.</p>
+
+<h2 id="routing">6. Routing decides whether the cache helps</h2>
+<p>Every replica has its own cache. A request only hits if it lands on a replica that holds its prefix. Ordinary load balancers (round robin, least connections) are blind to this and scatter related requests. Options, from simplest:</p>
+<ul>
+  <li><strong>Session or hash affinity:</strong> hash the user, session or system-prompt ID to a replica. Simple and effective, but hot customers overload "their" replica.</li>
+  <li><strong>Approximate prefix-aware routing:</strong> the router remembers which replica it sent each prefix to and predicts where it is cached.</li>
+  <li><strong>Precise prefix-aware routing:</strong> replicas publish events every time a block is stored or evicted; the router keeps a live index of which blocks are on which replica (and in which tier) and scores each replica by how much of the request's prefix it holds. The score is combined with load, so a hot replica does not get swamped.</li>
+</ul>
+<p>The llm-d benchmark (8 vLLM pods on 16 H100s, 150 simulated enterprise customers with 6,000-token contexts) compared these: precise prefix-aware scheduling reached a p90 TTFT of 0.54 s against over 31 s for the approximate scheduler and over 90 s for cache-blind ones, with about twice the throughput of cache-blind routing. Part D of the lab reproduces the shape of this result in a small simulator. Chapter 6.4 covers routers, queues and fairness in depth.</p>
+
+<h2 id="beyond">7. Beyond exact prefixes</h2>
+<p>Prefix caching only reuses an exact prefix, because each token's keys and values depend on every token before it and on its position (chapter 2.3). RAG breaks this constantly: the same document appears in different prompts at different positions after different documents. CacheBlend reuses each document's precomputed KV wherever it appears and recomputes only a small subset of tokens to repair the cross-attention between chunks, keeping quality close to full prefill. LMCache implements this kind of non-prefix reuse. It is an approximation: evaluate it on your own data before relying on it.</p>
+
+<h2 id="expert">8. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Cache capacity is a sizing decision</span>
+  <p>Engines size the GPU KV pool from free memory after weights (chapter 2.4). In TensorRT-LLM, for example, <code>free_gpu_memory_fraction</code> = 0.8 on a 180 GB B200 with 100 GB of weights and buffers gives a 64 GB pool. A large, mostly idle pool is a cache; under load it is working memory. Plan the CPU tier so that the working set of hot prefixes (system prompts, active sessions, popular documents) fits there.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Isolation and security</span>
+  <p>A shared cache can leak: if one tenant's request gets a faster TTFT because another tenant's prompt is cached, timing reveals that the other prompt existed. Multi-tenant systems can scope cache keys per tenant (vLLM supports a cache salt in the request, chapter 3.5). Chapter 6.9 returns to this.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">The same machinery serves disaggregation</span>
+  <p>Moving KV blocks between GPU, CPU, disk and network is exactly what prefill/decode disaggregation needs to move a request from a prefill GPU to a decode GPU. LMCache, Mooncake and Dynamo do both. Chapter 4.6 builds on this.</p>
+</div>
+
+<h2 id="mistakes">9. Common mistakes</h2>
+<ul>
+  <li>Putting timestamps, user IDs or request IDs at the start of the prompt.</li>
+  <li>Reporting the hit rate in requests instead of tokens.</li>
+  <li>Assuming prefix caching only helps TTFT; it frees prefill compute for everyone.</li>
+  <li>Scaling out replicas behind a round-robin balancer and watching the hit rate fall.</li>
+  <li>Pure affinity routing with no load cap, so one busy customer saturates one replica.</li>
+  <li>Offloading to a slow network store for a small model, where recomputation is faster.</li>
+  <li>Changing the chat template or tool definitions in a deploy and not expecting a cold-cache period.</li>
+</ul>
+
+<h2 id="lab">10. Lab</h2>
+<p><strong>Goal:</strong> see prompt layout decide the hit rate with a real tokenizer and template, compute when to load vs recompute, and compare routing policies in a simulator.</p>
+<h3>Part A: the 100 Days notebook</h3>
+<p>Run day 16 (prefix caching and cache-aware routing) of <em>100 Days of Inference</em>. Do its "rework the memory budget" experiment. Then read its takeaways against the note in References.</p>
+<h3>Part B: prompt layout with a real template (CPU, seconds)</h3>
+<p>This implements block hashing (chapter 3.5) over real Qwen3 token IDs and serves three requests with two layouts. Then it shows what a reasoning model's chat template does to multi-turn reuse.</p>
+<pre>from transformers import AutoTokenizer
+import hashlib
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+B = 16
+def block_hashes(ids):
+    hs, parent = [], b""
+    for i in range(0, len(ids) - len(ids) % B, B):          # full blocks only
+        parent = hashlib.sha256(parent + str(ids[i:i+B]).encode()).digest()
+        hs.append(parent)
+    return hs
+cache = set()
+def serve(ids):
+    hs = block_hashes(ids); hit = 0
+    for h in hs:
+        if h in cache: hit += 1
+        else: break
+    cache.update(hs)
+    return hit * B, len(ids)
+
+DOCS = "Refund policy: " + " ".join(f"Rule {i}: items in category {i} can be returned "
+                                   f"within {i+10} days with a receipt." for i in range(60))
+def bad(user, q, t):  return [{"role": "system", "content": f"Time: {t}. User: {user}.\n{DOCS}"},
+                              {"role": "user", "content": q}]
+# TODO: write good(user, q, t) that keeps the same information but maximizes reuse
+
+for name, build in [("variable fields first", bad), ("variable fields last", good)]:
+    cache.clear(); tot = hits = 0
+    for i, (u, q) in enumerate([("ana", "Can I return a lamp?"), ("bo", "Return window for shoes?"),
+                                ("cy", "Do I need a receipt?")]):
+        ids = tok.apply_chat_template(build(u, q, f"2026-11-07 10:0{i}:13"), add_generation_prompt=True,
+                                      tokenize=True, return_dict=True)["input_ids"]
+        h, n = serve(ids); tot += n; hits += h
+        print(f"{name}: request {i+1}: {h} of {n} tokens from cache")
+    print(name, "hit rate", round(hits / tot, 2))</pre>
+<details><summary>Solution</summary>
+<pre>def good(user, q, t): return [{"role": "system", "content": DOCS},
+                              {"role": "user", "content": f"(User: {user}. Time: {t}.) {q}"}]</pre>
+<p>Measured: with variable fields first, requests 2 and 3 reuse only 16 of about 1,410 tokens (the first block happens to match), a 1% hit rate overall. With variable fields last they reuse 1,360 tokens each, 64% overall (the first request is always a miss).</p></details>
+<p><strong>Now the reasoning template.</strong> Add this and predict the shared prefix before running:</p>
+<pre>turn1 = [{"role": "user", "content": "What is 17 * 23?"}]
+p1 = tok.apply_chat_template(turn1, add_generation_prompt=True, tokenize=False)
+answer = "&lt;think&gt;\n17*23 = 17*20 + 17*3 = 340 + 51 = 391.\n&lt;/think&gt;\n\n391"
+seen = p1 + answer                       # what the engine has cached after turn 1
+turn2 = turn1 + [{"role": "assistant", "content": answer}, {"role": "user", "content": "And 17 * 24?"}]
+p2 = tok.apply_chat_template(turn2, add_generation_prompt=True, tokenize=False)
+a, b = tok(seen).input_ids, tok(p2).input_ids
+common = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+print(len(a), len(b), common); print(p2)</pre>
+<details><summary>What we measured, and why</summary><p>Turn 1 left 58 tokens in the cache; turn 2's prompt is 40 tokens and shares only 18 with it. The template rendered turn 1's answer as just "391": the reasoning was removed from the history. Everything from turn 1's answer onwards must be prefilled again. With long reasoning traces and many turns this costs a lot, which is why some serving stacks and newer templates keep reasoning in the history for agent loops. Check your model's template.</p></details>
+
+<h3>Part C: load or recompute</h3>
+<p>Use the formula in section 5. For Llama 3.1 70B on 4 H100s at 50% MFU with a BF16 KV cache (320 KiB per token), compute the time to reuse a 32,000-token prefix from CPU memory (assume 4 × 50 GB/s, one link per GPU), from local NVMe (7 GB/s), and from a network store (2 GB/s), and the time to recompute it.</p>
+<details><summary>Answer</summary><p>KV for 32,000 tokens: 32,000 × 327,680 bytes = 10.5 GB. CPU: 10.5 ÷ 200 = 52 ms. NVMe: 1.5 s. Network: 5.2 s. Recompute: 32,000 × 2 × 70.6 × 10⁹ = 4.5 PFLOP; at 4 × 989 × 0.5 = 1,978 TFLOP/s that is about 2.3 s (more with attention FLOPs at this length). CPU wins by far; NVMe beats recomputation; a 2 GB/s network store loses.</p></details>
+
+<h3>Part D: routing policies (CPU, seconds)</h3>
+<p>Four replicas, each with an LRU cache of 3,000 blocks. 40 customers share 6,000-token contexts; a few customers send most of the traffic; each query adds 1,200 unique tokens.</p>
+<pre>import random
+from collections import OrderedDict
+random.seed(1)
+R, CAP, B = 4, 3000, 16
+CUST, CTX, Q = 40, 6000, 1200
+
+class Replica:
+    def __init__(s): s.cache, s.work = OrderedDict(), 0
+    def cached(s, blocks):
+        n = 0
+        for b in blocks:
+            if b in s.cache: n += 1
+            else: break
+        return n
+    def serve(s, blocks):
+        n = s.cached(blocks)
+        for b in blocks:
+            s.cache[b] = True; s.cache.move_to_end(b)
+        while len(s.cache) > CAP: s.cache.popitem(last=False)
+        s.work += (len(blocks) - n) * B          # prefill tokens actually computed
+        return n * B
+
+def request():
+    c = random.choices(range(CUST), weights=[1 / (i + 1) for i in range(CUST)])[0]
+    return c, [("ctx", c, i) for i in range(CTX // B)] + [("q", random.random(), i) for i in range(Q // B)]
+
+def run(policy, n=3000):
+    reps = [Replica() for _ in range(R)]; hit = tot = rr = 0
+    for _ in range(n):
+        c, blocks = request()
+        if policy == "round robin":    r = reps[rr % R]; rr += 1
+        elif policy == "least loaded": r = min(reps, key=lambda x: x.work)
+        elif policy == "hash affinity": r = reps[c % R]
+        else:
+            # TODO: cache-aware with a load cap. Keep replicas whose work is at most
+            # 1.15 x the mean, and among them pick the one with the longest cached prefix.
+            pass
+        hit += r.serve(blocks); tot += len(blocks) * B
+    w = [x.work for x in reps]
+    return hit / tot, sum(w), max(w) / (sum(w) / R)
+
+for p in ["round robin", "least loaded", "hash affinity", "cache-aware + load cap"]:
+    h, work, imb = run(p)
+    print(f"{p:24s} hit {h:5.1%}  prefill computed {work/1e6:5.2f} M tokens  busiest/mean {imb:4.2f}")</pre>
+<details><summary>Solution</summary>
+<pre>            mean = sum(x.work for x in reps) / R
+            ok = [x for x in reps if x.work &lt;= mean * 1.15 + 1] or reps
+            r = max(ok, key=lambda x: (x.cached(blocks), -x.work))</pre></details>
+<details><summary>What we measured, and why</summary><pre class="out">round robin              hit 33.3%  prefill computed 14.41 M tokens  busiest/mean 1.03
+least loaded             hit 34.4%  prefill computed 14.16 M tokens  busiest/mean 1.00
+hash affinity            hit 64.5%  prefill computed  7.67 M tokens  busiest/mean 1.40
+cache-aware + load cap   hit 64.7%  prefill computed  7.62 M tokens  busiest/mean 1.00</pre>
+<p>Cache-blind policies balance load but compute almost twice the prefill. Hash affinity gets the hits but overloads the replica that owns the busiest customers by 40%. Cache-aware routing with a load cap gets both. Try CAP = 1,000 (smaller caches) and R = 8: affinity matters even more.</p></details>
+
+<h3>Part E: TTFT with and without the cache, and CPU offload (T4)</h3>
+<p>Serve Qwen2.5-1.5B-Instruct on a T4. Send ten requests that share a 3,000-token system prompt with different questions, first with <code>--no-enable-prefix-caching</code>, then with the default. Compare TTFT p50 and the hit counters on <code>/metrics</code>. Then restart with <code>--gpu-memory-utilization 0.5</code> plus the OffloadingConnector from section 4, flood the engine with unrelated long prompts to evict the system prompt from GPU memory, and send the shared prompt again. Did the hit come back from CPU memory? Explain the TTFT you see with section 5.</p>
+
+<h2 id="realworld">11. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Reuse in production</span>
+  <ul>
+    <li><strong>Hosted APIs</strong> price cached input tokens far below uncached ones and document how to structure prompts to get hits.</li>
+    <li><strong>Agent and coding products</strong> design prompts and history handling around the cache, because their inputs are long, repeated and mostly append-only.</li>
+    <li><strong>Large deployments</strong> run prefix-aware routers (llm-d, Dynamo, SGLang's router) and tiered KV stores (LMCache, Mooncake, KVBM).</li>
+    <li><strong>Kimi</strong> (Moonshot AI) built its serving platform, Mooncake, around a distributed KV cache over the cluster's CPU memory and SSDs.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">12. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz44"></div>
+<script type="application/json" id="qz44">[
+{"q":"Where should a per-request timestamp go in a prompt?","o":["At the start, for clarity","At the end, or nowhere","In the middle","It does not matter"],"a":1,"e":"Anything that changes per request ends the shared prefix at that point."},
+{"q":"Prefix caching mainly saves:","o":["Decode time per token","Prefill compute, which lowers TTFT and frees GPU time for other requests","Weight memory","Network bandwidth"],"a":1,"e":"Skipped prefill helps the request and everyone sharing the GPU."},
+{"q":"Reloading KV from CPU memory vs recomputing it is usually:","o":["Slower","Much faster","Exactly equal","Impossible"],"a":1,"e":"Bytes over a host link take far less time than recomputing the FLOPs."},
+{"q":"Why do compact caches (GQA, MLA, FP8 KV) make lower tiers more attractive?","o":["They are encrypted","Fewer bytes stand in for the same tokens, so loading is cheaper relative to recomputation","They skip attention","They need no PCIe"],"a":1,"e":"Load cost scales with bytes; recompute cost with FLOPs."},
+{"q":"Pure hash affinity routing risks:","o":["Lower hit rates","Overloading the replica that owns the busiest customers","Wrong outputs","Losing the cache"],"a":1,"e":"Affinity must be balanced against load."},
+{"q":"A reasoning model's template removes earlier reasoning from the history. Turn 2 can reuse:","o":["Everything from turn 1","Only up to the end of turn 1's prompt","Nothing","Only the reasoning"],"a":1,"e":"The cached sequence included the reasoning; the new prompt does not, so they diverge there."},
+{"q":"What does CacheBlend add?","o":["Exact reuse of prefixes","Reuse of documents' KV at any position, with selective recomputation","FP4 caches","Routing"],"a":1,"e":"It repairs cross-attention by recomputing a small subset of tokens; it is approximate."}
+]</script>
+
+<h2 id="summary">13. Summary</h2>
+<ul>
+  <li>A cache hit skips prefill: lower TTFT, more throughput, lower cost. Agents and chat gain the most.</li>
+  <li>Prompt design decides the hit rate: stable content first, byte-stable serialization, and templates that do not inject changing content or rewrite history.</li>
+  <li>Measure hit rate in tokens, and watch it fall under load as blocks are evicted.</li>
+  <li>Extend the cache to CPU memory, SSD and shared network stores; reload from CPU almost always beats recomputation, and compact caches widen the advantage.</li>
+  <li>Route by cache contents, balanced with load; cache-blind routing throws most of the cache away.</li>
+  <li>Non-prefix reuse (CacheBlend) is possible but approximate.</li>
+</ul>
+
+<h2 id="refs">14. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 5.3</td><td>Prefix caching and context engineering, the G1 to G4 storage tiers, KVBM, and cache-aware routing.</td></tr>
+<tr><td><a href="https://llm-d.ai/blog/kvcache-wins-you-can-see">llm-d: KV-cache wins you can see</a></td><td>The 4.3 s to 0.6 s example, KV events and a live block index, and the routing benchmark.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/features/kv_offloading_usage/">vLLM: KV offloading usage guide</a></td><td>The OffloadingConnector, CPU and secondary tiers, and configuration.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2510.09665">LMCache</a></td><td>A KV caching layer across engines, tiers and disaggregation.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2407.00079">Mooncake</a></td><td>A KV-cache-centric architecture for a large production service.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2405.16444">CacheBlend</a></td><td>Reusing non-prefix KV with selective recomputation.</td></tr>
+<tr><td>Fuheng Wu, <em>Distributed AI Systems</em>, KV cache and serving chapters</td><td>KV management across a distributed deployment.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 16</td><td>Prompt design for caching, the storage hierarchy and a routing simulator.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The day 16 takeaways of <em>100 Days of Inference</em> say prefix-caching savings land in TTFT, not throughput. Under load, skipped prefill frees GPU time for other requests, so throughput rises too; the llm-d benchmark measured about twice the throughput with cache-aware routing.</li>
+  <li>The 10 times price ratio between cached and uncached tokens is the one quoted in the llm-d post for one API when it was written. Provider prices change; check current pricing pages.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Lab Parts B and D were run on CPU with Transformers 5.22 and Python 3.13.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+/* prompt layout */
+const PARTS=[{n:'System prompt',t:1200,c:'--pre'},{n:'Tools',t:1800,c:'--kv'},{n:'Documents',t:2600,c:'--dec'},{n:'History',t:350,c:'--good'}];
+function pd(){const pos=+$('pdP').value;const parts=PARTS.slice();parts.splice(pos,0,{n:'User details (varies)',t:50,c:'--bad',v:true});
+  const svg=$('pdSvg');svg.innerHTML='';const tot=parts.reduce((a,p)=>a+p.t,0);let x=0,reuse=0,stop=false;
+  parts.forEach(p=>{const w=680*p.t/tot;el('rect',{x,y:20,width:Math.max(w-2,3),height:40,rx:4,fill:css(p.c),'fill-opacity':stop||p.v?.35:.9},svg);
+    if(w>70)el('text',{x:x+6,y:45,fill:stop||p.v?css('--ink'):'#fff','font-size':12},svg,p.n);
+    if(p.v)stop=true;if(!stop)reuse+=p.t;x+=w;});
+  reuse=Math.floor(reuse/16)*16;
+  el('rect',{x:0,y:70,width:680*reuse/tot,height:8,fill:css('--kv')},svg);
+  el('text',{x:0,y:100,fill:css('--ink2'),'font-size':12},svg,'Reusable prefix for the next request (teal bar)');
+  $('pdStats').innerHTML=[['Tokens reused per later request',IE.int(reuse)],['Prefill per later request',IE.int(tot-reuse)+' tokens'],['Prefill saved',Math.round(reuse/tot*100)+'%']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+$('pdP').addEventListener('input',pd);IE.onTheme(pd);
+/* load vs recompute */
+const MODELS={'8':{P:8.03e9,kv:131072,g:1,n:'Llama 3.1 8B'},'70':{P:70.6e9,kv:327680,g:4,n:'Llama 3.1 70B'},'ds':{P:37e9,kv:70272,g:8,n:'DeepSeek-V3 (37B active)',mla:true}};
+function lr(){const m=MODELS[$('lrM').value],kb=+$('lrK').value/2,U=+$('lrU').value;$('lrUv').textContent=Math.round(U*100)+'%';
+  const kv=m.kv*kb;const rec=2*m.P/(m.g*989e12*U);
+  const tiers=[['G2 CPU memory',50e9*(m.mla?1:m.g)],['G3 local NVMe',7e9],['G4 network store',2e9]];
+  const rows=[['Recompute',rec,'--dec']].concat(tiers.map(t=>['Load: '+t[0],kv/t[1],'--kv']));
+  const svg=$('lrSvg');svg.innerHTML='';const mx=Math.max(...rows.map(r=>r[1]));
+  rows.forEach((r,i)=>{const y=12+i*48;el('text',{x:0,y:y+21,fill:css('--ink'),'font-size':13},svg,r[0]);
+    const w=250*r[1]/mx;el('rect',{x:190,y,width:Math.max(w,2),height:30,rx:4,fill:css(r[2])},svg);
+    el('text',{x:196+w,y:y+20,fill:css('--ink'),'font-size':12},svg,(r[1]*1e6).toFixed(1)+' µs/token'+(i?(r[1]<rec?'  ('+(rec/r[1]).toFixed(1)+'× faster)':'  (slower)'):''));});
+  $('lrNote').textContent=`${m.n}: ${IE.int(kv/1024)} KiB of KV per token${m.mla?' (MLA latent: every GPU needs the same latent, so the CPU load runs at the speed of one link)':''}. CPU bandwidth assumes about 50 GB/s per GPU over PCIe 5; one SSD and one network link are shared by the node.`;}
+['lrM','lrK','lrU'].forEach(id=>$(id).addEventListener('input',lr));IE.onTheme(lr);
+})();
+</script>
+
+</body>
+</html>
