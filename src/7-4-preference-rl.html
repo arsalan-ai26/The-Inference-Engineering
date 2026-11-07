@@ -114,7 +114,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 name = "Qwen/Qwen2.5-0.5B-Instruct"
 tok = AutoTokenizer.from_pretrained(name)
-model = get_peft_model(AutoModelForCausalLM.from_pretrained(name),
+model = get_peft_model(AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16),
                        LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", task_type="CAUSAL_LM"))
 pairs = [("What is the capital of France?", "Paris.", "Great question! The capital of France is Paris, a beautiful city known for many things."),
          ("How many legs does a spider have?", "Eight.", "Great question! Spiders have eight legs, which is one of their defining features."),

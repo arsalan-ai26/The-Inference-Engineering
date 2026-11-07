@@ -354,7 +354,7 @@ window.IE_CHAPTERS = [
 "title": "Evaluating and serving fine-tuned models",
 "slug": "7-6-evaluating-serving-finetuned",
 "part": 7,
-"ready": false
+"ready": true
 },
 {
 "n": "7.7",

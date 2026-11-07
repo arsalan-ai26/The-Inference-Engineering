@@ -139,7 +139,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
 name = "Qwen/Qwen2.5-0.5B-Instruct"
 tok = AutoTokenizer.from_pretrained(name)
-model = AutoModelForCausalLM.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32)
 model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", task_type="CAUSAL_LM"))
 model.print_trainable_parameters()
 facts = [(f"What is the support code for region {c}?", f"The support code for region {c} is ZX-{100+i}.")

@@ -117,8 +117,8 @@
 <pre>import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-inst = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct").eval()
-base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B").eval()
+inst = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype=torch.float32).eval()
+base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B", dtype=torch.float32).eval()
 prompts = ["Give me three tips for writing clear emails.", "What is the boiling point of water at sea level?",
            "Explain what a hash table is.", "Write a haiku about the monsoon.", "How do I reverse a list in Python?"]
 tot = top1 = top3 = 0; shifted = []

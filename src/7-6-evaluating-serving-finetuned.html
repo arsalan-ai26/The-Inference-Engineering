@@ -1,0 +1,211 @@
+<div class="kicker">Part 7 · Fine-tuning and post-training · Chapter 7.6</div>
+<h1>Evaluating and serving fine-tuned models</h1>
+<p class="lede">A fine-tune is finished only when you can show it is better on the task, no worse elsewhere, and served correctly. This chapter covers building a task evaluation and regression checks, the statistics of "is this really better?", the many ways evaluation numbers fail to reproduce, then serving: merging an adapter or keeping it separate, the precision trap in merging, serving many LoRA adapters on one base model, and keeping training and inference numerically consistent.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 6.6, 7.2, 7.3</span>
+  <span class="chip">Compute: Colab CPU (Part D: any GPU)</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Your fine-tune scores 82% and the base 79% on a 100-item evaluation. Is it better?</li>
+    <li>You merge a LoRA adapter into BF16 weights. Is the merged model identical to base plus adapter?</li>
+    <li>Fifty customers each have their own LoRA adapter on the same 8B base. Fifty deployments, or one?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Not shown. With 100 items, the 95% interval on 80% accuracy is about ±8 points, so a 3-point gap is noise. Use more items, or a paired comparison on the same items.</li>
+    <li>No. Adding a small update to BF16 weights rounds it; in the lab, merged and unmerged logits differed by up to 2.7 and the top token changed on 9% of positions. Merging in FP32 matched to 1e-4. Merge in higher precision, then cast, and re-run the evaluation on the merged artifact.</li>
+    <li>One. Multi-LoRA serving keeps one base model in memory and applies each request's adapter in the same batch (S-LoRA, vLLM's <code>--enable-lora</code>).</li>
+  </ol></details>
+</div>
+
+<h2 id="evals">1. What to evaluate</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Task evaluation:</strong> a held-out set from your real use case, scored the way the product needs (exact field match, unit tests passing, a rubric).</p>
+  <p><strong>General benchmark:</strong> a public test of broad ability (instruction following, maths, knowledge), used here to catch regressions.</p>
+  <p><strong>Regression check:</strong> a fixed set of evaluations every new checkpoint must not get worse on.</p>
+  <p><strong>LLM-as-a-judge:</strong> using a model to score outputs against a rubric or to compare two outputs.</p>
+</div>
+<ul>
+  <li><strong>The task evaluation decides.</strong> It must come from the same distribution as production, be held out before training, and be scored by the metric that matters.</li>
+  <li><strong>General evaluations guard against forgetting</strong> (chapter 7.2): a small set of instruction following, the base model's other languages, safety behaviour, and any capability the product also relies on.</li>
+  <li><strong>Vibe checks matter too.</strong> Hugging Face found that interacting with intermediate checkpoints catches problems benchmarks miss; read 20 outputs before trusting a score.</li>
+  <li><strong>Serving evaluations:</strong> the same tests through the production stack (chat template, quantization, engine), since that is what users get (chapter 6.6).</li>
+</ul>
+<h3>Is it really better? Sample size</h3>
+<div class="formula">95% interval on an accuracy p over n items ≈ p ± 1.96 × √(p × (1 − p) ÷ n)</div>
+<p>At 80% accuracy: ±7.8 points with 100 items, ±3.5 with 500, ±1.8 with 2,000. Comparing two models on the <em>same</em> items (a paired test, counting items where only one is right) is more sensitive than comparing two independent scores. For a product decision, size the evaluation to detect the smallest difference you care about.</p>
+<h3>Why evaluation numbers do not reproduce</h3>
+<p>Hugging Face's evaluation guidebook lists the usual causes, all of which apply to before-and-after comparisons of your own fine-tune:</p>
+<ul>
+  <li><strong>Metric definitions:</strong> "exact match" may be log-likelihood or generative, prefix or full, with or without normalization (punctuation, number formats).</li>
+  <li><strong>Prompt format:</strong> semantically identical multiple-choice layouts can move scores by several points; few-shot examples must be the same ones.</li>
+  <li><strong>Chat template and system prompt:</strong> not using the model's template "will kill its performance".</li>
+  <li><strong>Generation settings:</strong> end-of-sequence token, maximum tokens, temperature and seed.</li>
+  <li><strong>Model loading:</strong> hardware, library (Transformers vs vLLM), batch size and precision all change numerics (chapter 6.6's batch invariance).</li>
+</ul>
+<p><strong>LLM judges</strong> have known biases: position (prefer the first answer), verbosity (prefer longer), self-preference (prefer their own outputs), inconsistency across samples, and weakness at spotting partial hallucinations. Mitigations: randomize positions, ask for reasoning before the score with a clear scale, use several judges, and check the judge against human labels on a sample.</p>
+
+<h2 id="merge">2. Merge or keep the adapter?</h2>
+<div class="tbl"><table>
+<tr><th></th><th>Merged weights</th><th>Separate adapter</th></tr>
+<tr><td>Inference cost</td><td>Same as the base model</td><td>A small extra matmul pair per layer (in the lab, about 14% at batch 1 on CPU, negligible at batch 8)</td></tr>
+<tr><td>Storage per variant</td><td>A full model</td><td>Megabytes (42 M parameters for an 8B model at rank 16: about 84 MB in BF16)</td></tr>
+<tr><td>Many variants on one GPU</td><td>No</td><td>Yes, with multi-LoRA serving</td></tr>
+<tr><td>Quantization</td><td>Quantize the merged model like any other (chapter 4.1)</td><td>Base quantized, adapter kept in 16-bit</td></tr>
+<tr><td>Best for</td><td>One fine-tune at high volume</td><td>Many customers or tasks, frequent updates</td></tr>
+</table></div>
+<p><strong>The merge precision trap.</strong> A trained update is small relative to the weights. Added to BF16 weights (8 bits of mantissa), much of it rounds away or changes. The lab measures it: merging in FP32 reproduced the unmerged model to within 1.4 × 10⁻⁴ in the logits; merging in BF16 differed by up to 2.7 and changed the top token at 9% of positions. Merge in FP32, cast once, and evaluate the merged artifact you will ship. An adapter trained on a 4-bit QLoRA base learned to correct those quantized weights; merging it into BF16 weights is a different model and needs its own evaluation.</p>
+
+<h2 id="multi">3. Serving many adapters</h2>
+<p>S-LoRA showed that adapters from one base model can be served together: all adapters live in CPU memory, the ones needed by running requests are fetched to the GPU, a <strong>unified paging</strong> pool holds both adapter weights (of different ranks) and KV cache blocks, and custom kernels batch requests that use different adapters. It served thousands of adapters on one GPU with up to 4 times the throughput of Hugging Face PEFT and early vLLM LoRA support.</p>
+<p>vLLM's LoRA support today:</p>
+<ul>
+  <li><code>--enable-lora</code> with <code>--lora-modules name=path</code>; each request names its adapter in the <code>model</code> field.</li>
+  <li><code>max_loras</code> (adapters active in one batch on the GPU), <code>max_lora_rank</code> (largest rank allowed), <code>max_cpu_loras</code> (adapters cached in CPU memory).</li>
+  <li>Runtime loading with <code>/v1/load_lora_adapter</code> and <code>/v1/unload_lora_adapter</code> (when <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code> is set), or <strong>LoRAResolver</strong> plugins that fetch an adapter from a local directory, the Hugging Face Hub or your own store such as S3 on first use.</li>
+</ul>
+<div class="widget" id="mlW">
+  <div class="wt">Interactive: plan a multi-LoRA deployment</div>
+  <div class="ws">Adapter memory on one GPU, and what is left for the KV cache. Adapters target all seven linear layers per block; sizes in BF16.</div>
+  <div class="ctrls">
+    <label>Base model <select id="mlM"><option value="q15">Qwen2.5-1.5B</option><option value="l8" selected>Llama 3.1 8B</option><option value="l70">Llama 3.1 70B (4 GPUs, TP4)</option></select></label>
+    <label>Rank <select id="mlR"><option>8</option><option selected>16</option><option>64</option></select></label>
+    <label>Customer adapters <input type="number" id="mlN" value="50" min="1" step="10" style="width:84px"></label>
+    <label>max_loras (active on GPU) <input type="number" id="mlA" value="8" min="1" step="1" style="width:84px"></label>
+    <label>GPU memory per GPU (GB) <select id="mlG"><option>24</option><option selected>80</option></select></label>
+  </div>
+  <div class="stats" id="mlStats"></div>
+</div>
+<p>Routing matters with many adapters: a request whose adapter is already on a replica avoids a load, so gateways route by adapter as they route by prefix (chapter 6.4). Popular adapters can be pinned; rare ones loaded on demand.</p>
+
+<h2 id="mismatch">4. Train-inference mismatch</h2>
+<p>A model trained in one stack and served in another can behave differently: a different chat template, tokenizer version, sampling defaults (chapter 6.6), quantization, or simply different kernels. For RL, the mismatch is critical, because the sampler's probabilities feed the training update (chapter 7.4). vLLM and TorchTitan demonstrated bitwise-consistent RL on Qwen3-1.7B: they audited every forward kernel, used vLLM's batch-invariant kernels in both, and wrote matching backward passes. With matched numerics the KL between trainer and sampler stayed exactly 0, training reached higher reward in fewer steps, and the run was 2.4 times slower than the non-bitwise one, a cost they aim to cut.</p>
+<p>For SFT and DPO the practical checklist is shorter: same tokenizer files, same chat template, same generation settings in evaluation and production, and a golden-output test on the serving stack (chapter 6.6).</p>
+
+<h2 id="expert">5. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Heterogeneous LoRA batching</span>
+  <p>In one decode step, different requests use different adapters of different ranks. Gathering each request's A and B and running one small matmul per adapter would launch many tiny kernels; S-LoRA and later Punica-style kernels instead batch the LoRA computation across adapters in one kernel (a segmented or gathered matmul), keeping the extra cost close to the merged case.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Serverless adapters</span>
+  <p>Some platforms offer per-token inference for user-uploaded LoRA adapters on shared base models (Weights & Biases, among others), billing like an API while you own the adapter: multi-LoRA serving as a product.</p>
+</div>
+
+<h2 id="mistakes">6. Common mistakes</h2>
+<ul>
+  <li>Declaring a win on a 100-item evaluation with a 3-point gap.</li>
+  <li>Evaluating with a different template, prompt format or generation settings from production.</li>
+  <li>Merging into BF16 and shipping without re-evaluating the merged artifact.</li>
+  <li>One deployment per adapter when multi-LoRA serving would do.</li>
+  <li><code>max_lora_rank</code> below an adapter's rank, so it fails to load.</li>
+  <li>Trusting an LLM judge without checking it against human labels.</li>
+</ul>
+
+<h2 id="lab">7. Lab</h2>
+<h3>Part A: is a merged adapter the same model?</h3>
+<pre>import torch
+from transformers import AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model
+for dtype in [torch.float32, torch.bfloat16]:
+    torch.manual_seed(0)
+    m = get_peft_model(AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype=dtype).eval(),
+                       LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", task_type="CAUSAL_LM"))
+    for n, p in m.named_parameters():                   # stand-in for a trained adapter: small non-zero B
+        if "lora_B" in n: torch.nn.init.normal_(p, std=0.002)
+    x = torch.randint(0, 150000, (1, 64))
+    with torch.no_grad():
+        a = m(x).logits.float()
+        with m.disable_adapter(): b = m(x).logits.float()
+        c = m.merge_and_unload()(x).logits.float()
+    print(dtype, f"adapter effect {(a-b).abs().max():.2f}; merged vs unmerged {(a-c).abs().max():.1e}; "
+          f"same top token {(a.argmax(-1) == c.argmax(-1)).float().mean():.0%}")</pre>
+<p>Predict first: will the merged model match the unmerged one in both precisions?</p>
+<details><summary>What we measured (CPU)</summary><pre class="out">torch.float32   adapter effect 3.28; merged vs unmerged max diff 1.4e-04; same top token 100%
+torch.bfloat16  adapter effect 3.59; merged vs unmerged max diff 2.7e+00; same top token 91%</pre>
+<p>In FP32 the merge is exact to rounding. In BF16 the merge changes the model nearly as much as the adapter itself does. Note that Transformers 5 loads this checkpoint in BF16 by default when no <code>dtype</code> is given, so this trap is easy to fall into.</p></details>
+<h3>Part B: what does an unmerged adapter cost?</h3>
+<pre>import time
+def timeit(m, x, reps=3):
+    with torch.no_grad():
+        m(x); t = time.perf_counter()
+        for _ in range(reps): m(x)
+    return (time.perf_counter() - t) / reps
+# time the PEFT model (adapter separate) for one decode step at batch 1 and 8, and one 256-token prefill,
+# then m = m.merge_and_unload() and time again</pre>
+<details><summary>What we measured (FP32, 2 CPU cores)</summary><pre class="out">unmerged  batch 1 tokens   1:   122.9 ms
+unmerged  batch 8 tokens   1:   260.9 ms
+unmerged  batch 1 tokens 256:  1679.3 ms
+merged    batch 1 tokens   1:   107.5 ms
+merged    batch 8 tokens   1:   261.0 ms
+merged    batch 1 tokens 256:  1543.7 ms</pre>
+<p>About 14% extra at batch 1 and 9% for a prefill, nothing measurable at batch 8: the adapter adds a fixed amount of small work. On a GPU, engine kernels for batched LoRA keep the overhead small; Part D measures it.</p></details>
+<h3>Part C: size your evaluation</h3>
+<pre>import math
+for n in [100, 500, 2000]:
+    print(n, f"± {1.96 * math.sqrt(0.8 * 0.2 / n) * 100:.1f} points at 80% accuracy")</pre>
+<details><summary>What we computed</summary><pre class="out">n=100: accuracy 80% ± 7.8 points (95% interval)
+n=500: accuracy 80% ± 3.5 points (95% interval)
+n=2000: accuracy 80% ± 1.8 points (95% interval)</pre></details>
+<h3>Part D: serve the adapter with vLLM (GPU)</h3>
+<p>Serve your chapter 7.3 adapter: <code>vllm serve Qwen/Qwen2.5-1.5B-Instruct --enable-lora --lora-modules support=./adapter --max-lora-rank 16</code>. Run the chapter 6.1 benchmark against <code>model="Qwen/Qwen2.5-1.5B-Instruct"</code> and <code>model="support"</code> at concurrency 1 and 16, and compare TTFT and TPOT. Then load a second adapter at runtime and send mixed traffic. Expect a small TPOT overhead with the adapter, and higher when requests in one batch use several different adapters.</p>
+
+<h2 id="realworld">8. In the real world</h2>
+<div class="box real">
+  <span class="lbl">In practice</span>
+  <ul>
+    <li><strong>Platforms</strong> serve thousands of customer adapters on shared base models with multi-LoRA serving and adapter-aware routing.</li>
+    <li><strong>Release pipelines</strong> for fine-tunes run task, general and serving-stack evaluations on the exact artifact being deployed (chapter 6.5).</li>
+    <li><strong>RL teams</strong> track and correct train-inference mismatch, and some run bitwise-consistent stacks.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">9. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz76"></div>
+<script type="application/json" id="qz76">[
+{"q":"95% interval on 80% accuracy with 500 items is about:","o":["±1 point","±3.5 points","±8 points","±15 points"],"a":1,"e":"1.96 × √(0.16/500) ≈ 3.5%."},
+{"q":"Why did the BF16 merge change outputs?","o":["A PEFT bug","Adding a small update to BF16 weights rounds it","The adapter was disabled","Tied embeddings"],"a":1,"e":"FP32 merge matched to 1e-4."},
+{"q":"Which vLLM setting caps adapters active on the GPU in one batch?","o":["max_lora_rank","max_loras","max_cpu_loras","max_model_len"],"a":1,"e":"max_cpu_loras caches more in CPU memory."},
+{"q":"S-LoRA's unified paging holds:","o":["Only KV cache","Adapter weights and KV cache in one pool","Only weights","Prompts"],"a":1,"e":"Reduces fragmentation with mixed ranks and lengths."},
+{"q":"A common LLM-judge bias:","o":["Preferring shorter answers","Preferring the first answer shown","Always agreeing with humans","Ignoring format"],"a":1,"e":"Randomize positions."},
+{"q":"Bitwise-consistent RL with vLLM and TorchTitan kept trainer-sampler KL at:","o":["Exactly 0","0.1","1","Unmeasured"],"a":0,"e":"At 2.4× slower training."}
+]</script>
+
+<h2 id="summary">10. Summary</h2>
+<ul>
+  <li>Decide on a held-out task evaluation sized for the difference you care about; guard against forgetting with general checks; read outputs.</li>
+  <li>Control metric definitions, prompts, templates, generation settings and loading when comparing scores.</li>
+  <li>Merge for one high-volume fine-tune (in FP32, then cast, then re-evaluate); keep adapters separate for many variants.</li>
+  <li>Serve many adapters on one base with multi-LoRA serving and adapter-aware routing.</li>
+  <li>Keep training and serving stacks consistent; for RL, mismatch matters most.</li>
+</ul>
+
+<h2 id="refs">11. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://huggingface.co/spaces/OpenEvals/evaluation-guidebook">Hugging Face, The LLM Evaluation Guidebook</a></td><td>Designing evaluations, reproducibility pitfalls, LLM-as-a-judge biases and mitigations.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2311.03285">Sheng et al., S-LoRA</a></td><td>Serving thousands of adapters with unified paging and heterogeneous batching.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/features/lora.html">vLLM: LoRA adapters</a></td><td>Serving options, runtime loading and LoRAResolver plugins.</td></tr>
+<tr><td><a href="https://blog.vllm.ai/2025/11/10/bitwise-consistent-train-inference.html">vLLM and TorchTitan teams, Bitwise Consistent On-Policy RL</a></td><td>Matching trainer and sampler numerics, its effect on reward and its cost.</td></tr>
+<tr><td><a href="https://wandb.ai/wandb_fc/product-announcements-fc/reports/Introducing-Serverless-LoRA-Inference--VmlldzoxNTEyNDU4OQ">Weights & Biases, Serverless LoRA Inference</a></td><td>Per-token serving of user adapters as a product.</td></tr>
+</table></div>
+<h3>Sources considered and not used</h3>
+<ul><li>"When Speed Kills Stability" (a Notion page on RL collapse from train-inference mismatch) loads only in a browser; the vLLM and TorchTitan post covers the same problem with measurements.</li></ul>
+<p class="note">Facts checked on 7 November 2026. Parts A to C run on CPU with PyTorch 2.15, Transformers 5.22 and PEFT 0.21; Part D is an exercise with expected behaviour.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$}=IE;
+const M={q15:[1.54e9,1536,28,8960,256,1,28,2,128],l8:[8.03e9,4096,32,14336,1024,1,32,8,128],l70:[70.6e9,8192,80,28672,1024,4,80,8,128]};
+function ml(){const [P,h,L,f,kv,tp,Ly,kvh,hd]=M[$('mlM').value],r=+$('mlR').value,N=+$('mlN').value,A=Math.min(+$('mlA').value,N),G=+$('mlG').value;
+  const ad=r*L*(9*h+2*kv+3*f)*2;const w=2*P/tp;const act=A*ad/tp;const kvp=Math.max(0,G*1e9*0.9-w-act-2e9);
+  const kvTok=2*Ly*kvh*hd*2/ (tp>1?tp:1);const toks=kvp/kvTok;
+  $('mlStats').innerHTML=[['One adapter',(ad/1e6).toFixed(0)+' MB'],['All '+N+' adapters (CPU or disk)',(ad*N/1e9).toFixed(1)+' GB'],['Active adapters on each GPU',(act/1e9).toFixed(2)+' GB'],['Base weights per GPU',(w/1e9).toFixed(1)+' GB'],['KV cache left per GPU',(kvp/1e9).toFixed(1)+' GB'],['Tokens of KV that fit',IE.int(toks)]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['mlM','mlR','mlN','mlA','mlG'].forEach(id=>$(id).addEventListener('input',ml));ml();
+})();
+</script>

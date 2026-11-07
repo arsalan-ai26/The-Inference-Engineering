@@ -105,7 +105,7 @@
 <pre>import torch, torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-student = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct").eval()
+student = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", dtype=torch.float32).eval()
 teacher = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct", dtype=torch.bfloat16).eval()
 torch.manual_seed(0)
 qs = ["A farmer has 17 sheep. All but 9 run away. How many sheep are left? Answer briefly.",
