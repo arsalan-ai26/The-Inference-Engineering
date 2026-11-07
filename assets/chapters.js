@@ -200,7 +200,7 @@ window.IE_CHAPTERS = [
 "title": "GPU architecture",
 "slug": "5-2-gpu-architecture",
 "part": 5,
-"ready": false
+"ready": true
 },
 {
 "n": "5.3",

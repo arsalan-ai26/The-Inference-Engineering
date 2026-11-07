@@ -1,0 +1,220 @@
+<div class="kicker">Part 5 · GPUs, hardware and kernels · Chapter 5.2</div>
+<h1>GPU architecture</h1>
+<p class="lede">You do not need to design chips to be an inference engineer, but you need a working picture of what is inside one. Every number in Parts 2 to 4 (FLOP/s, bandwidth, ops:byte, why FlashAttention tiles, why fusion helps) comes from the structure described here: many streaming multiprocessors, each with tensor cores and a little fast memory, all sharing a large, slower main memory. This chapter walks through that structure from the outside in, using the H100 as the reference, and notes what Blackwell changes.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 2.5, 5.1</span>
+  <span class="chip">Compute: Colab CPU, then T4</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>How many threads run a single instruction together on an NVIDIA GPU?</li>
+    <li>Which memory is larger on an H100: total on-chip shared memory across all SMs, or the L2 cache?</li>
+    <li>Why does a GPU want many more threads than it has cores?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>32: a warp.</li>
+    <li>The L2 (50 MB) is larger than the total shared memory (132 SMs × up to 228 KB, about 30 MB), but shared memory is much faster and is controlled by the program.</li>
+    <li>To hide memory latency. While some warps wait hundreds of cycles for data, the scheduler runs others that are ready, at no switching cost.</li>
+  </ol></details>
+</div>
+
+<h2 id="overview">1. The big picture</h2>
+<p>A CPU has a few powerful cores built to finish one sequence of instructions as fast as possible. A GPU has a large number of simpler units built to run one operation on thousands of pieces of data at once. For neural networks, which are mostly large matrix multiplications, the GPU's design wins by a wide margin.</p>
+<p>An H100 SXM is, from the outside in:</p>
+<ul>
+  <li><strong>132 streaming multiprocessors (SMs)</strong>, the independent compute units. A B200 has 148.</li>
+  <li>A shared <strong>L2 cache</strong> of 50 MB.</li>
+  <li><strong>80 GB of HBM3</strong> (high-bandwidth memory) stacked next to the chip, at about 3.35 TB/s.</li>
+  <li><strong>NVLink</strong> ports to other GPUs (about 450 GB/s each way) and a <strong>PCIe</strong> link to the host CPU (about 64 GB/s each way on PCIe 5).</li>
+</ul>
+
+<h2 id="sm">2. Inside a streaming multiprocessor</h2>
+<p>Each SM is split into 4 identical sub-partitions. Each sub-partition has:</p>
+<ul>
+  <li>a <strong>warp scheduler</strong> that issues one instruction per cycle for one warp;</li>
+  <li><strong>32 FP32 CUDA cores</strong> (plus integer and FP64 units) for ordinary arithmetic;</li>
+  <li>one <strong>tensor core</strong>, a unit that multiplies small matrix tiles in one step;</li>
+  <li>a <strong>register file</strong> of 16,384 32-bit registers (64 KB).</li>
+</ul>
+<p>The 4 sub-partitions share the SM's <strong>L1 cache / shared memory</strong>: 256 KB of on-chip SRAM, of which up to about 228 KB can be used as programmer-controlled shared memory. Special function units (for exponentials, sines and similar) sit alongside.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Thread:</strong> one instance of a kernel's code with its own registers. <strong>Warp:</strong> 32 threads that execute the same instruction together (SIMT: single instruction, multiple threads).</p>
+  <p><strong>Thread block (CTA):</strong> a group of threads (up to 1,024) that run on one SM and can share its shared memory and synchronize with each other. <strong>Grid:</strong> all the blocks of one kernel launch. Chapter 5.3 covers this programming model.</p>
+  <p><strong>Shared memory (SMEM):</strong> fast on-chip memory shared by the threads of one block. <strong>Registers:</strong> the fastest storage, private to each thread.</p>
+</div>
+<h3>Where the FLOPs are</h3>
+<p>The tensor cores provide almost all of the headline FLOP/s: on an H100, about 990 TFLOP/s in BF16 from tensor cores against about 67 TFLOP/s in FP32 from CUDA cores (chapter 5.1). Counting backwards, each tensor core does roughly 1,024 BF16 FLOPs per clock cycle, about one 8 × 8 × 8 matrix multiply. Every generation has made tensor cores larger and faster, and that has changed how they must be fed:</p>
+<div class="tbl"><table>
+<tr><th>Generation</th><th>Tensor core fed by</th><th>Notable additions for inference</th></tr>
+<tr><td>Ampere (A100, 2020)</td><td>One warp (mma instructions)</td><td>BF16, TF32, 2:4 structured sparsity, asynchronous copies</td></tr>
+<tr><td>Hopper (H100, H200, 2022)</td><td>A warpgroup of 4 warps (wgmma), operands in shared memory</td><td>FP8; the Tensor Memory Accelerator (TMA) for bulk asynchronous copies; thread block clusters and distributed shared memory</td></tr>
+<tr><td>Blackwell (B200, B300, 2024)</td><td>Operands in a new Tensor Memory (TMEM), 256 KB per SM; one MMA can span 2 SMs</td><td>FP4, MXFP8, MXFP4, NVFP4 with hardware block scaling; NVLink 5</td></tr>
+</table></div>
+<p>The trend matters for kernels: the bigger the tensor core, the harder it is to keep busy, and the more kernels must use asynchronous copies, warp specialization and pipelining (FlashAttention-3 and 4, chapter 4.2). This is why each new GPU generation needs new kernels before it reaches its potential.</p>
+
+<h2 id="hierarchy">3. The memory hierarchy</h2>
+<p>Data moves through layers that trade size for speed. The closer to the tensor cores, the faster and smaller:</p>
+<div class="svgwrap"><svg id="mhSvg" viewBox="0 0 680 330" width="680" style="max-width:100%;height:auto" role="img" aria-label="H100 memory hierarchy with sizes and bandwidths"></svg></div>
+<div class="tbl"><table>
+<tr><th>Level</th><th>Size on H100</th><th>Bandwidth (approximate)</th><th>Who controls it</th></tr>
+<tr><td>Registers</td><td>256 KB per SM (about 33 MB total)</td><td>Highest; read in the same cycle</td><td>Compiler</td></tr>
+<tr><td>Shared memory / L1</td><td>256 KB per SM (up to about 228 KB as shared memory)</td><td>Tens of TB/s in aggregate</td><td>Programmer (shared) or hardware (L1)</td></tr>
+<tr><td>L2 cache</td><td>50 MB, split in two halves</td><td>About 5.5 TB/s measured</td><td>Hardware</td></tr>
+<tr><td>HBM</td><td>80 GB (H200: 141 GB; B200: about 180 to 192 GB)</td><td>3.35 TB/s (H200: 4.8; B200: about 8)</td><td>Program allocates; kernels read and write</td></tr>
+<tr><td>Host memory over PCIe 5</td><td>Hundreds of GB to TB</td><td>About 64 GB/s each way</td><td>Program copies</td></tr>
+</table></div>
+<p class="note">NVIDIA does not publish L2 bandwidth; the figure is the measurement quoted in the JAX scaling book. Aggregate SMEM bandwidth estimates vary by source; what matters is that it is several times HBM.</p>
+<p>Every optimization in Part 4 is about this hierarchy. Weights and the KV cache live in HBM, so decode is limited by HBM bandwidth. FlashAttention keeps tiles in shared memory and registers so the score matrix never reaches HBM. Fusion keeps intermediate results in registers instead of writing them to HBM. Quantization shrinks what must cross the HBM boundary.</p>
+
+<h2 id="latency">4. Hiding latency with many warps</h2>
+<p>A read from HBM takes hundreds of clock cycles to arrive. A CPU hides latency with large caches and by guessing ahead. A GPU hides it with parallelism: each SM keeps up to 64 warps (2,048 threads) resident, with their registers already loaded. When a warp stalls on a memory read, the scheduler issues an instruction from another warp that is ready, in the next cycle, with no context-switch cost. With enough warps in flight, the memory system always has requests outstanding and the cores always have work.</p>
+<p><strong>Occupancy</strong> is the number of resident warps as a share of the maximum. It is limited by whichever resource runs out first: registers per thread, shared memory per block, or threads per block. Higher occupancy hides latency better, but not always: kernels that keep more data in registers and shared memory (like FlashAttention) deliberately run at lower occupancy and hide latency with asynchronous copies instead.</p>
+<div class="widget" id="ocW">
+  <div class="wt">Interactive: what limits occupancy on an H100 SM</div>
+  <div class="ws">Per SM: 65,536 registers, 2,048 threads, 32 blocks, about 228 KB of shared memory. Choose a kernel's resource use and see how many warps fit. (Real allocation rounds registers and shared memory up to fixed sizes; this ignores that.)</div>
+  <div class="ctrls">
+    <label>Threads per block <select id="ocT"><option>64</option><option selected>128</option><option>256</option><option>512</option><option>1024</option></select></label>
+    <label>Registers per thread: <span class="mono" id="ocRv"></span><input type="range" id="ocR" min="16" max="255" step="1" value="64"></label>
+    <label>Shared memory per block (KB): <span class="mono" id="ocSv"></span><input type="range" id="ocS" min="0" max="227" step="1" value="32"></label>
+  </div>
+  <div class="stats" id="ocStats"></div>
+</div>
+
+<h2 id="pitfalls">5. Three hardware habits kernels must respect</h2>
+<ul>
+  <li><strong>Coalesced memory access.</strong> When the 32 threads of a warp read 32 neighbouring addresses, the hardware combines them into a few wide transactions. Scattered addresses turn into many separate transactions and waste bandwidth. Data layouts (row-major vs column-major, KV cache layouts) are chosen so that warps read contiguous memory.</li>
+  <li><strong>Warp divergence.</strong> All 32 threads in a warp run the same instruction. If an <code>if</code> sends half of them one way and half the other, the warp runs both paths one after the other, with half its threads idle each time. Kernels avoid data-dependent branches in inner loops.</li>
+  <li><strong>Shared memory bank conflicts.</strong> Shared memory is split into 32 banks. If several threads of a warp hit different addresses in the same bank, the accesses are serialized. Kernel authors pad or swizzle tile layouts to avoid this.</li>
+</ul>
+
+<h2 id="multi">6. Beyond one GPU</h2>
+<ul>
+  <li><strong>NVLink and NVSwitch</strong> connect the 8 GPUs of a node all-to-all at full bandwidth: about 450 GB/s each way per H100 (NVLink 4), about 900 GB/s per B200 (NVLink 5). GB200 NVL72 systems extend one NVLink domain to 72 GPUs.</li>
+  <li><strong>InfiniBand or RoCE</strong> connect nodes, typically one 400 Gb/s (about 50 GB/s) network card per GPU, with newer 800 Gb/s cards arriving.</li>
+  <li><strong>Grace CPUs</strong> (GH200, GB200) connect to their GPUs with NVLink-C2C at up to 900 GB/s in total, far faster than PCIe, which makes CPU memory a much faster KV offload tier (chapter 4.4).</li>
+</ul>
+<p>Chapter 4.5 used these numbers to choose parallel layouts; chapter 5.5 compares GPU generations and other accelerators.</p>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Asynchrony is the new programming model</span>
+  <p>On Hopper and Blackwell, the fastest kernels split warps into roles: "producer" warps issue TMA copies from HBM into shared memory, "consumer" warpgroups run tensor-core MMAs on data that already arrived, and the two overlap through barriers in shared memory. Blackwell adds tensor memory and 2-SM MMAs, so even the accumulator lives outside registers. Libraries such as CUTLASS, CuTe and ThunderKittens exist largely to make this tractable (chapter 5.8).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Clocks, power and the spec sheet</span>
+  <p>Peak FLOP/s assume the boost clock. Under sustained heavy load a GPU may lower its clock to stay within power and temperature limits, so a long benchmark can be slower than a short one. Spec sheets also often list FLOP/s "with sparsity" (2:4 structured sparsity, twice the dense figure); dense numbers are what inference normally gets.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Not only NVIDIA</span>
+  <p>AMD's Instinct GPUs use the same broad structure under different names (compute units, wavefronts of 64 threads on CDNA, LDS for shared memory, Infinity Fabric for links). TPUs use a few very large matrix units with a big software-managed memory (VMEM) instead of many small SMs. The concepts in this chapter transfer; the numbers and the kernel tricks do not.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Comparing GPUs on sparse FLOP/s figures.</li>
+  <li>Assuming a kernel tuned for an H100 is fast on a B200 (or runs at all).</li>
+  <li>Thinking more threads always means faster; resource limits and register spills can make the opposite true.</li>
+  <li>Ignoring memory layout: a transposed tensor that forces scattered reads can halve bandwidth.</li>
+  <li>Treating L2 as a place to keep weights; it holds a tiny fraction of a model and is managed by hardware.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p><strong>Goal:</strong> read your GPU's real properties, see the memory hierarchy in a measurement, and compute occupancy by hand.</p>
+<h3>Part A: the 100 Days notebook</h3>
+<p>Run day 19 (GPU architecture: SMs, memory hierarchy and HBM) of <em>100 Days of Inference</em>. Draw the memory hierarchy with sizes and bandwidths for the GPU you use, as section 3 does for the H100.</p>
+<h3>Part B: device properties and a cache cliff</h3>
+<pre>import torch, time
+dev = "cuda" if torch.cuda.is_available() else "cpu"
+if dev == "cuda":
+    p = torch.cuda.get_device_properties(0)
+    print(p.name, "SMs:", p.multi_processor_count, "memory GB:", round(p.total_memory / 1e9, 1),
+          "L2 MB:", getattr(p, "L2_cache_size", 0) / 1e6, "compute capability:", f"{p.major}.{p.minor}")
+def sync():
+    if dev == "cuda": torch.cuda.synchronize()
+for kib in [64, 256, 1024, 4096, 16384, 65536, 262144]:     # size of ONE tensor
+    n = kib * 1024 // 4
+    a = torch.randn(n, device=dev); b = torch.empty_like(a)
+    reps = max(10, int(2e9 // (8 * n)))
+    b.copy_(a); sync()
+    t = time.perf_counter()
+    for _ in range(reps): b.copy_(a)
+    sync(); s = (time.perf_counter() - t) / reps
+    print(f"working set {2*kib:>7} KiB  {2*n*4/s/1e9:7.1f} GB/s")</pre>
+<p>Predict where the bandwidth will change: on a CPU, where the working set (source plus destination) leaves the last-level cache; on a T4, where it exceeds the 4 MB L2.</p>
+<details><summary>What we measured on CPU, and what to expect on a T4</summary><p>On a 2-core CPU: 52, 71 and 123 GB/s for working sets of 128 KiB, 512 KiB and 2 MiB (in cache), then a cliff to 47, 37, 24 and 20 GB/s from 8 MiB up (main memory). On a T4 the large sizes should approach its 320 GB/s HBM bandwidth (often 70% to 90% of it). Small sizes are dominated by launch overhead (chapter 5.1), so the L2 effect is hard to see with this simple timer; time many copies inside one CUDA graph, or use the profiler of chapter 5.6, to see it.</p></details>
+<h3>Part C: occupancy by hand</h3>
+<p>A kernel uses 128 threads per block, 96 registers per thread and 48 KB of shared memory per block, on an H100 SM. How many blocks fit, what limits them, and what is the occupancy? Then change it to 40 KB of shared memory and recompute. Check with the widget.</p>
+<details><summary>Answer</summary><p>Threads: 2,048 ÷ 128 = 16 blocks. Registers: 65,536 ÷ (96 × 128) = 5.3, so 5 blocks. Shared memory: 228 ÷ 48 = 4.75, so 4 blocks. Shared memory limits it to 4 blocks = 16 warps = 25% occupancy. With 40 KB: 228 ÷ 40 = 5.7, so 5 blocks; now registers and shared memory both allow 5 blocks = 20 warps = 31%.</p></details>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Why this matters on the job</span>
+  <ul>
+    <li><strong>Hardware selection</strong> uses bandwidth and memory for decode-heavy work and tensor-core FLOP/s for prefill-heavy work (chapter 5.5).</li>
+    <li><strong>Kernel and engine releases</strong> lag new GPU generations because kernels must be rewritten for new tensor-core interfaces (TMA, wgmma, TMEM).</li>
+    <li><strong>Debugging slow kernels</strong> starts from this chapter's vocabulary: occupancy, coalescing, bank conflicts, register spills (chapter 5.6).</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz52"></div>
+<script type="application/json" id="qz52">[
+{"q":"What is a warp?","o":["One SM","32 threads that execute the same instruction together","A thread block","A tensor core"],"a":1,"e":"The basic unit the warp scheduler issues instructions for."},
+{"q":"Where do almost all of an H100's BF16 FLOP/s come from?","o":["CUDA cores","Tensor cores","Special function units","L2 cache"],"a":1,"e":"About 990 TFLOP/s from tensor cores vs about 67 from CUDA cores (FP32)."},
+{"q":"How does a GPU mainly hide memory latency?","o":["Large caches like a CPU","Switching between many resident warps at no cost","Branch prediction","Higher clocks"],"a":1,"e":"While one warp waits, another that is ready runs."},
+{"q":"What new memory did Blackwell add to feed its tensor cores?","o":["L3 cache","Tensor Memory (TMEM)","HBM4","Texture memory"],"a":1,"e":"256 KB of tensor memory per SM holds MMA operands and accumulators."},
+{"q":"Half the threads of a warp take an if branch and half the else. What happens?","o":["Both run in parallel at full speed","The two paths run one after the other with half the threads idle each time","The warp is split into two SMs","An error"],"a":1,"e":"Warp divergence serializes the paths."},
+{"q":"A kernel's occupancy is limited by:","o":["Only threads per block","Whichever runs out first: registers, shared memory or threads","HBM size","The CPU"],"a":1,"e":"All three resources are per SM."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>A GPU is many SMs (132 on an H100) sharing an L2 cache and HBM; each SM has 4 sub-partitions with a warp scheduler, CUDA cores, a tensor core and registers, and shared on-chip SRAM.</li>
+  <li>Tensor cores provide nearly all FLOP/s; each generation makes them larger and harder to feed (wgmma and TMA on Hopper, TMEM on Blackwell).</li>
+  <li>Memory runs from registers and shared memory (fast, tiny) through L2 to HBM (large, slower) and host memory over PCIe; optimizations are about staying high in this hierarchy.</li>
+  <li>Many resident warps hide latency; occupancy is limited by registers, shared memory and threads.</li>
+  <li>Coalescing, divergence and bank conflicts are the everyday hardware rules kernels follow.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 3.1 to 3.3</td><td>Compute, memory and caches, GPU generations and multi-GPU instances.</td></tr>
+<tr><td><a href="https://jax-ml.github.io/scaling-book/gpus/">How to Scale Your Model: GPUs</a></td><td>SM sub-partitions, tensor-core FLOPs per cycle, register and SMEM sizes, measured L2 bandwidth, TMEM and NVLink topology, with exercises.</td></tr>
+<tr><td><a href="https://hackbot.dad/writing/intro-to-gpus/">hackbot.dad: An introduction to GPUs</a></td><td>Warps, latency hiding and shared memory, built up from simple kernels.</td></tr>
+<tr><td><a href="https://www.youtube.com/watch?v=5UWphJWdAHY">Video: GPU architecture overview</a></td><td>A visual tour of the hardware.</td></tr>
+<tr><td>Hwu, Kirk and El Hajj, <em>Programming Massively Parallel Processors</em>, chapters 1 to 5</td><td>The standard textbook treatment of threads, warps, memory and occupancy.</td></tr>
+<tr><td><a href="https://resources.nvidia.com/en-us-tensor-core">NVIDIA H100 architecture whitepaper</a></td><td>Official SM, memory and NVLink specifications.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 19</td><td>A memory hierarchy model and bandwidth calculations.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The Kiely book lists an L0 cache as "instruction cache for a single Tensor Core". The L0 instruction cache belongs to each SM sub-partition (its warp scheduler), not to the tensor core.</li>
+  <li>The day 19 README of <em>100 Days of Inference</em> gives shared memory bandwidth as about 30 TB/s, "about 9 times" HBM. Figures in this range appear in several sources but are not published by NVIDIA; treat them as estimates.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Part B was run on CPU with PyTorch 2.15.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+function mh(){const svg=$('mhSvg');svg.innerHTML='';
+  const L=[['Registers','256 KB per SM','fastest','--pre'],['Shared memory / L1','256 KB per SM','tens of TB/s total','--pre'],['L2 cache','50 MB','about 5.5 TB/s','--kv'],['HBM3','80 GB','3.35 TB/s','--dec'],['Host DRAM (PCIe 5)','hundreds of GB','about 64 GB/s','--mute']];
+  L.forEach((r,i)=>{const w=170+i*100,x=(680-w)/2,y=8+i*62;el('rect',{x,y,width:w,height:50,rx:8,fill:css(r[3]),'fill-opacity':.18,stroke:css(r[3])},svg);
+    el('text',{x:340,y:y+21,'text-anchor':'middle',fill:css('--ink'),'font-size':14,'font-weight':600},svg,r[0]);
+    el('text',{x:340,y:y+39,'text-anchor':'middle',fill:css('--ink2'),'font-size':12},svg,r[1]+' · '+r[2]);});
+  el('text',{x:4,y:20,fill:css('--ink2'),'font-size':11},svg,'smaller,');el('text',{x:4,y:34,fill:css('--ink2'),'font-size':11},svg,'faster');
+  el('text',{x:4,y:300,fill:css('--ink2'),'font-size':11},svg,'larger,');el('text',{x:4,y:314,fill:css('--ink2'),'font-size':11},svg,'slower');}
+IE.onTheme(mh);
+function oc(){const T=+$('ocT').value,R=+$('ocR').value,S=+$('ocS').value;$('ocRv').textContent=R;$('ocSv').textContent=S;
+  const byT=Math.floor(2048/T),byR=Math.floor(65536/(R*T)),byS=S>0?Math.floor(228/S):Infinity,byB=32;
+  const blocks=Math.min(byT,byR,byS,byB);const warps=blocks*T/32;
+  const lim=[['threads',byT],['registers',byR],['shared memory',byS],['blocks per SM',byB]].sort((a,b)=>a[1]-b[1])[0][0];
+  $('ocStats').innerHTML=[['Blocks per SM',blocks],['Resident warps',warps+' of 64'],['Occupancy',Math.round(warps/64*100)+'%'],['Limited by',blocks===0?'does not fit':lim]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['ocT','ocR','ocS'].forEach(id=>$(id).addEventListener('input',oc));oc();
+})();
+</script>
