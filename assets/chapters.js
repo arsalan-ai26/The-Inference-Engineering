@@ -235,7 +235,7 @@ window.IE_CHAPTERS = [
 "title": "Compilation and CUDA graphs",
 "slug": "5-7-compilation-cuda-graphs",
 "part": 5,
-"ready": false
+"ready": true
 },
 {
 "n": "5.8",

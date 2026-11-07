@@ -1,0 +1,252 @@
+<div class="kicker">Part 5 · GPUs, hardware and kernels · Chapter 5.7</div>
+<h1>Compilation and CUDA graphs</h1>
+<p class="lede">Eager PyTorch runs one operation at a time, deciding and launching each kernel as Python reaches it. That is flexible and easy to debug, but it pays Python and launch overhead on every operation and cannot fuse across operations. Compilers capture the whole computation and generate fused kernels; CUDA graphs record a whole sequence of kernel launches and replay it with one call. Together they remove most of the overhead regime of chapter 5.1. This chapter explains how <code>torch.compile</code> works, what CUDA graphs are and their rules, and how vLLM combines both.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 5.3, 5.4, 5.6</span>
+  <span class="chip">Compute: Colab CPU, then T4</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why must CUDA graph inputs be copied into fixed buffers before replay?</li>
+    <li>Why does vLLM not put attention inside its piecewise CUDA graphs?</li>
+    <li>Your service's p99 latency spikes for the first request of each new batch size after deployment. What is likely happening?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>A graph replays the exact kernels with the exact memory addresses recorded at capture. New data must be placed at those addresses.</li>
+    <li>Attention's inputs (KV cache layout, sequence lengths, block tables) change shape from step to step in ways that are hard to capture; splitting the graph at attention lets everything else be captured while attention runs with its own handling. (vLLM can also capture full graphs, including attention, for uniform decode batches when the backend supports it.)</li>
+    <li>Compilation or graph capture happening on the request path: a new shape triggered a recompile or a capture. Engines do all compilation and capture before serving, and caches let restarts skip it.</li>
+  </ol></details>
+</div>
+
+<h2 id="why">1. What eager execution costs</h2>
+<p>In eager mode, for every operation PyTorch's Python code runs, the dispatcher picks an implementation, memory is allocated for the output, and a kernel is launched. That costs microseconds of CPU time per operation (chapter 5.3), and each operation reads and writes its tensors through HBM (chapter 5.4). For a large batch the GPU work hides this. For decode at small batch, the CPU work becomes the bottleneck, and the many small memory-bound kernels waste bandwidth.</p>
+<p>Two complementary fixes:</p>
+<ul>
+  <li><strong>Compile:</strong> see a whole region of the program at once, fuse operations, and generate fewer, better kernels. This cuts memory traffic and the number of launches.</li>
+  <li><strong>CUDA graphs:</strong> record the kernel launches of a whole step once, then replay them with a single launch. This removes per-kernel CPU cost entirely.</li>
+</ul>
+
+<h2 id="compile">2. torch.compile, step by step</h2>
+<p><code>model = torch.compile(model)</code> changes nothing until the first call. Then:</p>
+<ol>
+  <li><strong>Capture (TorchDynamo).</strong> Dynamo watches the Python bytecode run and records the tensor operations into a graph (an FX graph). Code it cannot trace (data-dependent Python control flow, unsupported calls) causes a <strong>graph break</strong>: it compiles what it has, runs the unsupported part in eager mode, and starts a new graph after it.</li>
+  <li><strong>Guards.</strong> Dynamo records assumptions the graph depends on: tensor shapes, dtypes, devices, some Python values. On later calls it checks these guards; if one fails (for example a new batch size), it <strong>recompiles</strong> or switches to a version with dynamic (symbolic) shapes.</li>
+  <li><strong>Lowering and code generation (TorchInductor).</strong> The graph is lowered to a loop-level representation, operations are fused (element-wise chains, reductions with element-wise work, epilogues around matmuls), and code is generated: Triton kernels on GPUs, C++ with OpenMP on CPUs. Large matmuls usually still call cuBLAS or a template kernel.</li>
+  <li><strong>Run.</strong> Later calls that pass the guards run the compiled code directly.</li>
+</ol>
+<div class="tbl"><table>
+<tr><th>Mode</th><th>What it adds</th><th>Trade-off</th></tr>
+<tr><td><code>default</code></td><td>Fusion and code generation</td><td>Moderate compile time</td></tr>
+<tr><td><code>reduce-overhead</code></td><td>Also wraps the compiled code in CUDA graphs</td><td>Needs static input addresses and shapes; uses extra memory for graph pools</td></tr>
+<tr><td><code>max-autotune</code></td><td>Benchmarks several kernel configurations (Triton and template GEMMs) and keeps the fastest, plus CUDA graphs</td><td>Much longer compile time</td></tr>
+</table></div>
+<p>Part A of the lab compiles a residual-add, RMSNorm and SiLU-multiply block: on a 2-core CPU it ran 2.3 times faster after a 25-second first compile, with identical results, and a new batch size cost another second.</p>
+<div class="box watch">
+  <span class="lbl">Watch out</span>
+  <p>Compilation happens on the first call with each new set of guards. In a server, that first call is a user request. Warm up with every shape you will see before taking traffic, limit the shapes (pad batches to a few sizes), and use a compile cache so restarts do not recompile.</p>
+</div>
+
+<h2 id="graphs">3. CUDA graphs</h2>
+<p>A CUDA graph is a recorded sequence of GPU operations (kernels, copies) with their arguments. You capture it once by running the code in capture mode; afterwards one replay call launches the entire sequence, and the driver submits it to the GPU with much less CPU work than launching each kernel.</p>
+<pre>g = torch.cuda.CUDAGraph()
+static_in = torch.zeros(batch, hidden, device="cuda", dtype=torch.float16)   # fixed buffer
+s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(s):                       # warm up on a side stream before capture
+    for _ in range(3): step(static_in)
+torch.cuda.current_stream().wait_stream(s)
+with torch.cuda.graph(g):                        # capture: kernels are recorded, not just run
+    static_out = step(static_in)
+
+static_in.copy_(new_input)                       # put new data at the captured address
+g.replay()                                       # one launch for the whole step
+result = static_out                              # results appear at the captured output address</pre>
+<h3>The rules a graph imposes</h3>
+<ul>
+  <li><strong>Fixed shapes.</strong> Each graph is for one set of shapes. Engines capture one graph per batch size in a list (for example 1, 2, 4, 8, 16, ... up to the maximum) and pad each real batch up to the nearest captured size (chapter 3.4).</li>
+  <li><strong>Fixed memory addresses.</strong> Inputs and outputs live in static buffers; data is copied in before replay.</li>
+  <li><strong>No CPU work inside.</strong> No Python decisions, no synchronizations, no allocation that changes between replays. Anything data-dependent must be expressed on the GPU.</li>
+  <li><strong>Memory.</strong> Each captured graph reserves memory for its intermediates (shared pools reduce this). More capture sizes means more memory taken from the KV cache and longer startup.</li>
+</ul>
+<div class="widget" id="cgW">
+  <div class="wt">Interactive: what CUDA graphs save in a decode step</div>
+  <div class="ws">A decode step with a fixed number of kernels per layer. Without graphs, each kernel costs a CPU launch; if the launch is slower than the kernel, the GPU waits. With a graph, the whole step costs one launch. Estimate for a model you choose.</div>
+  <div class="ctrls">
+    <label>Layers <input type="number" id="cgL" value="24" min="1" max="128" style="width:60px"></label>
+    <label>Kernels per layer <input type="number" id="cgK" value="14" min="4" max="40" style="width:60px"></label>
+    <label>GPU time of the whole step (µs) <input type="number" id="cgG" value="1500" min="50" step="50" style="width:80px"></label>
+    <label>CPU cost per launch (µs): <span class="mono" id="cgCv"></span><input type="range" id="cgC" min="2" max="30" step="1" value="8"></label>
+  </div>
+  <div class="stats" id="cgStats"></div>
+</div>
+<p>With 24 layers × 14 kernels = 336 launches at 8 µs each, the CPU needs 2.7 ms per step; if the GPU work is 1.5 ms, eager decode runs at the CPU's pace. A graph brings the step to about the GPU time. This is why small models gain the most, and why the gain fades as batch size (and so GPU time per step) grows.</p>
+
+<h2 id="vllm">4. How vLLM uses both</h2>
+<p>vLLM enables <code>torch.compile</code> by default and combines it with CUDA graphs:</p>
+<ul>
+  <li><strong>Compile before serving.</strong> All compilation and graph capture happen at startup; no request triggers a compile. Compiled artifacts are cached on disk (in <code>~/.cache/vllm/torch_compile_cache</code>), keyed by model, configuration and code, so restarts and identical deployments can reuse them, which shortens cold starts (chapter 6.2).</li>
+  <li><strong>Piecewise graphs.</strong> The model's graph is split at attention operations. The pieces between attention calls (projections, norms, activations, residuals) are compiled and captured as CUDA graphs; attention runs outside them, because its metadata (sequence lengths, block tables) varies per step. vLLM can also capture full graphs including attention for uniform decode batches when the attention backend supports it.</li>
+  <li><strong>Capture sizes.</strong> Graphs are captured for a list of batch sizes, configurable through <code>--compilation-config</code> (newer versions separate token sizes for batches with prefill from request sizes for uniform decode batches). Larger caps capture more graphs and take more memory and startup time.</li>
+  <li><strong>Escape hatch.</strong> <code>--enforce-eager</code> disables graphs (and compilation) for debugging; do not leave it on in production.</li>
+</ul>
+<pre>vllm serve Qwen/Qwen2.5-1.5B-Instruct \
+  --compilation-config '{"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64]}'</pre>
+<p class="note">Option names change between vLLM versions; check <code>vllm serve --help</code> and the torch.compile design document for your version.</p>
+<p>SGLang captures CUDA graphs for decode batch sizes up to a configurable maximum (<code>--cuda-graph-max-bs</code>) and can use <code>torch.compile</code> for small models. TensorRT-LLM builds an optimized engine per model and GPU, with its own graph capture.</p>
+
+<h2 id="ahead">5. Ahead-of-time compilation</h2>
+<p>JIT compilation (on first call) and AOT compilation (before deployment) trade flexibility against startup cost:</p>
+<ul>
+  <li><strong>JIT</strong> (<code>torch.compile</code>): works on any PyTorch model, adapts to shapes at run time, but pays compile time at startup or first use.</li>
+  <li><strong>AOT</strong> (TensorRT and TensorRT-LLM engines, <code>torch.export</code> with AOTInductor): compile once per model, GPU and shape range, ship the result. Fast startup and stable performance; changing the GPU type or shape range means recompiling.</li>
+  <li><strong>Caches</strong> blur the line: vLLM's compile cache and Triton's kernel cache let a JIT system behave like AOT after the first run.</li>
+</ul>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Custom compiler passes</span>
+  <p>vLLM adds its own passes on top of Inductor: fusing RMSNorm with quantization to FP8, fusing activation with quantization, fusing all-reduce with the following RMSNorm (with tensor parallelism), and others. Each is a pattern match on the captured graph that replaces several operations with one custom kernel, the "fusion the compiler cannot find on its own" of chapter 5.4, automated.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Dynamic shapes</span>
+  <p>Compilers can treat a dimension (such as the number of tokens) as symbolic, so one compiled graph serves many sizes. PyTorch distinguishes "backed" symbols, which may still pick up guards and specializations (for example for sizes 0 and 1), from "unbacked" ones, which never guard but can miss optimizations. vLLM exposes this choice because a stray guard can trigger an unexpected recompile; most users keep the default.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">CUDA graphs and speculative decoding</span>
+  <p>Speculative decoding verifies several tokens per sequence per step (chapter 4.3), which changes decode shapes. Engines capture graphs keyed on the number of tokens per request, or by total tokens for mixed batches; adaptive draft lengths make capture more complex. This is one reason new speculative methods often launch with graphs disabled and gain them later.</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Benchmarking the first call of a compiled model and concluding compilation is slow.</li>
+  <li>Letting compilation or graph capture happen on user requests.</li>
+  <li>Leaving <code>--enforce-eager</code> on after debugging.</li>
+  <li>Capturing graphs for dozens of batch sizes and wondering why the KV cache shrank.</li>
+  <li>Putting <code>.item()</code>, Python branches on GPU values, or new allocations inside code meant for graph capture.</li>
+  <li>Changing the GPU type or engine version without expecting caches to be invalidated.</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<p><strong>Goal:</strong> measure what compilation fuses, what a CUDA graph saves, and what recompilation costs.</p>
+<h3>Part A: torch.compile on a transformer block tail (CPU, then T4)</h3>
+<pre>import torch, time
+dev = "cuda" if torch.cuda.is_available() else "cpu"
+def sync():
+    if dev == "cuda": torch.cuda.synchronize()
+def bench(f, *a, reps=50):
+    for _ in range(3): f(*a)
+    sync(); t = time.perf_counter()
+    for _ in range(reps): f(*a)
+    sync(); return (time.perf_counter() - t) / reps * 1e6
+
+def block_tail(x, res, w, gate, up):        # residual add, RMSNorm, SiLU(gate) * up
+    h = x + res
+    h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-6) * w
+    return h, torch.nn.functional.silu(gate) * up
+
+D, F = 4096, 14336
+x, res = torch.randn(8, D, device=dev), torch.randn(8, D, device=dev)
+w = torch.ones(D, device=dev)
+gate, up = torch.randn(8, F, device=dev), torch.randn(8, F, device=dev)
+eager_us = bench(block_tail, x, res, w, gate, up)
+t0 = time.perf_counter(); compiled = torch.compile(block_tail); compiled(x, res, w, gate, up); sync()
+print(f"first compiled call: {time.perf_counter() - t0:.1f} s")
+comp_us = bench(compiled, x, res, w, gate, up)
+print(f"eager {eager_us:.0f} us, compiled {comp_us:.0f} us")
+x2, res2 = torch.randn(13, D, device=dev), torch.randn(13, D, device=dev)
+g2, u2 = torch.randn(13, F, device=dev), torch.randn(13, F, device=dev)
+t0 = time.perf_counter(); compiled(x2, res2, w, g2, u2); sync()
+print(f"first call with batch 13: {time.perf_counter() - t0:.2f} s")</pre>
+<details><summary>What we measured on CPU, and what to look for on a T4</summary><p>On a 2-core CPU: first compiled call 24.6 s (compilation), then eager 159 µs vs compiled 69 µs (2.3 times faster), identical results, and 1.14 s for the first call with a new batch size. On a T4, also set <code>TORCH_LOGS="output_code"</code> before running to print the generated Triton kernels; count them, and find the fused kernel that computes the add, the norm and the multiply in one pass. Then try <code>torch.compile(block_tail, mode="reduce-overhead")</code> and compare.</p></details>
+<h3>Part B: a CUDA graph for a small decode step (T4)</h3>
+<pre>import torch, time
+torch.manual_seed(0)
+L, D = 24, 1024
+layers = [torch.nn.Linear(D, D, bias=False).cuda().half() for _ in range(2 * L)]
+norm_w = torch.ones(D, device="cuda", dtype=torch.float16)
+def step(x):                                   # a toy decode step: 24 x (norm, linear, silu, linear, add)
+    for i in range(L):
+        h = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6).half() * norm_w
+        x = x + layers[2*i+1](torch.nn.functional.silu(layers[2*i](h)))
+    return x
+
+static_in = torch.randn(1, D, device="cuda", dtype=torch.float16)
+def timeit(f, reps=200):
+    for _ in range(10): f()
+    torch.cuda.synchronize(); t = time.perf_counter()
+    for _ in range(reps): f()
+    torch.cuda.synchronize(); return (time.perf_counter() - t) / reps * 1e6
+
+print(f"eager: {timeit(lambda: step(static_in)):.0f} us per step")
+# TODO: capture a CUDA graph of step(static_in) following section 3
+#       (warm up on a side stream, then torch.cuda.graph(g)), then time g.replay()</pre>
+<details><summary>Solution</summary>
+<pre>g = torch.cuda.CUDAGraph()
+s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(s):
+    for _ in range(3): step(static_in)
+torch.cuda.current_stream().wait_stream(s)
+with torch.cuda.graph(g):
+    static_out = step(static_in)
+print(f"graph: {timeit(g.replay):.0f} us per step")
+static_in.copy_(torch.randn_like(static_in)); g.replay()
+print("matches eager:", torch.allclose(static_out, step(static_in), atol=1e-2))</pre>
+<p>What to expect: the eager step launches roughly 24 × 9 ≈ 200 kernels and is limited by launch and Python overhead; the replay removes most of it, typically several times faster for this tiny step. Increase the batch from 1 to 256 and repeat: the GPU time grows, the CPU launch time does not, and the graph's advantage shrinks. Check your result against the widget in section 3.</p></details>
+<h3>Part C: vLLM with and without graphs (T4)</h3>
+<p>Serve Qwen2.5-0.5B-Instruct twice, once with <code>--enforce-eager</code> and once with defaults. Compare startup time (look for compilation and graph capture lines in the log), the KV cache size reported at startup, and single-request tokens per second. Then restart the default server and compare startup time again: did the compile cache help?</p>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Compilation and graphs in production</span>
+  <ul>
+    <li><strong>All major engines</strong> replay CUDA graphs for decode; it is one of the largest single wins for small and medium models.</li>
+    <li><strong>vLLM</strong> compiles by default, splits graphs at attention, and caches compiled artifacts; teams ship the cache with their images to cut cold starts.</li>
+    <li><strong>TensorRT-LLM</strong> users build engines ahead of time per GPU type and shape range as part of their release pipeline.</li>
+    <li><strong>Engine contributors</strong> add fusion passes as new model architectures and quantization formats appear.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz57"></div>
+<script type="application/json" id="qz57">[
+{"q":"What does TorchDynamo do?","o":["Generates Triton kernels","Captures tensor operations from Python bytecode into a graph, with guards","Runs CUDA graphs","Quantizes weights"],"a":1,"e":"Inductor then lowers and fuses the captured graph."},
+{"q":"A guard fails because the batch size changed. What happens?","o":["An error","A recompile, or use of a dynamic-shape version","Silent wrong results","Eager fallback forever"],"a":1,"e":"Guards protect the compiled code's assumptions."},
+{"q":"Why do engines pad decode batches to fixed sizes?","o":["Better accuracy","Each CUDA graph is captured for one shape","Attention needs it","To save memory"],"a":1,"e":"Pad up to the nearest captured size and replay its graph."},
+{"q":"CUDA graphs mainly remove:","o":["Memory traffic","Per-kernel CPU launch overhead","FLOPs","Network time"],"a":1,"e":"The same kernels run; the CPU launches them all at once."},
+{"q":"Why does vLLM split its graphs at attention?","o":["Attention is slow","Attention's metadata varies from step to step, so the rest is captured around it","Attention uses CPU","Licensing"],"a":1,"e":"Piecewise graphs keep everything else captured."},
+{"q":"How do you avoid compile time on a restarted server?","o":["Disable compilation","Reuse the on-disk compile and kernel caches","Use FP32","Use a bigger GPU"],"a":1,"e":"Cached artifacts skip recompilation when nothing relevant changed."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>Eager execution pays Python, dispatch and launch costs per operation and cannot fuse.</li>
+  <li><code>torch.compile</code> captures graphs with guards, fuses operations and generates Triton or C++; graph breaks and failed guards cost performance and recompiles.</li>
+  <li>CUDA graphs replay a recorded step with one launch; they require fixed shapes, fixed addresses and no CPU work inside, and they use memory.</li>
+  <li>vLLM compiles before serving, captures piecewise graphs around attention for a list of batch sizes, and caches artifacts.</li>
+  <li>Warm up every shape before traffic, limit shapes, and keep caches to protect startup and tail latency.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/design/torch_compile/">vLLM: torch.compile integration</a></td><td>Compilation before serving, the compile cache, piecewise graphs split at attention, capture sizes and dynamic shapes.</td></tr>
+<tr><td><a href="https://docs.pytorch.org/docs/stable/torch.compiler.html">PyTorch: torch.compiler</a> and <a href="https://docs.pytorch.org/docs/stable/notes/cuda.html#cuda-graphs">CUDA graphs notes</a></td><td>Dynamo, Inductor, modes, guards, and the CUDA graph capture API and rules.</td></tr>
+<tr><td><a href="https://modal.com/blog/host-overhead-inference-efficiency">Modal: Host overhead</a></td><td>Kernel launch counts cut by the PyTorch compiler, and CUDA graphs in production engines.</td></tr>
+<tr><td><a href="https://horace.io/brrr_intro.html">Horace He: Making deep learning go brrrr</a></td><td>Why overhead dominates small workloads, and why compilers and graphs help.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 4.1 and 4.2</td><td>CUDA graphs and compilation in the inference software stack.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 11</td><td>Compilation in TensorRT-LLM, with torch.compile as a stand-in.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. Part A was run on CPU with PyTorch 2.15; Parts B and C need a GPU.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$}=IE;
+function cg(){const L=+$('cgL').value,K=+$('cgK').value,G=+$('cgG').value,C=+$('cgC').value;$('cgCv').textContent=C;
+  const n=L*K,cpu=n*C,eager=Math.max(cpu,G)+C,graph=G+15;
+  $('cgStats').innerHTML=[['Kernel launches per step',IE.int(n)],['CPU launch time, eager',IE.int(cpu)+' µs'],['Step time, eager',IE.int(eager)+' µs'],['Step time, CUDA graph',IE.int(graph)+' µs'],['Speedup',(eager/graph).toFixed(2)+'×'],['Bound (eager)',cpu>G?'CPU (overhead)':'GPU']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['cgL','cgK','cgG','cgC'].forEach(id=>$(id).addEventListener('input',cg));cg();
+})();
+</script>
