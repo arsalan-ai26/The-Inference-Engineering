@@ -90,7 +90,24 @@
 <h2 id="diffusion">7. Diffusion inference</h2>
 <p>Diffusion models refine noise into an image or video over a number of steps; each step is a large, compute-bound forward pass of a U-Net or diffusion transformer. Hugging Face Diffusers lists the levers: run in reduced precision (FP16 or BF16, and TF32 matmuls on Ampere and later); use scaled dot-product attention, which picks FlashAttention or memory-efficient kernels automatically; compile the heavy components (U-Net or transformer, VAE) with <code>torch.compile</code>; and combine techniques. The largest lever is fewer steps (better schedulers, distilled few-step models), which trades quality for time: measure quality at each step budget, as chapter 3.7 described for serving systems such as SGLang Diffusion and vLLM-Omni.</p>
 
-<h2 id="expert">8. Expert layer</h2>
+<h2 id="embed">8. Embedding and reranker serving</h2>
+<p>Every RAG system has two more models besides the chat model: an embedding model that turns chunks and queries into vectors, and often a reranker that rescores the retrieved candidates. They are served differently.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Embedding model (bi-encoder):</strong> a model that maps one text to one vector; query and document are encoded separately and compared by cosine similarity, so documents can be embedded once, offline.</p>
+  <p><strong>Pooling:</strong> how a sequence of hidden states becomes one vector: the first token's state (CLS pooling, the default for BERT-style encoders), the last token's (LAST, for decoder-style embedding models) or the mean over all tokens (MEAN).</p>
+  <p><strong>Reranker (cross-encoder):</strong> a model that reads a query and one document together and outputs a single relevance score; it is more accurate than comparing vectors but must run once per query-document pair.</p>
+</div>
+<p>Both are <strong>prefill-only</strong> workloads: one forward pass, no decode, no KV cache that grows, no streaming. That changes what matters:</p>
+<ul>
+  <li><strong>Throughput is tokens per second of prefill</strong>, and the model is small (tens of millions to a few billion parameters), so a GPU is compute-bound almost immediately and needs large batches of tokens to stay busy (chapter 2.5).</li>
+  <li><strong>Padding is the hidden cost.</strong> A batch of texts is padded to its longest member; with chunk lengths that vary, a large share of the compute is spent on padding unless the server batches by tokens or groups texts of similar length. Hugging Face's Text Embeddings Inference (TEI) uses token-based dynamic batching for this reason, along with Flash Attention kernels, and ships CPU, Metal and GPU builds.</li>
+  <li><strong>Engines.</strong> vLLM serves embedding, classification and scoring models with the pooling runner (<code>vllm serve &lt;model&gt; --runner pooling</code>), with an OpenAI-compatible <code>/v1/embeddings</code> endpoint, a <code>/score</code> endpoint and Cohere-compatible <code>/rerank</code>. Its documentation says pooling support is there mainly for convenience and is not guaranteed to be faster than Hugging Face Transformers or Sentence Transformers. TEI supports common embedding models and rerankers (for example BAAI's bge rerankers and Alibaba's gte rerankers).</li>
+  <li><strong>Cost per million embedded tokens</strong> is GPU-hour price ÷ (prefill tokens per second × 3,600 ÷ 10⁶), the same formula as chapter 4.8's revenue per GPU-hour. Embedding a corpus is a batch job (section 5): run it in troughs, at the largest batch that fits.</li>
+  <li><strong>Rerankers dominate per-query cost.</strong> The query embedding is a few tokens; reranking 100 candidates of 300 tokens is a prefill of 32,000 tokens per query (lab Part D). Cap the candidates, keep the reranker small, and batch all pairs of a query together.</li>
+</ul>
+
+<h2 id="expert">9. Expert layer</h2>
 <div class="box expert">
   <span class="lbl">Mixed workloads on one fleet</span>
   <p>Interactive chat, long reasoning requests and batch jobs on the same replicas interfere: long decodes hold KV blocks, long prefills stall decodes (chapter 3.2), batch traffic fills queues. Production systems separate them by pool (routing by expected length or model mode), by priority (batch yields to interactive, chapter 6.4), or by time (batch in troughs), and measure each class against its own SLO.</p>
@@ -100,7 +117,7 @@
   <p>Many multimodal workloads reuse the same image or document across turns. Caching encoder outputs by a hash of the media (and the processor settings) avoids re-encoding, the multimodal analogue of prefix caching; it needs the same safety rules (scope to model and processor version, and to tenant, chapter 6.9).</p>
 </div>
 
-<h2 id="mistakes">9. Common mistakes</h2>
+<h2 id="mistakes">10. Common mistakes</h2>
 <ul>
   <li>One SLO for all workloads on a shared fleet.</li>
   <li>Planning reasoning capacity from median output length.</li>
@@ -110,7 +127,7 @@
   <li>RL rollouts with a different chat template or numerics from training.</li>
 </ul>
 
-<h2 id="lab">10. Lab</h2>
+<h2 id="lab">11. Lab</h2>
 <h3>Part A: throughput-first vs latency-first</h3>
 <pre>import torch, time
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -137,7 +154,57 @@ batch 16:   54.8 output tok/s total,   3.4 tok/s per request,  18.7 s per batch<
 <h3>Part C: two workload projects</h3>
 <p>Pick two workloads from section 2. For each: write the five-part definition from section 1, serve it on one GPU with the settings from this chapter, measure the metric from the table, and write which earlier technique changed the result most and by how much.</p>
 
-<h2 id="realworld">11. In the real world</h2>
+<h3>Part D: embedding throughput and reranker cost (CPU, about 30 minutes)</h3>
+<p>Embed real text (the book's own chapter sources, so run it from the repository root, or point the glob at any folder of text) with a 33M-parameter embedding model, cut into 10,000 chunks of 16 to 126 tokens. Time 2,000 of them at several batch sizes, with and without sorting by length. Predict first: on a 2-core CPU, how much faster is batch 128 than batch 1?</p>
+<pre># Embedding throughput on CPU: batch size and padding (lab for chapter 8.1)
+import glob, re, time, torch
+from transformers import AutoModel, AutoTokenizer
+torch.manual_seed(0); torch.set_num_threads(2)
+name = "BAAI/bge-small-en-v1.5"                 # 33M-parameter BERT-style encoder, CLS pooling
+tok = AutoTokenizer.from_pretrained(name); model = AutoModel.from_pretrained(name, dtype=torch.float32).eval()
+# real text: the book's own chapters, split into chunks of up to 128 tokens
+text = " ".join(re.sub(r"&lt;[^&gt;]+&gt;", " ", open(f).read()) for f in sorted(glob.glob("src/*.html")))
+ids = tok(text, add_special_tokens=False)["input_ids"]
+rng = torch.Generator().manual_seed(0)
+lens = torch.randint(16, 127, (10_000,), generator=rng).tolist()      # chunk lengths vary, as in real RAG
+chunks, pos = [], 0
+for L in lens:
+    chunks.append(tok.decode(ids[pos:pos + L])); pos = (pos + L) % (len(ids) - 200)
+def embed(texts, bs, sort):
+    order = sorted(range(len(texts)), key=lambda i: len(texts[i])) if sort else list(range(len(texts)))
+    real = padded = 0; t = time.perf_counter()
+    with torch.no_grad():
+        for i in range(0, len(order), bs):
+            batch = tok([texts[j] for j in order[i:i + bs]], padding=True, truncation=True, max_length=128, return_tensors="pt")
+            out = model(**batch).last_hidden_state[:, 0]                    # CLS pooling
+            out = torch.nn.functional.normalize(out, dim=-1)
+            real += int(batch["attention_mask"].sum()); padded += batch["input_ids"].numel()
+    return len(texts) / (time.perf_counter() - t), real, padded
+sample = chunks[:2_000]
+embed(sample[:64], 32, False)                                               # warm-up
+for bs, sort in [(1, False), (8, False), (32, False), (128, False), (32, True), (128, True)]:
+    cps, real, padded = embed(sample, bs, sort)
+    print(f"batch {bs:3d} {'sorted ' if sort else 'unsorted'}: {cps:6.1f} chunks/s, padding waste {1 - real/padded:5.1%}, "
+          f"10,000 chunks in {10_000/cps/60:4.1f} min, {real/2000:.0f} real tokens per chunk")</pre>
+<details><summary>What we measured (2-core CPU, PyTorch 2.15, Transformers 5.22)</summary><pre class="out">batch   1 unsorted:   28.5 chunks/s, padding waste  0.0%, 10,000 chunks in  5.8 min, 73 real tokens per chunk
+batch   8 unsorted:   32.6 chunks/s, padding waste 37.0%, 10,000 chunks in  5.1 min, 73 real tokens per chunk
+batch  32 unsorted:   26.5 chunks/s, padding waste 41.4%, 10,000 chunks in  6.3 min, 73 real tokens per chunk
+batch 128 unsorted:   26.9 chunks/s, padding waste 42.5%, 10,000 chunks in  6.2 min, 73 real tokens per chunk
+batch  32 sorted :   38.8 chunks/s, padding waste 25.9%, 10,000 chunks in  4.3 min, 73 real tokens per chunk
+batch 128 sorted :   34.8 chunks/s, padding waste 29.0%, 10,000 chunks in  4.8 min, 73 real tokens per chunk</pre><p>On a CPU, batching barely helps: a 73-token chunk already gives the two cores enough work, and larger unsorted batches lose what they gain to padding, which wastes about 40% of the compute. Sorting by length cuts the waste to about a quarter and is the biggest win here, about 1.4 times. On a GPU, batch 1 leaves almost all of the chip idle, so batching is the first lever and padding control (sorting or token-based batching) the second. Rerun it on a Colab T4 with <code>.cuda()</code> and compare.</p></details>
+<p>Then compute what reranking adds per query:</p>
+<pre># What reranking costs compared with embedding the query (prefill tokens per user query)
+query, doc, candidates = 20, 300, 100
+embed_query = query                              # bi-encoder: documents were embedded once, offline
+rerank = candidates * (query + doc)              # cross-encoder: one forward pass per (query, document) pair
+print(f"embed the query: {embed_query} tokens; rerank {candidates} candidates: {rerank:,} tokens ({rerank/embed_query:,.0f}x)")
+for k in (20, 50):
+    print(f"rerank only the top {k}: {k*(query+doc):,} tokens")</pre>
+<details><summary>What we computed</summary><pre class="out">embed the query: 20 tokens; rerank 100 candidates: 32,000 tokens (1,600x)
+rerank only the top 20: 6,400 tokens
+rerank only the top 50: 16,000 tokens</pre><p>Reranking is thousands of times the query's own embedding work, which is why the number of candidates is the main cost knob of a RAG pipeline.</p></details>
+
+<h2 id="realworld">12. In the real world</h2>
 <div class="box real">
   <span class="lbl">In practice</span>
   <ul>
@@ -147,7 +214,7 @@ batch 16:   54.8 output tok/s total,   3.4 tok/s per request,  18.7 s per batch<
   </ul>
 </div>
 
-<h2 id="quiz">12. Check yourself</h2>
+<h2 id="quiz">13. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz81"></div>
 <script type="application/json" id="qz81">[
 {"q":"For a reasoning model with very long outputs, the first limit on one GPU is usually:","o":["Compute","KV cache memory","Network","Tokenization"],"a":1,"e":"Each request's KV grows for thousands of tokens."},
@@ -158,16 +225,19 @@ batch 16:   54.8 output tok/s total,   3.4 tok/s per request,  18.7 s per batch<
 {"q":"The largest lever for diffusion latency is usually:","o":["Prefix caching","The number of denoising steps","Speculative decoding","LoRA"],"a":1,"e":"Then precision, attention kernels and compilation."}
 ]</script>
 
-<h2 id="summary">13. Summary</h2>
+<h2 id="summary">14. Summary</h2>
 <ul>
   <li>Define shape, arrival, SLO, quality target and cost target before choosing a system.</li>
   <li>Each workload stresses a different resource: grammar checks, adapters, encoders, prefixes, KV growth, batch throughput, weight sync or denoising steps.</li>
   <li>Reasoning: plan KV for the tail, use thinking budgets. Batch: maximize batch size and minimize cost. Multimodal: limit and cache media. RL: fast weight sync, async rollouts, matched numerics. Diffusion: fewer steps, lower precision, compiled kernels.</li>
 </ul>
 
-<h2 id="refs">14. References</h2>
+<h2 id="refs">15. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/models/pooling_models/">vLLM: Pooling models</a></td><td>Pooling types, embedding, score and rerank endpoints, and the convenience caveat.</td></tr>
+<tr><td><a href="https://github.com/huggingface/text-embeddings-inference">Hugging Face Text Embeddings Inference</a></td><td>A dedicated embedding and reranker server with token-based dynamic batching.</td></tr>
+<tr><td><a href="https://huggingface.co/BAAI/bge-small-en-v1.5">BAAI bge-small-en-v1.5</a></td><td>The embedding model used in lab Part D.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1</a>, <a href="https://arxiv.org/abs/2505.09388">Qwen3 Technical Report</a> and <a href="https://arxiv.org/abs/2506.13585">MiniMax-M1</a></td><td>The reasoning workload, thinking budgets in one model, and the FLOPs of long generations with linear attention.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/features/multimodal_inputs.html">vLLM: Multimodal inputs</a></td><td>Media limits, precomputed embeddings and video token pruning.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/features/reasoning_outputs.html">vLLM: Reasoning outputs</a></td><td>Reasoning parsers, the reasoning field, per-model thinking switches and thinking budgets.</td></tr>
@@ -177,7 +247,7 @@ batch 16:   54.8 output tok/s total,   3.4 tok/s per request,  18.7 s per batch<
 <tr><td><a href="https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook">Hugging Face, The Smol Training Playbook</a></td><td>Measured output length distributions of thinking and non-thinking modes.</td></tr>
 <tr><td>Chapter 3.7 sources (vLLM-Omni, SGLang Diffusion, Cornserve)</td><td>Multimodal and diffusion serving systems.</td></tr>
 </table></div>
-<p class="note">Facts checked on 7 November 2026. Part A measured on 2 CPU cores with PyTorch 2.15 and Transformers 5.22; Parts B and C are exercises with expected behaviour.</p>
+<p class="note">Facts checked on 7 November 2026. Parts A and D measured on 2 CPU cores with PyTorch 2.15 and Transformers 5.22; Parts B and C are exercises with expected behaviour.</p>
 <!--SCRIPT-->
 <script>
 (function(){
