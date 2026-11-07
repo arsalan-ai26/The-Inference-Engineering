@@ -1,0 +1,188 @@
+<div class="kicker">Part 7 · Fine-tuning and post-training · Chapter 7.7</div>
+<h1>Expert depth: training systems</h1>
+<p class="lede">Behind every model you serve is a training run that cost thousands to millions of GPU hours. Inference engineers meet training systems more and more: RL and distillation put inference inside training, continued pretraining adds knowledge, and training choices (optimizer, precision, data filtering, architecture) decide what you serve. This chapter covers what a pretraining run costs and how efficiently it uses the GPUs, how training memory is sharded, MoE pretraining at scale, new optimizers such as Muon, evolution strategies that train at inference speed, and data techniques that shape what a model can and cannot do.</p>
+<div class="meta">
+  <span class="chip">Level: expert</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 2.5, 4.5, 7.3</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>A 70B model trains with AdamW in mixed precision on 64 GPUs with FSDP (ZeRO-3). How much model state does each GPU hold?</li>
+    <li>What does Muon do to an update matrix before applying it?</li>
+    <li>Why is MoE pretraining often limited by the network rather than by FLOPs?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>About 16 bytes × 70B ÷ 64 ≈ 17.5 GB of weights, gradients and optimizer state, plus activations. Without sharding it would be 1.12 TB per GPU, which does not fit.</li>
+    <li>It orthogonalizes it with a few Newton-Schulz iterations: the update keeps its directions but all its singular values are pushed close to 1, so rare directions get as much step size as dominant ones.</li>
+    <li>Expert parallelism sends every token to the GPUs holding its chosen experts and back (all-to-all) in every MoE layer, forward and backward, while each expert's matmul is small (chapter 4.5).</li>
+  </ol></details>
+</div>
+
+<h2 id="cost">1. What pretraining costs</h2>
+<p>Hugging Face published the full budget for SmolLM3, a 3B model trained on 11 trillion tokens: the main run used 384 H100s for 30 days (276,480 GPU hours), pretraining ablations 69,120, mid-training ablations 46,080, and resets and debugging another 46,080: about 438,000 GPU hours in total, with evaluations adding just under 10,000. Ablations and failures cost more than half as much as the final run.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>MFU (model FLOPs utilization):</strong> useful model FLOPs per second ÷ the GPU's peak (chapter 2.5), the main efficiency score for training.</p>
+  <p><strong>Data parallelism:</strong> each GPU holds a copy of the model and processes different data; gradients are averaged with all-reduce.</p>
+  <p><strong>ZeRO and FSDP (fully sharded data parallelism):</strong> data parallelism that shards optimizer state (ZeRO-1), also gradients (ZeRO-2), and also the weights themselves (ZeRO-3, FSDP) across the GPUs, gathering weights just in time for each layer.</p>
+</div>
+<p>Typical MFU: Hugging Face's BF16 matmul kernels reached 72 to 77% of the H100's peak, but end-to-end training reaches much less: about 30% for SmolLM3, 38 to 41% for Llama 3 405B, and 20 to 30% for DeepSeek-V3, whose MoE layers are communication-bound. Most of the gap is communication between nodes.</p>
+<div class="widget" id="zrW">
+  <div class="wt">Interactive: training memory with sharding</div>
+  <div class="ws">Model state per GPU for mixed-precision AdamW (2 bytes weights + 2 gradients + 12 optimizer: FP32 master copy and two moments), using the ZeRO paper's breakdown. Activations come on top and depend on batch, sequence and checkpointing (chapter 7.3).</div>
+  <div class="ctrls">
+    <label>Parameters (billions) <input type="number" id="zrP" value="70" step="1" min="0.1" style="width:84px"></label>
+    <label>Data-parallel GPUs <input type="number" id="zrN" value="64" step="8" min="1" style="width:84px"></label>
+    <label>GPU memory (GB) <select id="zrG"><option>24</option><option selected>80</option><option>141</option><option>192</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="zrSvg" viewBox="0 0 680 190" width="680" style="max-width:100%;height:auto" role="img" aria-label="Memory per GPU for each sharding stage"></svg></div>
+</div>
+<p>Sharding the weights (ZeRO-3, FSDP) costs extra communication: each layer's weights are all-gathered before use and gradients reduce-scattered after. Large runs combine FSDP with pipeline, tensor and expert parallelism to balance memory and communication. The Smol playbook's rule for post-training: plain data parallelism is enough for small models and LoRA; larger full fine-tunes need FSDP2 or DeepSpeed ZeRO-3.</p>
+
+<h2 id="moe">2. MoE pretraining at scale</h2>
+<p>AMD and Meta's PyTorch team tuned TorchTitan (Meta's PyTorch-native training stack, configured by parallelism degrees in one file) with AMD's Primus-Turbo kernels on MI325X GPUs. They report a 2.77 times speedup on DeepSeek-V3 671B from kernel work alone, 96% scaling efficiency from 128 to 1,024 GPUs, and linear scaling for Llama 4 Scout from 32 to 512 GPUs. The three problems they name are the same ones inference faces (chapter 4.5):</p>
+<ul>
+  <li><strong>All-to-all traffic</strong> for expert parallelism in every MoE layer; large GPU memory (256 GB per MI325X) lets more experts stay local and shrinks the expert-parallel degree.</li>
+  <li><strong>Small expert matmuls</strong>, turned into high-occupancy work with grouped GEMM kernels and FP8.</li>
+  <li><strong>Pipeline bubbles</strong> when FSDP, pipeline and expert parallelism are not overlapped well.</li>
+</ul>
+<div class="box expert">
+  <span class="lbl">Character.ai's pretraining techniques</span>
+  <p>Character.ai's early pretraining cluster had a quarter of the network bandwidth of state-of-the-art systems, so Noam Shazeer designed <strong>Squinch</strong>: 6-bit gradient compression that packs 8 gradient values into 48 bits (a shared maximum, sign bits and 4-bit magnitudes), tuned to the distribution of transformer gradients, with negligible loss in training fidelity. Other published techniques: <strong>attention Z-regularization</strong>, a virtual loss that keeps attention logits near zero where BF16 has fine resolution; <strong>dynamic clamping</strong> in quantization-aware training, which sets clamp limits from weight statistics; and a <strong>visibility mask</strong>, two per-token tensors that describe which tokens each token may attend to, covering causal, document-packed and tree layouts compactly.</p>
+</div>
+
+<h2 id="opt">3. Optimizers beyond AdamW</h2>
+<p>Muon (MomentUm Orthogonalized by Newton-Schulz) is an optimizer for the 2D weight matrices of hidden layers. It takes the SGD-momentum update and replaces it with the nearest semi-orthogonal matrix, using five iterations of a tuned Newton-Schulz polynomial in BF16. Keller Jordan's motivation: updates from SGD-momentum and Adam for transformer weights tend to be dominated by a few directions; orthogonalizing raises the scale of rare directions. Embeddings, the output head and scalar parameters stay on AdamW.</p>
+<div class="formula">Muon FLOP overhead ≤ T × m ÷ B   (T Newton-Schulz steps, m model dimension, B tokens per batch)</div>
+<p>For the NanoGPT speedrun (m = 768, B = 524,288, T = 5) that is 0.7%; for Llama 405B (m = 16,384, B = 16 million) about 0.5%. Muon set speed records for NanoGPT speedrunning (1.35 times faster to the target loss) and CIFAR-10, and NVIDIA's Emerging Optimizers project notes that Muon was used to train Kimi K2. That project also implements Shampoo and SOAP, which precondition with matrix (Kronecker-factored) statistics rather than Adam's per-element ones.</p>
+
+<h2 id="es">4. Evolution strategies at inference speed</h2>
+<p>Evolution strategies (ES) optimize without backpropagation: perturb the weights randomly, evaluate a population of perturbed models, and move the weights toward the better ones. Naive ES on billion-parameter models is slow because each population member needs its own full weight perturbation, which turns batched inference into low-intensity work. EGGROLL makes each perturbation low-rank (like a LoRA adapter), so a population evaluates as batched LoRA inference: a hundredfold increase in training throughput over naive ES at large populations, up to 91% of the throughput of pure batched inference, while the combined update is still full-rank. In their words, if you can run batched LoRA inference and define a fitness score, you can train. They used it to pretrain a recurrent language model that runs purely in integer arithmetic, something backpropagation handles poorly.</p>
+
+<h2 id="data">5. Data: filtering, masking, synthetic data, continued pretraining</h2>
+<ul>
+  <li><strong>Token-level filtering.</strong> Rathi et al. removed a capability (medical knowledge, as a proxy) by filtering pretraining data and found filtering individual tokens beats filtering whole documents: the same loss of the unwanted capability at a lower cost to others. The effect grows with scale; for their largest models, token filtering made learning the forgotten domain 7,000 times more compute-expensive. Filtered models could still be aligned on that domain.</li>
+  <li><strong>Selective gradient masking (SGTM).</strong> Anthropic Fellows research routes learning from flagged dangerous examples into dedicated parameters that are removed afterwards. It traded off removal and general capability better than data filtering when labels are imperfect, and needed 7 times more retraining to restore removed knowledge than other unlearning methods.</li>
+  <li><strong>Document masking.</strong> When documents are packed into long sequences, intra-document masking stops attention across documents (chapter 7.2's packing). Hugging Face saw no effect at short context but found it matters for long-context extension, as Meta reported for Llama 3.</li>
+  <li><strong>Synthetic data</strong> generated by models now makes up much of post-training data and part of pretraining; the quality of generation and filtering decides its value.</li>
+  <li><strong>Continued pretraining (mid-training)</strong> on domain text adds knowledge (chapter 7.1); it needs a lower learning rate than pretraining and mixed-in general data to limit forgetting. Unsloth provides a LoRA-based continued-pretraining notebook for 7B models on one GPU.</li>
+</ul>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Where training and inference converge</span>
+  <p>RL rollouts (chapter 7.4), on-policy distillation (7.5), ES populations (section 4) and evaluation all run inference inside training. Bitwise-consistent kernels (chapter 7.6), shared model definitions between trainer and engine, fast weight synchronization, and LoRA-based population or policy updates are the shared infrastructure. An inference engine is now a training component.</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Budgeting only the final run, not ablations, failures and evaluations.</li>
+  <li>Judging a cluster by kernel benchmarks instead of end-to-end MFU.</li>
+  <li>Using Muon on embeddings or the output head.</li>
+  <li>Continued pretraining at the original learning rate without general data mixed in.</li>
+  <li>Packing documents without masking across them for long-context training.</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<h3>Part A: Muon vs AdamW on a tiny language model</h3>
+<p>A 4-layer, 128-wide character-level transformer on 2 MB of WikiText-2, 300 steps of batch 32 × 128 characters on CPU. Muon updates the hidden 2D weights; AdamW updates everything else (and everything, in the AdamW run). Predict first: will Muon's validation loss after 300 steps be lower, the same, or higher?</p>
+<pre>def newtonschulz5(G, steps=5, eps=1e-7):                 # from Keller Jordan's Muon post
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16(); X /= (X.norm() + eps)
+    if G.size(0) > G.size(1): X = X.T
+    for _ in range(steps):
+        A = X @ X.T; B = b * A + c * A @ A; X = a * X + B @ X
+    if G.size(0) > G.size(1): X = X.T
+    return X.to(G.dtype)
+
+class Muon(torch.optim.Optimizer):                     # a simplified version of the reference implementation
+    def __init__(s, params, lr=0.02, momentum=0.95): super().__init__(params, dict(lr=lr, momentum=momentum))
+    @torch.no_grad()
+    def step(s):
+        for g in s.param_groups:
+            for p in g["params"]:
+                buf = s.state[p].setdefault("buf", torch.zeros_like(p))
+                buf.mul_(g["momentum"]).add_(p.grad)
+                u = newtonschulz5(p.grad.add(buf, alpha=g["momentum"]))     # Nesterov momentum, then orthogonalize
+                p.add_(u, alpha=-g["lr"] * max(1, p.size(0) / p.size(1)) ** 0.5)
+
+hidden = [p for n, p in model.named_parameters() if p.ndim == 2 and "blocks" in n]
+other  = [p for n, p in model.named_parameters() if not (p.ndim == 2 and "blocks" in n)]
+opts = [Muon(hidden, lr=0.02), torch.optim.AdamW(other, lr=3e-3, betas=(0.9, 0.95))]
+# the model (4 transformer blocks, character embeddings) and training loop are in the lab notebook</pre>
+<details><summary>What we measured (2 CPU cores, about 1 minute per run)</summary><pre class="out">adamw (62 s): val loss by step [(0, 6.141), (50, 2.486), (100, 2.449), (150, 2.425), (200, 2.416), (250, 2.393), (300, 2.374)]
+muon  (64 s): val loss by step [(0, 6.141), (50, 2.451), (100, 2.405), (150, 2.325), (200, 2.107), (250, 1.943), (300, 1.833)]
+singular values of a random update: before 4.84..27.11, after Newton-Schulz 0.68..1.14
+AdamW at lr 1e-3 and 1e-2 ended at 2.389 and 2.435.</pre>
+<p>AdamW at three learning rates stalled near 2.4; Muon broke through to 1.83 in the same steps and time. The singular values show what Newton-Schulz does: a spread of 4.8 to 27 becomes 0.7 to 1.1. This is one short toy run without schedules or tuning, so treat it as an illustration of the mechanism, not a benchmark; the speedrun results are the evidence at scale.</p></details>
+<h3>Part B: Muon's overhead</h3>
+<p>Compute T × m ÷ B for a model you know (for example Llama 3 8B, m = 4,096, with 4 million tokens per batch) and compare with the 0.5 to 0.7% in section 3. Then compute the per-GPU model state for that model with FSDP on 8, 32 and 128 GPUs with the widget.</p>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Training systems in practice</span>
+  <ul>
+    <li><strong>Labs</strong> run pretraining with FSDP plus pipeline, tensor and expert parallelism at 20 to 40% MFU.</li>
+    <li><strong>Open training stacks</strong> (TorchTitan, Megatron, NeMo, nanotron) publish recipes; RL frameworks embed inference engines.</li>
+    <li><strong>Optimizers</strong> such as Muon have moved from speedruns to frontier pretraining.</li>
+    <li><strong>Safety-motivated data work</strong> (token filtering, gradient routing) shapes capabilities during training rather than after.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz77"></div>
+<script type="application/json" id="qz77">[
+{"q":"SmolLM3's total training budget was about how many GPU hours?","o":["44,000","276,000","438,000","4.4 million"],"a":2,"e":"The main run was 276,480; ablations and debugging added the rest."},
+{"q":"ZeRO-3 / FSDP shards:","o":["Only optimizer state","Optimizer state and gradients","Optimizer state, gradients and weights","Activations only"],"a":2,"e":"Weights are gathered just in time per layer."},
+{"q":"Muon's update is:","o":["Adam with weight decay","SGD-momentum orthogonalized by Newton-Schulz","Sign of the gradient","Random"],"a":1,"e":"For 2D hidden weights only."},
+{"q":"Muon's FLOP overhead for Llama 405B training is about:","o":["0.5%","5%","50%","2×"],"a":0,"e":"T × m ÷ B = 5 × 16,384 ÷ 16 million."},
+{"q":"EGGROLL makes evolution strategies fast by:","o":["Using backpropagation","Low-rank perturbations evaluated as batched LoRA inference","Smaller populations","CPU training"],"a":1,"e":"Up to 91% of batched inference throughput."},
+{"q":"Token-level filtering compared with document-level filtering:","o":["Removes less","Same removal of the unwanted capability at lower cost to others","Is impossible","Only works for small models"],"a":1,"e":"And it grows more effective with scale."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>Pretraining costs hundreds of thousands to millions of GPU hours, much of it ablations; end-to-end MFU is typically 20 to 40%.</li>
+  <li>Model state is about 16 bytes per parameter; ZeRO and FSDP shard it across data-parallel GPUs at a communication cost.</li>
+  <li>MoE pretraining is bound by all-to-all and small matmuls; grouped GEMM, FP8 and careful parallelism layouts address them.</li>
+  <li>Muon orthogonalizes updates for hidden matrices at under 1% overhead; ES with low-rank perturbations trains at nearly inference speed.</li>
+  <li>Data techniques (token filtering, gradient masking, document masking, synthetic data) shape what models can do.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook">Hugging Face, The Smol Training Playbook</a></td><td>SmolLM3's GPU-hour budget, MFU numbers, parallelism choices and document masking.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/1910.02054">Rajbhandari et al., ZeRO</a></td><td>Memory breakdown of mixed-precision training and the sharding stages.</td></tr>
+<tr><td><a href="https://pytorch.org/blog/efficient-moe-pre-training-at-scale-with-torchtitan/">PyTorch and AMD, Efficient MoE Pre-Training at Scale with TorchTitan</a></td><td>MoE pretraining bottlenecks and scaling results on MI325X.</td></tr>
+<tr><td><a href="https://blog.character.ai/squinch/">Character.ai, Optimizing Large-Scale Pretraining (Squinch)</a></td><td>6-bit gradient compression, attention Z-regularization, dynamic clamping and visibility masks.</td></tr>
+<tr><td><a href="https://kellerjordan.github.io/posts/muon/">Keller Jordan, Muon</a> and <a href="https://main-horse.github.io/translations/kexue/11416/">main-horse, Muon optimizer guide</a></td><td>The algorithm, Newton-Schulz coefficients, overhead analysis and speedrun results.</td></tr>
+<tr><td><a href="https://github.com/NVIDIA-NeMo/Emerging-Optimizers">NVIDIA NeMo, Emerging Optimizers</a></td><td>Shampoo, SOAP and Muon implementations; Muon's use in Kimi K2.</td></tr>
+<tr><td><a href="https://eshyperscale.github.io/">Sarkar et al., Evolution Strategies at the Hyperscale (EGGROLL)</a></td><td>Low-rank ES at near batched-inference throughput.</td></tr>
+<tr><td><a href="https://github.com/neilrathi/token-filtering">Rathi et al., Shaping capabilities with token-level data filtering</a></td><td>Token vs document filtering and its scaling.</td></tr>
+<tr><td><a href="https://alignment.anthropic.com/2025/selective-gradient-masking/">Shilov et al., Beyond Data Filtering: Selective Gradient Masking</a></td><td>Localizing and removing knowledge during training.</td></tr>
+<tr><td><a href="https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Mistral_v0.3_(7B)-CPT.ipynb">Unsloth, Continued pretraining notebook</a></td><td>A single-GPU continued-pretraining recipe.</td></tr>
+</table></div>
+<h3>Sources considered and not used</h3>
+<ul><li>The LMSYS post on FSDP2 for miles returned "not found"; the nanochat discussion could not be retrieved; the Physics of Language Models synthetic-data talk is a video and was not reviewed.</li></ul>
+<p class="note">Facts checked on 7 November 2026. Part A measured on 2 CPU cores with PyTorch 2.15.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$,el,css}=IE;
+function zr(){const P=+$('zrP').value*1e9,N=Math.max(1,+$('zrN').value),G=+$('zrG').value;
+  const st=[['No sharding',2*P,2*P,12*P],['ZeRO-1 (optimizer)',2*P,2*P,12*P/N],['ZeRO-2 (+ gradients)',2*P,2*P/N,12*P/N],['ZeRO-3 / FSDP (+ weights)',2*P/N,2*P/N,12*P/N]];
+  const s=$('zrSvg');s.innerHTML='';const x0=180,x1=640;const mx=Math.max(st[0][1]+st[0][2]+st[0][3],G*1e9)*1.02,X=v=>x0+v/mx*(x1-x0);
+  st.forEach((r,i)=>{const y=12+i*38;let x=x0;el('text',{x:x0-8,y:y+16,'text-anchor':'end','font-size':11,fill:css('--ink')},s,r[0]);
+    [[r[1],'--pre'],[r[2],'--dec'],[r[3],'--kv']].forEach(([v,c])=>{const w=X(v)-x0;el('rect',{x,y,width:Math.max(0,w),height:24,fill:css(c)},s);x+=w;});
+    const tot=(r[1]+r[2]+r[3])/1e9;el('text',{x:Math.min(x+6,x1-60),y:y+16,'font-size':11,'font-weight':600,fill:css(tot<=G?'--good':'--bad')},s,tot>=100?Math.round(tot)+' GB':tot.toFixed(1)+' GB');});
+  el('line',{x1:X(G*1e9),x2:X(G*1e9),y1:6,y2:162,stroke:css('--ink'),'stroke-dasharray':'4 3'},s);
+  el('text',{x:Math.min(X(G*1e9),620),y:176,'text-anchor':'middle','font-size':10,fill:css('--ink')},s,G+' GB GPU');
+  [['weights','--pre'],['gradients','--dec'],['optimizer','--kv']].forEach((l,i)=>{el('rect',{x:430+i*80,y:172,width:10,height:10,fill:css(l[1])},s);el('text',{x:444+i*80,y:181,'font-size':10,fill:css('--ink2')},s,l[0]);});}
+['zrP','zrN','zrG'].forEach(id=>$(id).addEventListener('input',zr));IE.onTheme(zr);
+})();
+</script>

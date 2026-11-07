@@ -361,7 +361,7 @@ window.IE_CHAPTERS = [
 "title": "Expert depth: training systems",
 "slug": "7-7-training-systems",
 "part": 7,
-"ready": false
+"ready": true
 },
 {
 "n": "8.1",
