@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>7.4 Preference tuning and RL</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="7.4">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 7 · Chapter 7.4</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 7 · Fine-tuning and post-training · Chapter 7.4</div>
+<h1>Preference tuning and RL</h1>
+<p class="lede">SFT teaches a model to imitate good answers. Preference tuning and reinforcement learning teach it to tell better from worse, and to produce the better kind more often, including answers no one wrote down. This chapter explains RLHF with a reward model, how DPO removes the reward model and the RL loop, how GRPO and verifiable rewards power today's reasoning models, why reward hacking is the central risk, and why RL is, in practice, an inference engineering problem.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 1.2, 7.2, 7.3</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What does DPO need that SFT does not, and what does it not need that RLHF does?</li>
+    <li>In GRPO, eight answers to one prompt all get reward 1. What does the model learn from that prompt?</li>
+    <li>Why does RL training time often depend more on the inference engine than on the trainer?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>DPO needs pairs of answers (chosen and rejected) and a frozen reference model. It does not need a separate reward model or sampling from the model during training.</li>
+    <li>Nothing. Advantages are rewards minus the group mean, so every advantage is zero and the gradient vanishes. Prompts that are always or never solved carry no signal.</li>
+    <li>Each step must generate many long samples (rollouts) before it can train on them. Generation is slow and has a long tail of very long answers, so rollout throughput, served by engines such as vLLM or SGLang, sets the pace.</li>
+  </ol></details>
+</div>
+
+<h2 id="rlhf">1. RLHF: learn a reward, then optimize it</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Policy:</strong> the model being trained, viewed as a rule that picks the next token.</p>
+  <p><strong>Reward model:</strong> a model trained on human comparisons ("A is better than B") to output a score for an answer.</p>
+  <p><strong>Reference model:</strong> a frozen copy of the starting policy (usually the SFT checkpoint). A <strong>KL penalty</strong> keeps the policy's probabilities close to it.</p>
+  <p><strong>Rollout:</strong> one answer the policy generates during training.</p>
+  <p><strong>Advantage:</strong> how much better an answer's reward is than expected; training raises the probability of tokens in answers with positive advantage and lowers it for negative ones.</p>
+</div>
+<p>Classic RLHF (InstructGPT) has three steps: SFT; train a reward model on human preference pairs; then optimize the policy with PPO to maximize reward minus a KL penalty to the reference. It works, but it trains and runs four models (policy, reference, reward model, and PPO's value model), samples inside the loop, and is sensitive to hyperparameters. And because the reward model only approximates human judgement, the policy can find outputs it scores highly that people do not want: <strong>reward hacking</strong>, such as a degenerate repeated phrase that happens to get a high score.</p>
+
+<h2 id="dpo">2. DPO: preference learning as classification</h2>
+<p>Rafailov et al. showed that the optimal policy for the RLHF objective can be written in closed form in terms of the policy and the reference, so the reward model can be eliminated. The result, Direct Preference Optimization, trains directly on preference pairs with a simple classification loss, needs no sampling during training, and matched or beat PPO-based RLHF in their experiments.</p>
+<div class="formula">implicit reward r(x, y) = β × (log π(y | x) − log π_ref(y | x))<br>DPO loss = −log σ( r(x, y_chosen) − r(x, y_rejected) )</div>
+<p>In words: raise the chosen answer's log probability relative to the reference more than the rejected answer's. β controls how far the policy may move; σ is the sigmoid. The lab implements this in a dozen lines.</p>
+<div class="widget" id="dpW">
+  <div class="wt">Interactive: the DPO loss</div>
+  <div class="ws">Move the policy's log-probability changes (relative to the reference) for the chosen and rejected answers. The loss is small when the chosen answer gains more than the rejected one, and stops pushing once the margin is large: it saturates.</div>
+  <div class="ctrls">
+    <label>Δ log π, chosen <input type="range" id="dpC" min="-20" max="20" step="0.5" value="0"> <span id="dpCv"></span></label>
+    <label>Δ log π, rejected <input type="range" id="dpR" min="-20" max="20" step="0.5" value="0"> <span id="dpRv"></span></label>
+    <label>β <select id="dpB"><option>0.05</option><option selected>0.1</option><option>0.5</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="dpSvg" viewBox="0 0 680 210" width="680" style="max-width:100%;height:auto" role="img" aria-label="DPO loss against margin"></svg></div>
+  <div class="stats" id="dpStats"></div>
+</div>
+<h3>Practical guidance</h3>
+<ul>
+  <li><strong>Start from a good SFT model.</strong> DPO refines; it does not teach the format.</li>
+  <li><strong>Learning rate about 10 times below SFT</strong> (Hugging Face found roughly 10 times smaller improved SmolLM3; larger rates hurt); scan 5 to 20 times smaller than your SFT rate.</li>
+  <li><strong>One epoch.</strong> Most preference algorithms overfit after about one epoch; the lab shows the loss reaching zero within 20 steps on six pairs. Partition data and train iteratively instead.</li>
+  <li><strong>Data size:</strong> Hugging Face saw stable results from 2,000 to 340,000 pairs, so quality and relevance matter more than volume.</li>
+  <li><strong>Variants</strong> (switchable in TRL's DPOTrainer): IPO, KTO (single good or bad labels instead of pairs), ORPO (no reference model), APO (anchors the absolute likelihoods). APO-zero raised SmolLM3's IFEval score by 15 to 20 points over SFT.</li>
+  <li><strong>On-policy pairs</strong> work better: sample several answers from the model you are training, grade them (a reward model or an LLM judge), and use the best and worst as a pair.</li>
+</ul>
+
+<h2 id="rlvr">3. RL with verifiable rewards and GRPO</h2>
+<p>When correctness can be checked, by a maths answer checker, unit tests or a compiler, the reward needs no human labels: <strong>RLVR</strong>. DeepSeek-R1 popularized it with <strong>GRPO</strong> (Group Relative Policy Optimization), which drops PPO's value model:</p>
+<ol>
+  <li>For each prompt, sample a group of G answers (for example 8).</li>
+  <li>Score each answer.</li>
+  <li>Advantage of each answer = (its reward − group mean) ÷ group standard deviation.</li>
+  <li>Raise the probability of above-average answers' tokens and lower below-average ones, with clipping so one step cannot move too far.</li>
+</ol>
+<div class="formula">Â_i = (r_i − mean(r)) ÷ std(r)   (for all tokens of answer i)</div>
+<p>Details that matter in practice, documented in TRL: scaling by the standard deviation can bias training toward very easy or very hard questions, and averaging the loss per sequence introduces a length bias, so variants such as DAPO and Dr. GRPO change the normalization. Many recent recipes set the KL penalty β to 0, which TRL now uses by default.</p>
+<h3>Reward hacking, again</h3>
+<p>Hugging Face applied GRPO with maths rewards to SmolLM3's non-thinking mode: reward and scores rose, and so did answer length; the model had learned to write long chains of thought (with "Wait, ..." self-checks) because they earned more reward. An <strong>overlong penalty</strong> (from DAPO) fixed it: zero penalty up to L_max − L_cache tokens, a linear penalty down to −1 at L_max, and −1 beyond. Penalties around 2,500 to 3,000 tokens gave the best trade-off, and GRPO then nearly doubled AIME 2025 performance over the offline APO model.</p>
+
+<h2 id="systems">4. RL is an inference workload</h2>
+<p>Every GRPO step must generate G answers per prompt before it can train, and reasoning answers can run to tens of thousands of tokens with a long tail. TRL calls generation the main bottleneck of online methods and integrates vLLM in two modes: <strong>colocate</strong> (vLLM shares the trainer's GPUs, better utilization, memory contention) and <strong>server</strong> (vLLM on separate GPUs). Larger systems go further:</p>
+<ul>
+  <li><strong>Asynchronous rollouts:</strong> rollout engines produce trajectories into a buffer while trainers consume them, with weights synced in flight. Hugging Face reports such designs (verl, PipelineRL) train 4 to 5 times faster than synchronous ones; the price is slightly off-policy data, corrected with importance sampling and clipping.</li>
+  <li><strong>Partial rollouts and load balancing</strong> for agentic RL, where some trajectories take dozens of tool-calling steps (chapter 6.8).</li>
+  <li><strong>Train-inference mismatch:</strong> if the sampler (vLLM) and trainer compute slightly different probabilities, "on-policy" training is silently off-policy; TRL logs the gap and can correct for it, and batch-invariant inference removes it (chapter 6.6, and 7.6).</li>
+</ul>
+<div class="box ex">
+  <span class="lbl">Worked example: rollout cost of one GRPO step</span>
+  <p>256 prompts × 8 samples × 4,000 tokens on average = 8.2 million generated tokens per step. At 8,500 output tokens per second per H100 (chapter 6.5's figure for an 8B model), that is about 960 GPU-seconds of generation per step, while the training update on 8.2 million tokens takes a fraction of that. Doubling rollout throughput roughly halves the step time.</p>
+</div>
+
+<h2 id="expert">5. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Rewards without verifiers</span>
+  <p>Compute as Teacher (CaT) turns inference compute into supervision: generate parallel rollouts, synthesize them into a pseudo-reference answer, and reward rollouts against it, using self-proposed rubrics in domains like healthcare guidance where no programmatic checker exists. It extends RL beyond maths and code, at the cost of many extra rollouts.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Soft clipping</span>
+  <p>GRPO's hard clip zeroes the gradient once the probability ratio leaves [1 − ε, 1 + ε]. Qwen's SAPO replaces it with a smooth, temperature-controlled gate, which TRL supports, to keep some signal from tokens just outside the trust region.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Agentic RL systems</span>
+  <p>Training agents with RL needs many parallel environments (containers, browsers, sandboxes) alongside the LLM servers. Typical designs separate an agent layer that runs environments from rollout engines and trainers, with remote execution pools so 128 or more parallel agent rollouts do not need 128 local containers.</p>
+</div>
+
+<h2 id="mistakes">6. Common mistakes</h2>
+<ul>
+  <li>DPO for several epochs at the SFT learning rate.</li>
+  <li>Preference pairs that differ in an irrelevant way (length, politeness filler) the model learns instead of the real quality difference.</li>
+  <li>RL on prompts the model always or never solves (zero advantage, wasted rollouts).</li>
+  <li>Watching only the reward, not answer length and held-out evaluations, so reward hacking goes unnoticed.</li>
+  <li>Different numerics or templates in the rollout engine and the trainer.</li>
+</ul>
+
+<h2 id="lab">7. Lab</h2>
+<h3>Part A: DPO by hand</h3>
+<p>Policy: Qwen2.5-0.5B-Instruct with a LoRA adapter. Reference: the same model with the adapter turned off (so no second copy is needed). Six preference pairs prefer a short answer ("Paris.") over a padded one ("Great question! ..."); two more pairs are held out. Predict first: after 20 steps, does the model also answer <em>new</em> questions briefly?</p>
+<pre>import torch, torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(name)
+model = get_peft_model(AutoModelForCausalLM.from_pretrained(name),
+                       LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", task_type="CAUSAL_LM"))
+pairs = [("What is the capital of France?", "Paris.", "Great question! The capital of France is Paris, a beautiful city known for many things."),
+         ("How many legs does a spider have?", "Eight.", "Great question! Spiders have eight legs, which is one of their defining features."),
+         ("What colour is the sky on a clear day?", "Blue.", "Great question! On a clear day the sky looks blue because of how sunlight scatters."),
+         ("What is 12 times 12?", "144.", "Great question! 12 times 12 equals 144, which is also called a gross."),
+         ("Which planet is closest to the Sun?", "Mercury.", "Great question! The planet closest to the Sun is Mercury, the smallest planet."),
+         ("What is H2O?", "Water.", "Great question! H2O is the chemical formula for water, made of hydrogen and oxygen.")]
+def seq_logp(q, a):                                   # sum of log-probs of the answer tokens
+    p = tok.apply_chat_template([{"role": "user", "content": q}], tokenize=False, add_generation_prompt=True)
+    pi = tok(p, add_special_tokens=False)["input_ids"]; ai = tok(a + "&lt;|im_end|&gt;", add_special_tokens=False)["input_ids"]
+    logits = model(torch.tensor([pi + ai])).logits[0, len(pi)-1:-1]
+    return F.log_softmax(logits.float(), -1).gather(1, torch.tensor(ai)[:, None]).sum()
+beta = 0.1
+opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=5e-5)
+for step in range(21):
+    q, c, r = pairs[step % len(pairs)]
+    with torch.no_grad(), model.disable_adapter():
+        ref_c, ref_r = seq_logp(q, c), seq_logp(q, r)
+    margin = beta * ((seq_logp(q, c) - ref_c) - (seq_logp(q, r) - ref_r))
+    loss = -F.logsigmoid(margin)
+    loss.backward(); opt.step(); opt.zero_grad()
+    if step % 5 == 0: print(step, round(loss.item(), 3), round(margin.item(), 3))</pre>
+<details><summary>What we measured (2 CPU cores, about 3 minutes)</summary><pre class="out">step  loss   train margin  held-out margin
+   0  0.693  +0.332        +0.265
+   5  0.350  +2.956        +1.781
+  10  0.003  +5.634        +4.130
+  15  0.000  +7.883        +5.628
+  20  0.000  +8.955        +6.288
+Q: What is the boiling point of water in Celsius?
+  before: The boiling point of water at standard atmospheric pressure (1 atmosphere) and 25 degrees Celsius is 100 degrees Celsius or 21
+  after:  100.0 Celsius.
+Q: Name the longest river in Africa.
+  before: The longest river in Africa is the Nile River.
+
+The Nile is the longest river in the world and flows through 10 countries: Egypt, Sudan
+  after:   Nile River</pre>
+<p>The loss starts at log 2 = 0.693 (no preference) and reaches zero within about 10 steps; the margin on two held-out pairs grows too, and new questions get short answers. The behaviour generalized. The margins keep growing after the loss is zero, which is the overfitting the sources warn about: with real data, stop after about an epoch and check general evaluations.</p></details>
+<h3>Part B: GRPO advantages</h3>
+<pre>import numpy as np
+for name, r in [("mixed group", [1, 0, 0, 1, 0, 0, 0, 1]), ("all correct", [1] * 8), ("all wrong", [0] * 8)]:
+    r = np.array(r, float); a = (r - r.mean()) / (r.std() + 1e-4)
+    print(name, np.round(a, 2).tolist())
+def overlong(n, Lmax=3000, Lc=500):                   # DAPO's overlong penalty
+    return 0 if n <= Lmax - Lc else ((Lmax - Lc - n) / Lc if n <= Lmax else -1)
+print([(n, round(overlong(n), 2)) for n in [1000, 2500, 2750, 3000, 3500]])</pre>
+<details><summary>What we computed</summary><pre class="out">mixed group  rewards [1, 0, 0, 1, 0, 0, 0, 1] advantages [1.29, -0.77, -0.77, 1.29, -0.77, -0.77, -0.77, 1.29]
+all correct  rewards [1, 1, 1, 1, 1, 1, 1, 1] advantages [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+all wrong    rewards [0, 0, 0, 0, 0, 0, 0, 0] advantages [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+[(1000, 0), (2500, 0), (2750, -0.5), (3000, -1.0), (3500, -1)]</pre>
+<p>Only groups with mixed outcomes teach anything, which is why RL datasets are filtered to prompts the model solves sometimes. Add the overlong penalty to the reward and see how a correct but 3,500-token answer now scores below a wrong short one: choose L_max with care.</p></details>
+<h3>Part C: a small GRPO run (GPU)</h3>
+<p>Run TRL's <code>GRPOTrainer</code> with <code>use_vllm=True</code> on a 0.5B to 1.5B model and a maths dataset with an exact-answer reward, on a Colab T4 or rented GPU. Log reward, answer length and the share of zero-advantage groups. Expect reward and length to rise together; add an overlong penalty and compare.</p>
+
+<h2 id="realworld">8. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Preference tuning and RL in practice</span>
+  <ul>
+    <li><strong>Open models</strong> use SFT, then DPO-family preference tuning, then RL with verifiable rewards for reasoning.</li>
+    <li><strong>RL frameworks</strong> (verl, TRL, OpenRLHF, slime, miles, AReaL) all embed an inference engine for rollouts.</li>
+    <li><strong>Product teams</strong> mostly stop at SFT plus DPO; RL is used where automatic checks exist, such as code and SQL.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">9. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz74"></div>
+<script type="application/json" id="qz74">[
+{"q":"What does DPO remove compared with RLHF?","o":["The data","The reward model and sampling during training","The reference model","The policy"],"a":1,"e":"It optimizes the same objective with a classification loss on pairs."},
+{"q":"The DPO loss with zero margin equals:","o":["0","log 2 ≈ 0.693","1","Infinity"],"a":1,"e":"−log σ(0) = log 2."},
+{"q":"A good DPO learning rate is about:","o":["10 times the SFT rate","The SFT rate","10 times below the SFT rate","Zero"],"a":2,"e":"Hugging Face found ~10 times smaller best."},
+{"q":"GRPO replaces PPO's value model with:","o":["A reward model","The mean and spread of rewards within a group of answers to the same prompt","Human labels","Nothing"],"a":1,"e":"Group-relative advantages."},
+{"q":"Naive RLVR made SmolLM3's non-thinking mode:","o":["Shorter","Write long chains of thought to earn more reward","Forget maths","Refuse"],"a":1,"e":"Fixed with an overlong penalty."},
+{"q":"Why does TRL integrate vLLM for GRPO?","o":["For evaluation only","Generation is the main bottleneck of online training","To store weights","For tokenization"],"a":1,"e":"Rollouts dominate step time."}
+]</script>
+
+<h2 id="summary">10. Summary</h2>
+<ul>
+  <li>RLHF trains a reward model on human comparisons and optimizes it with PPO under a KL penalty; it is powerful, costly and prone to reward hacking.</li>
+  <li>DPO trains on preference pairs with a classification loss against a frozen reference; use a low learning rate and about one epoch.</li>
+  <li>GRPO with verifiable rewards uses group-relative advantages; only mixed-outcome groups give signal; shape rewards (length penalties) to stop hacking.</li>
+  <li>RL speed depends on rollout generation; inference engines, asynchronous designs and matched numerics are central.</li>
+</ul>
+
+<h2 id="refs">11. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2305.18290">Rafailov et al., Direct Preference Optimization</a></td><td>The closed-form reparameterization and the DPO loss.</td></tr>
+<tr><td><a href="https://huggingface.co/docs/trl/grpo_trainer">Hugging Face TRL: GRPO Trainer</a></td><td>The GRPO objective, normalization variants, KL default, vLLM colocate and server modes, train-inference mismatch metrics.</td></tr>
+<tr><td><a href="https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook">Hugging Face, The Smol Training Playbook</a></td><td>DPO and APO results and settings, RLHF vs RLVR, reward hacking and the overlong penalty, asynchronous RL speedups.</td></tr>
+<tr><td><a href="https://rlhfbook.com/">Nathan Lambert, RLHF Book</a></td><td>Reward models, PPO and policy optimization in depth.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2509.14234">Jayalath et al., Compute as Teacher</a></td><td>RL rewards from aggregated rollouts and self-proposed rubrics.</td></tr>
+<tr><td><a href="https://amberljc.github.io/blog/2025-09-05-agentic-rl-systems.html">Amber Li, Agentic RL Systems</a></td><td>Architecture for RL with many parallel agent environments: asynchronous rollouts, partial rollouts, load balancing.</td></tr>
+<tr><td><a href="https://github.com/radixark/miles">miles</a> and <a href="https://arxiv.org/html/2512.23966v1">PRIME</a></td><td>Examples of current RL training frameworks and scalable RL methods.</td></tr>
+</table></div>
+<h3>Sources considered and not used</h3>
+<ul>
+  <li>The GRPO Ministral3-VL notebook link no longer resolves; TRL's GRPO documentation covers the same method. Qwen's SAPO blog loads only in a browser; TRL's description of SAPO is used instead. The video talks (self-supervised RL, determinism in RL systems) and the AReaL code walkthrough on LinkedIn were not reviewed.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Parts A and B run on CPU with PyTorch 2.15, Transformers 5.22 and PEFT 0.21; Part C is an exercise with expected behaviour.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {$,el,css}=IE;
+const ls=x=>Math.log(1+Math.exp(-x));
+function dp(){const c=+$('dpC').value,r=+$('dpR').value,b=+$('dpB').value;$('dpCv').textContent=c;$('dpRv').textContent=r;
+  const m=b*(c-r),L=ls(m),s=$('dpSvg');s.innerHTML='';const x0=50,x1=660,y0=170,y1=12,X=v=>x0+(v+4)/8*(x1-x0),Y=v=>y0-v/4.2*(y0-y1);
+  for(let v=-4;v<=4;v++){el('line',{x1:X(v),x2:X(v),y1:y0,y2:y0+4,stroke:css('--ink2')},s);el('text',{x:X(v),y:y0+17,'text-anchor':'middle','font-size':10,fill:css('--ink2')},s,v);}
+  for(let v=0;v<=4;v++){el('text',{x:x0-6,y:Y(v)+4,'text-anchor':'end','font-size':10,fill:css('--ink2')},s,v);el('line',{x1:x0,x2:x1,y1:Y(v),y2:Y(v),stroke:css('--line')},s);}
+  let d='';for(let v=-4;v<=4.001;v+=0.05)d+=(d?'L':'M')+X(v).toFixed(1)+','+Y(ls(v)).toFixed(1);el('path',{d,fill:'none',stroke:css('--pre'),'stroke-width':2},s);
+  const mc=Math.max(-4,Math.min(4,m));el('circle',{cx:X(mc),cy:Y(ls(mc)),r:6,fill:css('--dec')},s);
+  el('text',{x:(x0+x1)/2,y:y0+30,'text-anchor':'middle','font-size':10.5,fill:css('--ink2')},s,'margin = β × (Δ chosen − Δ rejected)');
+  const g=1/(1+Math.exp(m));
+  $('dpStats').innerHTML=[['Margin',m.toFixed(2)],['Loss',L.toFixed(3)],['Gradient weight σ(−margin)',g.toFixed(3)]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['dpC','dpR','dpB'].forEach(id=>$(id).addEventListener('input',dp));IE.onTheme(dp);
+})();
+</script>
+
+</body>
+</html>

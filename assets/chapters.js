@@ -340,7 +340,7 @@ window.IE_CHAPTERS = [
 "title": "Preference tuning and RL",
 "slug": "7-4-preference-rl",
 "part": 7,
-"ready": false
+"ready": true
 },
 {
 "n": "7.5",
