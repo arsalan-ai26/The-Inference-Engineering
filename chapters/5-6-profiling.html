@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>5.6 Profiling</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="5.6">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 5 · Chapter 5.6</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 5 · GPUs, hardware and kernels · Chapter 5.6</div>
+<h1>Profiling</h1>
+<p class="lede">A benchmark tells you how fast a system is; a profile tells you why. Profilers record every operator, kernel launch, memory copy and synchronization with timestamps, so you can see which kernels take the time, where the GPU sits idle, and what the CPU was doing meanwhile. This chapter shows how to use the PyTorch profiler, what Nsight Systems and Nsight Compute add, how to read a trace and turn it into a diagnosis with the three regimes of chapter 5.1, and how to profile a real engine.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 5.1, 5.3, 5.4</span>
+  <span class="chip">Compute: Colab CPU, then T4</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>A trace shows the GPU stream with many short kernels separated by gaps, and the CPU busy the whole time. Which regime?</li>
+    <li>What does Nsight Compute tell you that Nsight Systems does not?</li>
+    <li>Why should you not report latency numbers measured while the profiler was running?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Overhead-bound: the GPU waits for the CPU to launch work.</li>
+    <li>What happens inside one kernel: achieved memory and compute throughput as a share of peak, occupancy, cache hit rates, stall reasons. Nsight Systems shows the timeline across the whole program.</li>
+    <li>Profiling adds overhead (recording, shapes, stacks), which changes timings, especially for small kernels and CPU-side work. Profile to find causes; benchmark separately to measure.</li>
+  </ol></details>
+</div>
+
+<h2 id="why">1. Benchmark first, then profile</h2>
+<p>Benchmarking gives the numbers (for example p90 TTFT = 350 ms); profiling shows where each millisecond went. Most inference engineers using a mature engine mainly configure and benchmark. Profiling becomes essential when you contribute to an engine, write your own serving code, adopt a new model or hardware generation, or a benchmark result does not match your estimate from first principles (chapter 2.5). A large gap between the estimate and the measurement is the best reason to profile.</p>
+<div class="tbl"><table>
+<tr><th>Tool</th><th>Shows</th><th>Overhead</th><th>Use it for</th></tr>
+<tr><td>PyTorch profiler (<code>torch.profiler</code>)</td><td>PyTorch operators, their CUDA kernels, shapes, memory, stacks; exports a timeline</td><td>Medium (more with shapes, memory and stacks)</td><td>First look at any PyTorch program; operator-level breakdowns</td></tr>
+<tr><td>Nsight Systems (<code>nsys</code>)</td><td>System-wide timeline: CPU threads, CUDA API calls, kernels, copies, NCCL, NVTX ranges, multiple GPUs</td><td>Low</td><td>Finding gaps, synchronizations, overlap problems, multi-GPU communication</td></tr>
+<tr><td>Nsight Compute (<code>ncu</code>)</td><td>One kernel in depth: throughput vs peak ("speed of light"), occupancy, memory traffic per level, stall reasons</td><td>High (replays kernels)</td><td>Why one specific kernel is slow</td></tr>
+<tr><td>Engine profilers</td><td>vLLM and SGLang wrap the PyTorch profiler or Nsight around their workers</td><td>Medium</td><td>Profiling a real serving setup with a few requests</td></tr>
+</table></div>
+
+<h2 id="torch">2. The PyTorch profiler</h2>
+<pre>import torch
+from torch.profiler import profile, record_function, ProfilerActivity
+
+acts = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+with torch.no_grad():
+    model(ids)                                        # warm up outside the profile
+    with profile(activities=acts, record_shapes=True) as prof:
+        with record_function("prefill"):              # a named range in the trace
+            out = model(ids, use_cache=True)
+        with record_function("decode_step"):
+            model(next_token, past_key_values=out.past_key_values, use_cache=True)
+
+print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=12))
+prof.export_chrome_trace("trace.json")                # open at ui.perfetto.dev</pre>
+<p>The table has one row per operator (or kernel), summed over calls. Key columns:</p>
+<ul>
+  <li><strong>Self time:</strong> time spent in the operator itself, excluding operators it called. Sort by self CUDA time to find the kernels that take the GPU's time.</li>
+  <li><strong>Total time:</strong> including children. A <code>record_function</code> range's total shows the cost of a whole phase.</li>
+  <li><strong># of calls:</strong> often the most revealing column. Hundreds of calls of a cheap operator mean launch overhead; check the count against the model's structure (for example, 4 matmuls per layer per pass).</li>
+</ul>
+<p>For long-running programs, pass a <code>schedule</code> (wait, warm-up, active steps) and an <code>on_trace_ready</code> handler so only a few steps are recorded. Options such as <code>profile_memory</code> and <code>with_stack</code> are useful but add overhead.</p>
+
+<h2 id="read">3. Reading a trace</h2>
+<p>Open the exported trace in Perfetto (or Chrome's trace viewer). You will see rows (tracks) on a shared time axis:</p>
+<ul>
+  <li><strong>CPU thread:</strong> Python and PyTorch operators as nested bars, with CUDA API calls such as <code>cudaLaunchKernel</code> and <code>cudaStreamSynchronize</code> at the bottom of each stack.</li>
+  <li><strong>GPU stream:</strong> the kernels that actually ran, and memory copies. Arrows (flows) link each launch on the CPU to the kernel it started.</li>
+</ul>
+<p>Then ask, in this order:</p>
+<ol>
+  <li><strong>Is the GPU stream continuous?</strong> Gaps between kernels mean the GPU waited. If the CPU row is busy with launches during the gap, it is launch or Python overhead; if the CPU is inside <code>cudaStreamSynchronize</code> or a <code>.item()</code>, it is a synchronization (chapter 5.3).</li>
+  <li><strong>Which kernels take the time?</strong> Kernel names reveal their type: GEMMs contain names like <code>gemm</code>, <code>cutlass</code>, <code>xmma</code> or <code>nvjet</code>; attention contains <code>flash</code>, <code>fmha</code> or the backend's name; element-wise kernels mention <code>elementwise</code> or <code>vectorized</code>; Triton kernels carry generated names starting with <code>triton_</code>.</li>
+  <li><strong>Is each heavy kernel near its roofline?</strong> Divide the bytes it must move by its time (for memory-bound kernels) or its FLOPs by its time (for compute-bound ones) and compare with peak (chapters 2.5 and 5.1). A GEMM at 30% of peak bandwidth in decode is a lead; at 85% it is done.</li>
+  <li><strong>What runs on the CPU between steps?</strong> Scheduling, sampling, detokenization: anything that delays the next launch.</li>
+</ol>
+<div class="widget" id="trW">
+  <div class="wt">Interactive: read a decode-step trace</div>
+  <div class="ws">A simplified trace of one decode step of a small model (4 layers shown). Switch between scenarios and read the GPU row. Colours: GEMM indigo, attention amber, element-wise and norm teal, CPU launch work grey, synchronization red.</div>
+  <div class="ctrls"><span class="seg" role="group" aria-label="Scenario"><button data-s="eager" class="on">Eager, batch 1</button><button data-s="sync">Eager + .item()</button><button data-s="graph">CUDA graph</button><button data-s="big">Eager, batch 64</button></span></div>
+  <div class="svgwrap"><svg id="trSvg" viewBox="0 0 680 150" width="680" style="max-width:100%;height:auto" role="img" aria-label="Simplified CPU and GPU trace"></svg></div>
+  <div class="stats" id="trStats"></div>
+  <div class="ws" id="trNote"></div>
+</div>
+
+<h2 id="nsight">4. Nsight Systems and Nsight Compute</h2>
+<p><strong>Nsight Systems</strong> is the tool for whole-program timelines with low overhead, including multiple processes and GPUs, NCCL collectives, and memory copies. Typical use:</p>
+<pre>nsys profile -t cuda,nvtx,osrt -o decode_trace python serve_one_request.py
+nsys stats decode_trace.nsys-rep          # text summaries: top kernels, API calls</pre>
+<p>Add NVTX ranges (<code>torch.cuda.nvtx.range_push("prefill")</code> / <code>range_pop()</code>, or <code>record_function</code>) to label phases. In the GUI, look for the same things as in section 3: gaps on the GPU row, long CUDA API calls on the CPU row, and whether communication overlaps with compute.</p>
+<p><strong>Nsight Compute</strong> profiles individual kernels, replaying each one several times to collect hardware counters. Its "speed of light" section reports achieved memory and compute throughput as a percentage of peak, which tells you immediately whether a kernel is memory- or compute-limited and how close it is. Further sections show occupancy and its limiter (chapter 5.2), cache hit rates, and warp stall reasons (waiting for memory, for a barrier, for an instruction). Use it on one or two kernels you already know matter; it is far too slow to run on a whole model.</p>
+<pre>ncu --set full -k regex:gemm -c 5 -o gemm_report python one_forward_pass.py</pre>
+
+<h2 id="engine">5. Profiling a serving engine</h2>
+<p>Engines run the model in worker processes, so a profiler around your client script sees nothing. vLLM has built-in support: start the server with a profiler configuration and trigger recording with the benchmark tool or HTTP endpoints.</p>
+<pre>vllm serve Qwen/Qwen2.5-1.5B-Instruct \
+  --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile"}'
+curl -X POST http://localhost:8000/start_profile
+# ... send two or three requests ...
+curl -X POST http://localhost:8000/stop_profile    # flushes traces; can take a while</pre>
+<p>Each worker writes a trace and a summary table, viewable in Perfetto. Send only a few requests: traces grow fast. vLLM's documentation recommends Nsight Systems for low-overhead performance work and the PyTorch profiler for richer debugging information, and warns that profiling is for developers, never for production serving.</p>
+
+<h2 id="workflow">6. A profiling workflow</h2>
+<ol>
+  <li><strong>Estimate.</strong> Compute the expected step time from bytes and FLOPs (chapter 2.5).</li>
+  <li><strong>Benchmark.</strong> Measure the real step time without the profiler.</li>
+  <li><strong>Profile a small, representative run.</strong> Warm up first; record a few steps of both prefill and decode at the batch sizes you serve.</li>
+  <li><strong>Classify.</strong> Overhead (gaps), memory (bandwidth-bound kernels below peak), compute (GEMMs below peak FLOP/s).</li>
+  <li><strong>Change one thing.</strong> Remove a sync, fuse kernels, capture a CUDA graph, change a kernel backend, raise the batch.</li>
+  <li><strong>Benchmark again</strong>, then re-profile to confirm the trace changed the way you expected.</li>
+</ol>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">CUDA graphs hide kernels from the CPU view</span>
+  <p>With CUDA graphs (chapter 5.7), the CPU launches one graph and the GPU runs many kernels; the PyTorch profiler may show only the graph launch on the CPU side. Nsight Systems can trace individual kernels inside graphs (with graph tracing enabled at node level), at some extra overhead. When comparing eager and graph runs, compare GPU-side time per step.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Profiling multi-GPU runs</span>
+  <p>With tensor or expert parallelism, look at each rank's timeline side by side. A rank that finishes its compute early and waits in an all-reduce or all-to-all reveals load imbalance (for example, a hot expert in chapter 4.5). Communication kernels (NCCL) that do not overlap with compute are the usual target.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Clocks and warm-up</span>
+  <p>GPUs change clock speeds with load and temperature; the first iterations also include compilation, autotuning and memory allocation. Always warm up, record steady-state steps, and for kernel-level measurements consider locking clocks (on machines where you are allowed to), as Nsight Compute does by default.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Profiling the first iteration and optimizing compilation or allocation time.</li>
+  <li>Reporting latency from a profiled run.</li>
+  <li>Sorting by total time instead of self time and chasing parent operators.</li>
+  <li>Profiling only prefill (or only decode) when the workload is a mix.</li>
+  <li>Running Nsight Compute on a whole model and waiting hours.</li>
+  <li>Wrapping the client script with a profiler while the model runs in an engine's worker process.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p><strong>Goal:</strong> profile a small model's prefill and decode, name the top kernels and why they cost the most, and find the overhead.</p>
+<h3>Part A: an operator table (CPU, under a minute)</h3>
+<pre>import torch
+from torch.profiler import profile, record_function, ProfilerActivity
+from transformers import AutoModelForCausalLM, AutoTokenizer
+dev = "cuda" if torch.cuda.is_available() else "cpu"
+MID = "Qwen/Qwen2.5-0.5B-Instruct"
+model = AutoModelForCausalLM.from_pretrained(
+    MID, dtype=torch.float16 if dev == "cuda" else torch.float32).to(dev).eval()
+tok = AutoTokenizer.from_pretrained(MID)
+ids = tok("The quick brown fox " * 64, return_tensors="pt").input_ids.to(dev)   # about 300 tokens
+acts = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if dev == "cuda" else [])
+with torch.no_grad():
+    model(ids)                                              # warm up
+    with profile(activities=acts, record_shapes=True) as prof:
+        with record_function("prefill"):
+            out = model(ids, use_cache=True)
+        nxt = out.logits[:, -1:].argmax(-1)
+        with record_function("decode_step"):
+            model(nxt, past_key_values=out.past_key_values, use_cache=True)
+key = "self_cuda_time_total" if dev == "cuda" else "self_cpu_time_total"
+print(prof.key_averages().table(sort_by=key, row_limit=12))
+prof.export_chrome_trace("trace.json")</pre>
+<p>Before reading the table, predict: how many matmul calls should there be? (Qwen2.5-0.5B has 24 layers; its Q, K and V projections have biases, the other four projections do not; there is one output head; the program runs two forward passes.)</p>
+<details><summary>What we measured on CPU, and why</summary><pre class="out">Name                                   Self CPU %   Self CPU   # of Calls
+aten::mm                                   85.72%     1.271s          194
+aten::addmm                                 4.10%    60.8ms           144
+aten::_scaled_dot_product_flash_attention_for_cpu   2.71%   40.2ms     48
+aten::mul                                   1.86%    27.5ms           442
+prefill (range)                             1.25%    18.6ms             1
+aten::silu                                  0.86%    12.8ms            48
+decode_step (range)                         0.64%     9.5ms             1</pre>
+<p>Matmuls dominate prefill (86% self time): they hold almost all the FLOPs. The counts check out: <code>addmm</code> = 3 biased projections × 24 layers × 2 passes = 144; <code>mm</code> = 4 unbiased projections × 24 × 2 + 2 output heads = 194. The decode step took about 101 ms in total against about 1.38 s for prefill of 300 tokens, much more than 1/300 of it: per token, decode is far less efficient. Element-wise ops (<code>mul</code> with 442 calls) are cheap individually but numerous: on a GPU, their launches become the overhead.</p></details>
+<h3>Part B: the GPU trace (T4)</h3>
+<p>Run Part A on a T4 and open <code>trace.json</code> in <a href="https://ui.perfetto.dev/">Perfetto</a>. In the decode step: measure the GPU's busy time against the step's wall time; find the three kernels with the most self CUDA time and name their type (GEMM, attention, element-wise); and find a gap and the CPU activity during it. Then batch 32 sequences into the decode step and compare. Write a three-line diagnosis using chapter 5.1's regimes.</p>
+<details><summary>What to expect</summary><p>For a 0.5B model at batch 1 on a T4, the decode step's GPU row is mostly gaps: kernels take a few microseconds each, and the CPU spends longer launching them. GEMM kernels still lead self CUDA time, followed by attention and element-wise kernels. At batch 32 the kernels lengthen but the gaps barely change, so the GPU busy fraction rises: the overhead is amortized. This is the motivation for CUDA graphs in chapter 5.7.</p></details>
+<h3>Part C (optional): Nsight Systems</h3>
+<p>If <code>nsys</code> is available on your machine, profile the same script with <code>nsys profile -t cuda,nvtx,osrt</code> and run <code>nsys stats</code> on the result. Compare the top kernels list with the PyTorch profiler's. Which tool showed the CPU-side gaps more clearly?</p>
+<h3>Part D: profile vLLM (T4)</h3>
+<p>Start vLLM with the profiler configuration from section 5, send one short and one long request between <code>start_profile</code> and <code>stop_profile</code>, and open the worker trace. Find a prefill step and a decode step. Are decode steps replayed from CUDA graphs (look for graph launches and dense kernel sequences)? Compare the decode step's GPU row with your Part B trace.</p>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Profiling in practice</span>
+  <ul>
+    <li><strong>Engine teams</strong> profile every new model architecture and GPU generation; many performance pull requests start with a trace showing a gap or a slow kernel.</li>
+    <li><strong>Platform teams</strong> keep profiling scripts for their standard models and rerun them after engine upgrades to catch regressions.</li>
+    <li><strong>Kernel authors</strong> live in Nsight Compute's speed-of-light and stall-reason views.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz56"></div>
+<script type="application/json" id="qz56">[
+{"q":"Which tool would you use to see why one GEMM kernel reaches only 40% of peak?","o":["nvidia-smi","Nsight Compute","A load test","Nsight Systems only"],"a":1,"e":"It reports per-kernel throughput vs peak, occupancy and stall reasons."},
+{"q":"Sorting the profiler table by self time shows:","o":["Time including children","Time spent in each operator itself","Only CPU time","Memory use"],"a":1,"e":"Self time excludes nested operators, so it finds the real cost centres."},
+{"q":"The CPU row shows a long cudaStreamSynchronize while the GPU row is busy, then the GPU goes idle. Cause:","o":["A compute-bound GEMM","A synchronization: the CPU waited, then had to launch new work","FlashAttention","Too little memory"],"a":1,"e":"After a sync, the GPU queue is empty until the CPU launches again."},
+{"q":"Why warm up before profiling?","o":["To heat the GPU","The first iterations include compilation, autotuning and allocation","Profilers require it","To fill the KV cache"],"a":1,"e":"You want steady-state behaviour."},
+{"q":"How do you profile a vLLM server?","o":["Wrap the client in torch.profiler","Start vLLM with a profiler configuration and use start/stop profiling","Use nvidia-smi","It cannot be profiled"],"a":1,"e":"The model runs in worker processes; the engine must record the profile."},
+{"q":"A decode step shows 400 kernel launches of a few microseconds each with gaps between. Best next step:","o":["Buy a faster GPU","Capture CUDA graphs or fuse kernels","Use FP32","Increase max-model-len"],"a":1,"e":"The step is launch-bound; remove per-kernel CPU cost."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Benchmark to measure, profile to explain; profile when measurements disagree with first-principles estimates.</li>
+  <li>The PyTorch profiler gives operator tables and timelines; Nsight Systems gives low-overhead system timelines; Nsight Compute explains single kernels.</li>
+  <li>Read traces for gaps (overhead or synchronization), top kernels (by self time), and each heavy kernel's distance from its roofline.</li>
+  <li>Profile engines through their own hooks (vLLM's profiler configuration) with a few requests.</li>
+  <li>Estimate, benchmark, profile, change one thing, repeat.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://docs.pytorch.org/tutorials/recipes/recipes/profiler_recipe.html">PyTorch profiler recipe</a></td><td>The profiler API, tables, memory profiling, traces and schedules.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 4.5.3</td><td>Benchmarking vs profiling, and when inference engineers need each profiler.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/contributing/profiling/">vLLM: Profiling</a></td><td>Choosing a profiler, the profiler configuration flag and endpoints, and trace handling.</td></tr>
+<tr><td><a href="https://tomasruizt.github.io/posts/08_cpu_gpu_synchronization/">Tomas Ruiz: CPU-GPU synchronization</a></td><td>Reading synchronizations in Nsight Systems timelines.</td></tr>
+<tr><td><a href="https://modal.com/blog/host-overhead-inference-efficiency">Modal: Host overhead</a></td><td>Finding gaps in CUDA streams in engine traces.</td></tr>
+<tr><td><a href="https://docs.nvidia.com/nsight-systems/">NVIDIA Nsight Systems</a> and <a href="https://docs.nvidia.com/nsight-compute/">Nsight Compute</a> documentation</td><td>Command-line options, NVTX, graph tracing, speed-of-light and stall analysis.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em></td><td>Profiling workflows across PyTorch, Nsight and distributed systems.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. Part A was run on CPU with PyTorch 2.15 and Transformers 5.22.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;let sc='eager';
+const LAYER=[['qkv','g',3],['rope','e',1],['attn','a',2],['o_proj','g',2],['add+norm','e',1],['gate_up','g',4],['silu_mul','e',1],['down','g',3],['add+norm','e',1]];
+function build(s){const L=4,launch=s==='graph'?0:5,scale=s==='big'?4:1;let cpu=0,gpu=0;const C=[],G=[];
+  if(s==='graph'){C.push([0,6,'l']);cpu=6;}
+  for(let l=0;l<L;l++)LAYER.forEach(([n,t,d])=>{const dd=t==='e'?d*(s==='big'?1.5:1):d*scale;
+    if(s!=='graph'){C.push([cpu,cpu+launch,'l']);cpu+=launch;}const st=Math.max(gpu,s==='graph'?6:cpu);gpu=st+dd;G.push([st,gpu,t,n]);});
+  if(s==='sync'){C.push([cpu,gpu,'s']);cpu=gpu;C.push([cpu,cpu+12,'l']);cpu+=12;const st=Math.max(gpu,cpu);G.push([st,st+3,'e','sample']);gpu=st+3;}
+  return{C,G,end:Math.max(cpu,gpu)};}
+function tr(){const {C,G,end}=build(sc);const svg=$('trSvg');svg.innerHTML='';const X=t=>60+t/end*610;
+  el('text',{x:0,y:40,fill:css('--ink2'),'font-size':12},svg,'CPU');el('text',{x:0,y:90,fill:css('--ink2'),'font-size':12},svg,'GPU');
+  C.forEach(([a,b,k])=>el('rect',{x:X(a),y:26,width:Math.max(1,X(b)-X(a)-0.5),height:20,fill:css(k==='s'?'--bad':'--mute'),'fill-opacity':k==='s'?.6:.7},svg));
+  const col={g:'--pre',a:'--dec',e:'--kv'};G.forEach(([a,b,t])=>el('rect',{x:X(a),y:76,width:Math.max(1,X(b)-X(a)-0.5),height:20,fill:css(col[t])},svg));
+  el('text',{x:60,y:130,fill:css('--ink2'),'font-size':11},svg,`0 µs`);el('text',{x:670,y:130,'text-anchor':'end',fill:css('--ink2'),'font-size':11},svg,`${Math.round(end)} µs`);
+  const busy=G.reduce((s,g)=>s+g[1]-g[0],0);const by=t=>G.filter(g=>g[2]===t).reduce((s,g)=>s+g[1]-g[0],0);
+  $('trStats').innerHTML=[['Step time',Math.round(end)+' µs'],['GPU busy',Math.round(busy/end*100)+'%'],['GEMM share of GPU time',Math.round(by('g')/busy*100)+'%'],['Kernels',G.length]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');
+  $('trNote').textContent={eager:'Each kernel waits for the CPU to launch it: the GPU row has gaps. Overhead-bound.',sync:'A .item() at the end makes the CPU wait (red), then launch sampling: the step gets longer and the next step starts late.',graph:'One graph launch; kernels run back to back. The GPU row is continuous.',big:'Larger batch: GEMMs and attention lengthen, launch gaps stay the same size, so the GPU is busy a larger share of the time.'}[sc];}
+document.querySelectorAll('#trW [data-s]').forEach(b=>b.onclick=()=>{sc=b.dataset.s;document.querySelectorAll('#trW [data-s]').forEach(x=>x.classList.toggle('on',x===b));tr();});
+IE.onTheme(tr);
+})();
+</script>
+
+</body>
+</html>

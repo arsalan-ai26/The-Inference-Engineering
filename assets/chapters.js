@@ -228,7 +228,7 @@ window.IE_CHAPTERS = [
 "title": "Profiling",
 "slug": "5-6-profiling",
 "part": 5,
-"ready": false
+"ready": true
 },
 {
 "n": "5.7",
