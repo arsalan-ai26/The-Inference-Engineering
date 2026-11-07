@@ -181,6 +181,10 @@
   <p>The model runner is where most engine performance work lands: input preparation on the GPU instead of the CPU, persistent buffers, fewer host-device syncs, and better attention metadata building. vLLM has gone through more than one generation of its GPU model runner for these reasons. Read the pull requests of such rewrites to see which overheads matter at scale.</p>
 </div>
 <div class="box expert">
+  <span class="lbl">Overlap inside one GPU: NanoFlow</span>
+  <p>Overlap scheduling hides CPU work behind the GPU. <strong>NanoFlow</strong> (arXiv 2408.12757) goes one level further and overlaps work <em>inside</em> the GPU. Its authors argue that end-to-end serving is compute-bound for most common workloads, yet engines run compute-heavy, memory-heavy and network-heavy operations one after another. NanoFlow splits each batch into nano-batches and runs, for example, one nano-batch's matmuls alongside another's attention and a third's communication, choosing the number, sizes and order of nano-batches automatically; it reports 1.91 times the throughput of the best engines it compared. DeepSeek's DeepInfer credits SGLang and NanoFlow for its asynchronous scheduler (chapter 4.8).</p>
+</div>
+<div class="box expert">
   <span class="lbl">Data parallelism and MoE coordination</span>
   <p>With data parallelism, each rank has its own engine core and scheduler. For MoE models with expert parallelism, all ranks must run their forward passes in lockstep, even if one has no work, because experts communicate across ranks every layer. vLLM adds a coordinator process for this (chapter 4.5).</p>
 </div>
@@ -285,6 +289,7 @@ for o in outs:
 <tr><th>Source</th><th>What it adds</th></tr>
 <tr><td><a href="https://neutree.ai/blog/nano-vllm-part-1">Neutree: Inside Nano-vLLM, part 1</a></td><td>A guided tour of nano-vLLM's architecture, request flow and scheduling.</td></tr>
 <tr><td><a href="https://github.com/GeeeekExplorer/nano-vllm">nano-vLLM</a></td><td>The code quoted in section 3: scheduler, block manager, model runner.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2408.12757">Zhu et al., NanoFlow</a></td><td>Overlapping compute, memory and network operations within one device with nano-batches.</td></tr>
 <tr><td><a href="https://github.com/sgl-project/mini-sglang">mini-SGLang</a></td><td>A compact SGLang with radix cache, chunked prefill and the overlap loop in section 4.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/design/arch_overview.html">vLLM: Architecture overview</a></td><td>The API server, engine core and worker processes, and how they communicate.</td></tr>
 <tr><td><a href="https://blog.vllm.ai/2025/11/20/vllm-plugin-system.html">vLLM blog: Building clean vLLM modifications with the plugin system</a></td><td>Kept from triage: why forks and monkey-patches fail, and how plugins work.</td></tr>
@@ -300,7 +305,7 @@ for o in outs:
 <tr><td>vLLM-style engine on CPU (Medium)</td><td>Overlaps with nano-vLLM, which is the better reading target.</td></tr>
 <tr><td>vLLM Metal plugin; SGLang routed-experts PR; SGLang roadmap; GPU Model Runner V2 PR; internals thread on X</td><td>Narrow or fast-changing items; mentioned only as examples in sections 7 and 9.</td></tr>
 </table></div>
-<p class="note">Facts checked on 6 November 2026. Code excerpts from the nano-vLLM and mini-SGLang repositories as of that date.</p>
+<p class="note">Facts checked on 6 November 2026 (additions on 7 November 2026). Code excerpts from the nano-vLLM and mini-SGLang repositories as of that date.</p>
 <!--SCRIPT-->
 <script>
 (function(){

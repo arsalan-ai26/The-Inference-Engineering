@@ -53,6 +53,7 @@
 
 <h2 id="continuous">3. Continuous batching</h2>
 <p>The fix is to schedule at the level of a <strong>step</strong> (one forward pass), not a request. This is called <strong>continuous batching</strong>, also known as iteration-level scheduling. It was introduced by the Orca system (OSDI 2022) and is used by every modern engine.</p>
+<p>Orca had to solve a second problem to make this work: requests in one step are at different positions and lengths, so their attention inputs have different shapes. Its answer, <strong>selective batching</strong>, batches the operations that do not care about sequence boundaries (the linear layers, which see a flat list of tokens) and runs attention separately per request. Every engine since keeps this split: one flat token batch for matmuls, and per-sequence metadata that tells the attention kernel where each request starts and ends (chapter 3.4, section 5).</p>
 <ol>
   <li>At each step, the scheduler looks at every request.</li>
   <li>Requests that finished in the last step leave the batch and free their KV memory.</li>
@@ -301,7 +302,7 @@ vllm bench serve --model Qwen/Qwen2.5-0.5B-Instruct --dataset-name random \
 <tr><td>Philip Kiely, <em>Inference Engineering</em>, section 4.3.1</td><td>vLLM's scheduling features in the context of choosing an engine.</td></tr>
 <tr><td>Chi Wang and Peiheng Hu, <em>Hands-On LLM Serving and Optimization</em>, chapter 6</td><td>Continuous batching with worked examples among the essential optimizations.</td></tr>
 </table></div>
-<p class="note">Facts checked on 6 November 2026.</p>
+<p class="note">Facts checked on 6 November 2026 (additions on 7 November 2026).</p>
 
 <div class="navfoot"></div>
 </article></main>

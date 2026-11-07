@@ -150,6 +150,7 @@
   <li><strong>State-space and linear layers</strong> keep one fixed-size state per request instead of a per-token cache.</li>
 </ul>
 <p>vLLM handles all of these with a <strong>hybrid KV cache manager</strong>. It keeps one memory pool with a single page size, groups layers of the same type so that each group needs the same number of blocks per request, and gives each group its own block table. Mamba-style states, which are much larger per request than one token's KV, are fitted into the same page size. The design has some padding overhead for awkward layer ratios, which its documentation discusses openly.</p>
+<p>The research behind this is <strong>Jenga</strong> (arXiv 2503.18292), built on vLLM. It names the two problems heterogeneous models create: fragmentation when layers store entries of different sizes, and caching rules that differ per layer (a window layer can drop old tokens, a full layer cannot). Its allocator has two levels and sizes pages by the least common multiple (LCM) of the entry sizes, so pages of every layer type fit one pool, and it lets each layer type declare its own caching and eviction logic. The authors report up to 79.6% better GPU memory use and up to 4.92 times (1.80 on average) the serving throughput. DeepSeek-V4 uses the same LCM idea for its compressed attention layers (chapter 4.8).</p>
 
 <h2 id="expert">9. Expert layer</h2>
 <div class="box expert">
@@ -344,6 +345,7 @@ print([run(s) for s in range(20)])</pre>
 <tr><td><a href="https://arxiv.org/abs/2309.06180">Kwon et al., Efficient Memory Management for LLM Serving with PagedAttention</a></td><td>The original design and the measured waste of earlier systems.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/design/paged_attention.html">vLLM: PagedAttention design</a></td><td>How the kernel reads keys and values through block tables.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager.html">vLLM: Hybrid KV cache manager</a></td><td>One pool and one page size for full, sliding-window and Mamba layers.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2503.18292">Zhang et al., Jenga</a></td><td>A two-level, LCM-sized allocator with per-layer caching rules for heterogeneous models.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/design/prefix_caching.html">vLLM: Automatic prefix caching</a></td><td>Block hashing for reuse across requests; developed in chapter 3.5.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2405.04437">Prabhu et al., vAttention</a></td><td>Paging through GPU virtual memory instead of block tables.</td></tr>
 <tr><td>Fuheng Wu, <em>Distributed AI Systems</em>, chapter 6</td><td>PagedAttention inside a vLLM deployment.</td></tr>
@@ -359,7 +361,7 @@ print([run(s) for s in range(20)])</pre>
 <ul>
   <li>The day 09 README of <em>100 Days of Inference</em> gives Llama 3 8B's KV cache as about 512 KB per token. With 32 layers, 8 KV heads, head size 128 and BF16, it is 128 KiB (131,072 bytes). The same README's utilization figures (80% to 90% vs 40% to 60%) are not sourced; this chapter uses the vLLM paper's measured figures instead.</li>
 </ul>
-<p class="note">Facts checked on 6 November 2026. The allocator and its tests were run with Python 3.13.</p>
+<p class="note">Facts checked on 6 November 2026 (additions on 7 November 2026). The allocator and its tests were run with Python 3.13.</p>
 
 <div class="navfoot"></div>
 </article></main>

@@ -104,6 +104,11 @@
   <div class="stats" id="edStats"></div>
 </div>
 
+<h3>KTransformers: CPU and GPU together for large MoE models</h3>
+<p>llama.cpp can offload layers, but a DeepSeek-class MoE has hundreds of GB of expert weights. <strong>KTransformers</strong> (Tsinghua University's MADSys lab with Approaching.AI; SOSP 2025) is built for that case. It keeps attention, shared experts and other dense parts on the GPU and runs the routed experts on the CPU with kernels written for Intel AMX and AVX-512 (and now AVX2), placing frequently used experts on the GPU when they fit. The idea follows from chapter 2.6: each token touches only k experts, so a CPU with high memory bandwidth can compute them for a single user or a few, while the GPU handles the parts every token needs. Its README reports DeepSeek-R1 and V3 on one 24 GB GPU with 382 GB of DRAM (February 2025), and, for a server, 227.85 tokens per second total and 87.58 output tokens per second at 8 concurrent requests for DeepSeek-R1-0528 in FP8 on 8 L20 GPUs with a Xeon Gold 6454S (authors-reported). It integrates with SGLang for serving, adds a GPU, CPU and disk prefix cache, and also supports fine-tuning. Use it for local or on-premises serving of very large MoE models on a few GPUs; it is not a high-concurrency engine.</p>
+<h3>LMDeploy and LightLLM</h3>
+<p>Two more engines from Chinese labs appear in production. <strong>LMDeploy</strong> (Shanghai AI Laboratory's InternLM team) has its own C++ runtime, <strong>TurboMind</strong>, with paged attention, W4A16 weights and 8-bit and 4-bit KV cache kernels, alongside a second engine written in PyTorch; its paper (arXiv 2508.15601, EuroSys 2027) describes TurboMind's mixed-precision design. <strong>LightLLM</strong> (ModelTC) is a lightweight Python engine whose team has published work on SLA-aware scheduling (ASPLOS 2025) and constrained decoding (ACL 2025).</p>
+
 <h2 id="fair">4. Comparing engines fairly</h2>
 <p>Published engine comparisons often disagree, because small differences in setup change results by large factors. A fair comparison controls these:</p>
 <ol>
@@ -126,6 +131,7 @@
 <tr><td>Hardware</td><td>NVIDIA, AMD, TPU, CPU and others via plugins</td><td>NVIDIA, AMD and others</td><td>NVIDIA only</td><td>Almost anything, including laptops and phones</td></tr>
 <tr><td>Best fit</td><td>The default choice; widest model and hardware support</td><td>Heavy prefix sharing, agents, large MoE deployments</td><td>Maximum performance on NVIDIA with engineering time</td><td>Local, offline, single-user and edge</td></tr>
 </table></div>
+<p>Two narrower choices sit outside the matrix: KTransformers when a very large MoE must run on one or a few GPUs with a big-memory CPU, and LMDeploy when its TurboMind kernels fit your model and quantization (for example 4-bit weight-only serving).</p>
 <p>Start with the default, measure, and switch only when a measured bottleneck points to another engine's strength. Many production teams run more than one engine, choosing per model.</p>
 
 <h2 id="expert">6. Expert layer</h2>
@@ -180,7 +186,24 @@ print(llm.metadata.get("general.architecture"), llm.metadata.get("tokenizer.chat
 <tr><td>llama.cpp (GPU offload)</td><td>Q4_K_M</td><td></td><td></td><td></td><td></td></tr>
 </table></div>
 <p>Explain each column with chapters 2.5 and 3.2. Which engine wins at 1 user? At 16? Why does the answer change?</p>
-<h3>Part D: your own selection matrix</h3>
+<h3>Part D: how fast can a CPU run DeepSeek-V3's experts? (CPU)</h3>
+<p>KTransformers puts the routed experts on the CPU. For a single user, every token reads the weights of its 8 routed experts in each MoE layer. Read the real config and compute the ceiling that CPU memory bandwidth sets. Predict first: with INT4 experts and 300 GB/s (a server with 8 to 12 DDR5 channels), how many tokens per second at most?</p>
+<pre>from transformers import AutoConfig
+c = AutoConfig.from_pretrained("deepseek-ai/DeepSeek-V3")
+D, F, k = c.hidden_size, c.moe_intermediate_size, c.num_experts_per_tok
+moe_layers = c.num_hidden_layers - c.first_k_dense_replace
+per_token = moe_layers * k * 3 * D * F            # routed-expert weights one token reads
+print(f"hidden {D}, expert size {F}, {k} routed experts per token, {moe_layers} MoE layers")
+for name, bpw in [("FP8", 1.0), ("INT4", 0.5)]:
+    gb = per_token * bpw / 1e9
+    for bw in (300, 600):                          # GB/s of CPU memory bandwidth
+        print(f"{name}: {gb:5.1f} GB of expert weights per token; at {bw} GB/s the CPU part takes {gb/bw*1e3:5.1f} ms -> at most {bw/gb:4.1f} tokens/s")</pre>
+<details><summary>What we computed</summary><pre class="out">hidden 7168, expert size 2048, 8 routed experts per token, 58 MoE layers
+FP8:  20.4 GB of expert weights per token; at 300 GB/s the CPU part takes  68.1 ms -> at most 14.7 tokens/s
+FP8:  20.4 GB of expert weights per token; at 600 GB/s the CPU part takes  34.1 ms -> at most 29.4 tokens/s
+INT4:  10.2 GB of expert weights per token; at 300 GB/s the CPU part takes  34.1 ms -> at most 29.4 tokens/s
+INT4:  10.2 GB of expert weights per token; at 600 GB/s the CPU part takes  17.0 ms -> at most 58.7 tokens/s</pre><p>Each token must stream about 10 to 20 GB of expert weights from DRAM, so the CPU part alone caps a single user at roughly 15 to 60 tokens per second depending on precision and bandwidth, before the GPU part and transfers. That is why KTransformers puts hot experts on the GPU, uses AMX kernels to keep the CPU bandwidth-bound rather than compute-bound, and targets one or a few users. Several users share the expert reads only when they pick the same experts, which they mostly do not.</p></details>
+<h3>Part E: your own selection matrix</h3>
 <p>Write the matrix of section 5 for three real projects you know: for each, name the model, traffic pattern, hardware and latency target, choose an engine, and give two measured or measurable reasons. Keep it; chapter 6.10 asks you to defend a full engine choice.</p>
 
 <h2 id="realworld">9. In the real world</h2>
@@ -219,6 +242,9 @@ print(llm.metadata.get("general.architecture"), llm.metadata.get("tokenizer.chat
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
 <tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 4.3.3 and 4.4</td><td>TensorRT-LLM versions, when to use it, and Dynamo's role and limits.</td></tr>
+<tr><td><a href="https://github.com/kvcache-ai/ktransformers">KTransformers</a> and its SOSP 2025 paper, "KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models"</td><td>CPU and GPU hybrid inference of large MoE models with AMX kernels and expert placement.</td></tr>
+<tr><td><a href="https://github.com/InternLM/lmdeploy">LMDeploy</a> and <a href="https://arxiv.org/abs/2508.15601">LMDeploy Accelerates Mixed-Precision LLM Inference with TurboMind</a></td><td>The TurboMind runtime and its mixed-precision kernels.</td></tr>
+<tr><td><a href="https://github.com/ModelTC/lightllm">LightLLM</a></td><td>A lightweight Python engine and its scheduling and constrained-decoding papers.</td></tr>
 <tr><td><a href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.md">TensorRT-LLM: Disaggregated serving</a> (skim)</td><td>How context and generation instances split, and when it pays.</td></tr>
 <tr><td><a href="https://docs.nvidia.com/dynamo/latest/index.html">NVIDIA Dynamo documentation</a></td><td>Components (frontend, KV router, planner, KV cache manager), supported engines and platforms.</td></tr>
 <tr><td><a href="https://huggingface.co/docs/hub/gguf">Hugging Face: GGUF</a></td><td>The format, its metadata, the Hub viewer, and the quantization types with bits per weight.</td></tr>
@@ -237,7 +263,7 @@ print(llm.metadata.get("general.architecture"), llm.metadata.get("tokenizer.chat
 <ul>
   <li>The day 11 README of <em>100 Days of Inference</em> says changing batch size or sequence length "means recompilation" and that TensorRT-LLM FP8 throughput cannot be matched by vLLM or SGLang. The first applies to version 0.x engine builds; the second is a workload-dependent claim (section 1 watch-out).</li>
 </ul>
-<p class="note">Facts checked on 6 November 2026. Dynamo version from its documentation on that date.</p>
+<p class="note">Facts checked on 6 November 2026; KTransformers, LMDeploy and LightLLM checked on 7 November 2026. Dynamo version from its documentation on that date. Lab Part D computed with Python 3.13 and Transformers 5.22 (config only).</p>
 <!--SCRIPT-->
 <script>
 (function(){
