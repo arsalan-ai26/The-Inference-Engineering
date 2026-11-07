@@ -179,7 +179,7 @@ window.IE_CHAPTERS = [
 "title": "Prefill/decode disaggregation",
 "slug": "4-6-disaggregation",
 "part": 4,
-"ready": false
+"ready": true
 },
 {
 "n": "4.7",

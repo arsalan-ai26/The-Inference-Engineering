@@ -1,0 +1,296 @@
+<div class="kicker">Part 4 · Model optimization · Chapter 4.6</div>
+<h1>Prefill/decode disaggregation</h1>
+<p class="lede">Prefill is compute-bound and decides TTFT; decode is memory-bound and decides the time between tokens (chapter 2.5). On one GPU they compete: a long prompt arriving stalls every running decode. Disaggregation runs them on separate GPUs, moves each request's KV cache from the prefill GPU to a decode GPU, and lets each pool be sized and tuned for its own job. This chapter explains the interference, the KV transfer, how to size the two pools, and when the extra complexity pays off.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 4 hours with the lab</span>
+  <span class="chip">Needs: 2.4, 2.5, 3.2, 4.4, 4.5</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Does disaggregation raise the raw tokens per second a set of GPUs can produce?</li>
+    <li>What does "3P2D" mean?</li>
+    <li>For Llama 3.1 70B, how large is the KV cache of a 32K-token prompt, and how long does it take to send over a 50 GB/s network link?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Not by itself. It improves goodput: the request rate that still meets both TTFT and TPOT targets. Raw throughput can even fall because the KV transfer and pool imbalance cost something.</li>
+    <li>Three prefill engines and two decode engines serving one model deployment.</li>
+    <li>2 × 80 × 8 × 128 × 2 bytes × 32,768 ≈ 10.7 GB; about 215 ms at 50 GB/s, or about 24 ms over NVLink at 450 GB/s. Streaming it layer by layer during prefill hides much of this.</li>
+  </ol></details>
+</div>
+
+<h2 id="interference">1. The problem: prefill and decode get in each other's way</h2>
+<p>With continuous batching (chapter 3.2), every engine step mixes decode tokens of running requests with prefill work for new ones. Chunked prefill caps how much prefill joins each step, but it cannot remove the conflict:</p>
+<ul>
+  <li><strong>Decode slows when prefill arrives.</strong> A step that carries 2,048 prompt tokens does far more math than a pure decode step, so every running request waits longer for its next token. The DistServe authors report that one large prefill can inflate TPOT by 2 to 30 times under bursty load, even with chunked prefill.</li>
+  <li><strong>Prefill waits behind decode.</strong> With a token budget, decodes go first. A full batch of decodes leaves little budget for new prompts, so TTFT rises.</li>
+  <li><strong>One configuration must serve both.</strong> Prefill wants large token batches and modest parallelism; decode wants many sequences, lots of KV memory and often wider tensor parallelism for latency. A shared GPU must compromise, and the cluster must be sized for the worst case of both TTFT and TPOT at once.</li>
+</ul>
+
+<h2 id="how">2. How disaggregation works</h2>
+<ol>
+  <li>A router sends a new request to a <strong>prefill engine</strong>. It runs the prompt, produces the first token and the KV cache.</li>
+  <li>The KV cache is <strong>transferred</strong> to a <strong>decode engine</strong> over NVLink, InfiniBand or RoCE, usually GPU memory to GPU memory with RDMA (no CPU copy).</li>
+  <li>The decode engine adds the request to its running batch and generates the rest of the tokens.</li>
+</ol>
+<p>Real deployments have several of each, written xPyD: 5P3D means five prefill engines and three decode engines for one model. Each pool scales on its own signal: prefill on queued prompt tokens and TTFT, decode on running sequences, KV memory and TPOT.</p>
+<p>A common refinement is <strong>conditional disaggregation</strong>: the decode engine prefills locally when the prompt is short, or when most of it is already in its prefix cache (chapter 4.4), and sends only long, uncached prompts to the prefill pool. Short prompts never pay the transfer.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Colocated (aggregated) serving:</strong> prefill and decode run on the same engine and GPUs.</p>
+  <p><strong>Disaggregated serving:</strong> prefill and decode run on separate engines, usually separate GPUs or nodes.</p>
+  <p><strong>Goodput:</strong> the request rate a system can serve while meeting its latency targets (for example p90 TTFT under 1 s and p90 TPOT under 50 ms). It is what disaggregation optimizes.</p>
+  <p><strong>NIXL:</strong> NVIDIA's inference transfer library for moving KV blocks between engines and memory tiers; used by Dynamo and by vLLM's NixlConnector.</p>
+</div>
+
+<h2 id="transfer">3. The KV transfer</h2>
+<p>The cost of disaggregation is moving the cache. Its size is the formula from chapter 2.4, and its time depends on the link:</p>
+<div class="formula">transfer time ≈ prompt tokens × KV bytes per token ÷ link bandwidth</div>
+<div class="widget" id="xfW">
+  <div class="wt">Interactive: KV transfer vs prefill time</div>
+  <div class="ws">Prefill time assumes the prefill engine runs at 40% of H100 BF16 peak on its GPUs (attention FLOPs included). If the transfer is much shorter than the prefill, it can be hidden by sending each layer's KV as soon as that layer is done.</div>
+  <div class="ctrls">
+    <label>Model <select id="xfM"><option value="8">Llama 3.1 8B (1 GPU)</option><option value="70" selected>Llama 3.1 70B (TP 4)</option><option value="ds">DeepSeek-V3, MLA (8 GPUs)</option></select></label>
+    <label>Prompt: <span class="mono" id="xfTv"></span><input type="range" id="xfT" min="9" max="17" step="1" value="13"></label>
+    <label>KV precision <select id="xfK"><option value="2">BF16</option><option value="1">FP8</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="xfSvg" viewBox="0 0 680 210" width="680" style="max-width:100%;height:auto" role="img" aria-label="Transfer time by link compared with prefill time"></svg></div>
+  <div class="ws" id="xfNote"></div>
+</div>
+<p>Three ways to make the transfer cheap:</p>
+<ul>
+  <li><strong>Layer-by-layer streaming.</strong> Send layer i's KV while layer i + 1 is still being computed, so most of the transfer overlaps with prefill.</li>
+  <li><strong>Smaller caches.</strong> GQA, MLA and FP8 KV cut the bytes (chapter 4.2).</li>
+  <li><strong>Placement.</strong> Keep prefill and decode engines on the same node or NVLink domain when possible; DistServe placed them according to cluster bandwidth for this reason.</li>
+</ul>
+<p>Layouts can differ between pools: a prefill engine at TP 2 and a decode engine at TP 8 split the KV cache by heads differently. The transfer layer must re-shard (transpose) blocks on the way; Dynamo includes a kernel for this.</p>
+
+<h2 id="sizing">4. Sizing the pools: the xPyD ratio</h2>
+<p>Each pool must keep up with its share of the work, with headroom:</p>
+<div class="formula">prefill GPUs ≈ arrival rate × prompt tokens ÷ (prefill tokens per second per GPU × target utilization)<br>decode GPUs ≈ arrival rate × output tokens ÷ (decode tokens per second per GPU at the TPOT target)</div>
+<p>The ratio follows the workload. Long prompts and short answers (RAG, summarization, code context) need many prefill GPUs; short prompts and long answers (chat, reasoning) need many decode GPUs. Get it wrong and one pool queues while the other idles: a 1P1D setup with too little prefill capacity has stable TPOT but TTFT that grows without limit. Part C of the lab shows exactly this.</p>
+<div class="widget" id="szW">
+  <div class="wt">Interactive: size prefill and decode pools</div>
+  <div class="ws">Llama 3.1 70B in FP8 on H100s at TP 4 per engine, idealized rates from chapters 2.4 and 2.5. Prefill per engine: 4 × 1,979 TFLOP/s × MFU ÷ (2 × parameters). Decode per engine: the largest batch whose step time stays under the TPOT target.</div>
+  <div class="ctrls">
+    <label>Requests per second <input type="number" id="szR" value="20" min="1" max="500" style="width:70px"></label>
+    <label>Prompt tokens <input type="number" id="szP" value="6000" step="500" style="width:80px"></label>
+    <label>Output tokens <input type="number" id="szO" value="400" step="50" style="width:70px"></label>
+    <label>TPOT target (ms) <input type="number" id="szS" value="40" step="5" style="width:60px"></label>
+    <label>Prefill MFU: <span class="mono" id="szUv"></span><input type="range" id="szU" min="0.2" max="0.7" step="0.05" value="0.4"></label>
+  </div>
+  <div class="stats" id="szStats"></div>
+</div>
+
+<h2 id="when">5. When disaggregation pays off</h2>
+<p>Disaggregation needs more GPUs, a fast network, a router, KV transfer, and two pools to monitor and scale. Practitioner guidance (from the Kiely book and from vLLM's own documentation) converges on:</p>
+<ul>
+  <li><strong>High volume.</strong> Enough traffic to keep two pools busy: the Kiely book suggests starting at roughly 100 million to 1 billion tokens per day, depending on model size.</li>
+  <li><strong>Large models.</strong> About 100B parameters and up, where each GPU is expensive and interference costs a lot.</li>
+  <li><strong>Prefill-heavy traffic with strict decode targets.</strong> Long, varied, uncached prompts mixed with users who need smooth streaming. A coding assistant on a very large model, with many developers sending large code contexts, is the textbook case.</li>
+</ul>
+<p>When these do not hold, more colocated replicas with chunked prefill and good prefix caching usually win. vLLM's documentation states it plainly: disaggregated prefill does not improve throughput; it lets you tune TTFT and inter-token latency separately and control tail latency.</p>
+<div class="tbl"><table>
+<tr><th>Situation</th><th>Better choice</th></tr>
+<tr><td>Small model, moderate traffic</td><td>Colocated replicas, chunked prefill</td></tr>
+<tr><td>Short prompts or high prefix-cache hit rate</td><td>Colocated (or conditional disaggregation)</td></tr>
+<tr><td>Large model, long uncached prompts, strict TPOT</td><td>Disaggregated</td></tr>
+<tr><td>Very large MoE on many nodes</td><td>Disaggregated, with different EP sizes per pool</td></tr>
+</table></div>
+
+<h2 id="production">6. Disaggregation in production stacks</h2>
+<p>Disaggregation went from a research idea (DistServe and Splitwise, both 2024) to a default building block within about eighteen months. DistServe reported serving up to 7.4 times more requests, or meeting 12.6 times tighter SLOs, than colocated systems of the time. Splitwise reported 1.4 times higher throughput at 20% lower cost, and studied running prefill and decode on different GPU types.</p>
+<ul>
+  <li><strong>NVIDIA Dynamo</strong> (chapter 3.6): prefill queue, conditional disaggregation with thresholds on uncached prompt length and queue size, NIXL transfers with re-sharding, and runtime changes to the xPyD ratio.</li>
+  <li><strong>vLLM</strong> (marked experimental): KV connectors such as NixlConnector, LMCacheConnector and MooncakeConnector, plus a proxy that sends the prefill request and then the decode request.</li>
+  <li><strong>SGLang:</strong> PD disaggregation used for large DeepSeek deployments; the SGLang team reported DeepSeek-R1 on 96 H100s with 3 prefill nodes and 9 decode nodes.</li>
+  <li><strong>llm-d and Ray Serve LLM:</strong> prefill and decode as separately scaled Kubernetes or Ray services.</li>
+  <li><strong>DeepSeek</strong> described serving V3 with separate prefill and decode deployments, each using a different degree of expert parallelism.</li>
+</ul>
+<pre># vLLM, one prefill and one decode instance with NIXL (sketch; see the NixlConnector guide)
+vllm serve MODEL --port 8100 --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+vllm serve MODEL --port 8200 --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+# a proxy sends each request to 8100 for prefill, then to 8200 for decode</pre>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Different hardware per phase</span>
+  <p>Once the phases are separate, they can run on different GPUs: compute-rich chips for prefill, bandwidth- and memory-rich chips for decode. Splitwise explored H100 for one phase and A100 for the other; newer work and some hardware vendors design decode-specialized or attention-specialized accelerators along the same lines.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Attention/FFN disaggregation</span>
+  <p>A further split separates attention (memory-bound, holds the KV cache) from the feed-forward or MoE layers (compute-heavy, holds the weights) during decode, sending activations between them twice per layer. For large MoE models that already pay all-to-alls for expert parallelism, the extra communication is affordable. It is an active research and early production area.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Failure and backpressure</span>
+  <p>Disaggregation adds failure modes: a prefill finishes but the decode engine has no KV memory left, a transfer fails mid-way, or the prefill queue grows without bound. Production systems pull work rather than push it (decode engines accept transfers when they have room), bound the prefill queue, fall back to local prefill, and retry failed transfers (vLLM documents KV load failure recovery). Chapter 6.9 covers fault tolerance.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Expecting disaggregation to raise raw throughput on a small model.</li>
+  <li>Using a fixed 1P1D ratio for prefill-heavy traffic, so prefill queues and TTFT explode.</li>
+  <li>Placing prefill and decode engines across a slow network without layer-wise streaming.</li>
+  <li>Disaggregating short or mostly cached prompts instead of prefilling them locally.</li>
+  <li>Watching only average latency; disaggregation's main benefit is in the tails (p90 to p99 TPOT).</li>
+  <li>Forgetting that decode engines can run out of KV memory under load; quantize and offload the cache (chapters 4.1 and 4.4).</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p><strong>Goal:</strong> compute transfer costs, size pools, and see in a simulator how colocated and disaggregated serving trade TTFT against TPOT.</p>
+<h3>Part A: the 100 Days notebook</h3>
+<p>Run day 18 (prefill/decode disaggregation) of <em>100 Days of Inference</em>, with its latency models and xPyD traffic simulation. Check its 70B transfer example against the widget in section 3, and note which link it assumes.</p>
+<h3>Part B: transfer cost by hand</h3>
+<p>For Llama 3.1 8B (128 KiB per token in BF16), compute the transfer time of an 8,000-token prompt over NVLink (450 GB/s), a 400 Gb/s RDMA link (50 GB/s) and a 100 Gb/s Ethernet link (12.5 GB/s). Compare with its prefill time on one H100 at 40% MFU.</p>
+<details><summary>Answer</summary><p>KV: 8,000 × 131,072 = 1.05 GB. NVLink 2.3 ms, RDMA 21 ms, 100 GbE 84 ms. Prefill: 8,000 × 16.06 GFLOP ≈ 128 TFLOP plus attention (about 32 × 2 × 8,000² × 4,096 ≈ 17 TFLOP) ≈ 145 TFLOP at 396 TFLOP/s ≈ 370 ms. Even 100 GbE is under a quarter of the prefill time, and layer-wise streaming hides most of it.</p></details>
+<h3>Part C: colocated vs disaggregated, in a simulator (CPU, seconds)</h3>
+<p>A step-level simulator with the idealized cost model of chapters 2.4 and 2.5 (Llama 3.1 8B on H100s, 4,000-token prompts, 200-token answers, Poisson arrivals). Colocated engines use chunked prefill with a 2,048-token budget; disaggregated engines send each finished prefill's KV over 50 GB/s.</p>
+<pre>import random
+random.seed(0)
+W, KVT, BW, FLOPS = 16.06e9, 131072, 3.35e12, 989e12 * 0.5
+def step_time(n_decode, ctx_tokens, n_prefill_tokens):
+    mem = (W + ctx_tokens * KVT) / BW
+    comp = 2 * 8.03e9 * (n_decode + n_prefill_tokens) / FLOPS
+    return max(mem, comp)
+
+def decode_gpu(arrivals, prompt, out, budget=None):
+    """arrivals: (time ready, original arrival). budget set = colocated with chunked prefill."""
+    ttft, tpot, clock, queue, running, i = [], [], 0.0, [], [], 0
+    while i &lt; len(arrivals) or queue or running:
+        while i &lt; len(arrivals) and arrivals[i][0] &lt;= clock:
+            if budget: queue.append([arrivals[i][1], prompt])
+            else:
+                running.append({"arr": arrivals[i][1], "start": arrivals[i][0], "made": 1})
+                ttft.append(arrivals[i][0] - arrivals[i][1])
+            i += 1
+        if not queue and not running: clock = arrivals[i][0]; continue
+        chunk = 0
+        if budget:                                   # decodes first, then prefill fills the budget
+            left = budget - len(running)
+            while queue and left &gt; 0:
+                take = min(left, queue[0][1]); queue[0][1] -= take; left -= take; chunk += take
+                if queue[0][1] == 0: running.append({"arr": queue.pop(0)[0], "start": None, "made": 0})
+        clock += step_time(len(running), sum(prompt + r["made"] for r in running), chunk)
+        for r in running[:]:
+            if r["start"] is None: r["start"] = clock; ttft.append(clock - r["arr"]); r["made"] = 1
+            else: r["made"] += 1
+            if r["made"] &gt;= out: tpot.append((clock - r["start"]) / (out - 1)); running.remove(r)
+    return ttft, tpot
+
+def simulate(P, D, rate, prompt=4000, out=200, T=120.0):
+    arr, t = [], 0.0
+    while t &lt; T: t += random.expovariate(rate); arr.append(t)
+    ttft, tpot = [], []
+    if P == 0:                                       # colocated: D replicas, round robin
+        for g in range(D):
+            a, b = decode_gpu([(x, x) for x in arr[g::D]], prompt, out, budget=2048); ttft += a; tpot += b
+    else:
+        # TODO: P prefill GPUs. For each arrival, pick the prefill GPU that frees up first,
+        # run the prompt (step_time(0, 0, prompt)), add the KV transfer time
+        # (prompt * KVT / 50e9) and record (ready time, arrival). Then sort the ready list
+        # and give every D-th request to each decode GPU (decode_gpu without a budget).
+        pass
+    q = lambda xs, p: sorted(xs)[int(p * (len(xs) - 1))]
+    return q(ttft, .5), q(ttft, .99), q(tpot, .5), q(tpot, .99)
+
+for rate in [12, 20]:
+    for P, D, name in [(0, 4, "colocated x4"), (2, 2, "2P + 2D"), (3, 1, "3P + 1D")]:
+        a, b, c, d = simulate(P, D, rate)
+        print(f"{rate} req/s {name:13s} TTFT p50 {a*1e3:6.0f} p99 {b*1e3:6.0f} ms  "
+              f"TPOT p50 {c*1e3:5.1f} p99 {d*1e3:5.1f} ms")</pre>
+<details><summary>Solution</summary>
+<pre>        free, ready = [0.0] * P, []
+        xfer = prompt * KVT / 50e9
+        for a in arr:
+            g = min(range(P), key=lambda k: free[k])
+            free[g] = max(free[g], a) + step_time(0, 0, prompt)
+            ready.append((free[g] + xfer, a))
+        ready.sort()
+        for g in range(D):
+            a, b = decode_gpu(ready[g::D], prompt, out); ttft += a; tpot += b</pre></details>
+<details><summary>What we measured, and why</summary><pre class="out">12 req/s colocated x4  TTFT p50    133 p99    200 ms  TPOT p50   8.7 p99  11.5 ms
+12 req/s 2P + 2D       TTFT p50    194 p99    645 ms  TPOT p50   6.0 p99   6.4 ms
+12 req/s 3P + 1D       TTFT p50    140 p99    269 ms  TPOT p50   8.0 p99   9.5 ms
+20 req/s colocated x4  TTFT p50    137 p99    311 ms  TPOT p50  18.9 p99  28.8 ms
+20 req/s 2P + 2D       TTFT p50  20016 p99  39953 ms  TPOT p50   6.4 p99   6.4 ms
+20 req/s 3P + 1D       TTFT p50    250 p99    859 ms  TPOT p50  14.3 p99  17.4 ms</pre>
+<p>Disaggregated decode is smooth: TPOT p99 barely moves from p50, because no prefill ever enters a decode step. Colocated TPOT more than doubles from 12 to 20 requests per second as more prefill chunks join each step. But at 20 requests per second, 2P2D has too little prefill capacity: each 4,000-token prompt takes about 130 ms, so two prefill GPUs handle at most about 15 per second, and the queue grows without limit. 3P1D keeps up, at the cost of more TPOT on its single decode GPU. The lesson: disaggregation trades TTFT for TPOT stability, and it only works with the right ratio. Try prompt = 500 and out = 1,000 (decode-heavy) and find the best split.</p></details>
+<h3>Part D (optional): a real 1P1D setup</h3>
+<p>If you have two GPUs on one machine (for example Kaggle's T4 ×2), follow vLLM's NixlConnector usage guide to run one prefill and one decode instance with its proxy. Send long-prompt requests and confirm in the logs that the decode instance receives KV blocks instead of prefilling. This needs NIXL and UCX installed and may take some setup; treat it as an exploration, not a benchmark.</p>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Who disaggregates</span>
+  <ul>
+    <li><strong>Frontier and large open-model providers</strong> serving models with hundreds of billions of parameters, especially for coding and long-document products.</li>
+    <li><strong>DeepSeek and Kimi (Mooncake)</strong> built their serving around separate prefill and decode clusters with KV-centric scheduling.</li>
+    <li><strong>Inference platforms</strong> (Dynamo, llm-d, SGLang, Ray Serve LLM) offer it as a deployment pattern, usually with conditional disaggregation and autoscaling per pool.</li>
+    <li><strong>Smaller deployments</strong> mostly stay colocated, with chunked prefill and prefix caching.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz46"></div>
+<script type="application/json" id="qz46">[
+{"q":"What does disaggregation mainly improve?","o":["Raw throughput of a GPU","Goodput: requests served within both TTFT and TPOT targets, especially tail TPOT","Model quality","Memory per GPU"],"a":1,"e":"It removes prefill-decode interference and lets each pool be tuned separately."},
+{"q":"In 4P2D, which pool handles the KV cache transfer's sending side?","o":["Decode","Prefill","The router","Neither"],"a":1,"e":"Prefill engines produce the KV cache and send it to decode engines."},
+{"q":"Which workload needs more prefill engines?","o":["Short prompts, long answers","Long prompts, short answers","Equal prompt and answer lengths","Cached prompts"],"a":1,"e":"Prefill work grows with prompt tokens."},
+{"q":"How is most of the KV transfer time hidden?","o":["Compression only","Sending each layer's KV while later layers are still being prefilled","Using CPU memory","It cannot be hidden"],"a":1,"e":"Layer-wise streaming overlaps transfer with compute."},
+{"q":"Conditional disaggregation sends a request to the prefill pool when:","o":["Always","Its uncached prompt is long","It is short","The decode pool is idle"],"a":1,"e":"Short or mostly cached prompts are prefilled locally to skip the transfer."},
+{"q":"A 1P1D setup has stable TPOT but TTFT grows without limit. Likely cause:","o":["Network too fast","Too little prefill capacity for the prompt load","Decode too slow","Prefix caching on"],"a":1,"e":"The prefill queue grows when arrival rate × prompt cost exceeds prefill capacity."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Colocated prefill and decode interfere: prefill inflates TPOT, decode delays prefill, and one configuration must serve both.</li>
+  <li>Disaggregation runs them on separate engines and moves the KV cache between them, usually by RDMA, often layer by layer.</li>
+  <li>Size the pools from prompt and output token rates; the xPyD ratio follows the workload, and a wrong ratio makes one pool queue.</li>
+  <li>It improves goodput and tail latency, not raw throughput; it pays off for large models, high volume and long uncached prompts.</li>
+  <li>Dynamo, vLLM, SGLang, llm-d and LMCache all support it; conditional disaggregation keeps short and cached prompts local.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 5.5</td><td>How disaggregation works, conditional disaggregation, when to use it, xPyD and Dynamo's features.</td></tr>
+<tr><td><a href="https://hao-ai-lab.github.io/blogs/distserve-retro/">Hao AI Lab: Disaggregated inference 18 months later</a></td><td>The interference problem, adoption across Dynamo, llm-d, Ray, vLLM, SGLang, LMCache and Mooncake, heterogeneous hardware and attention/FFN disaggregation.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2401.09670">Zhong et al., DistServe</a></td><td>Goodput-optimized disaggregation; 7.4 times more requests or 12.6 times tighter SLOs.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2311.18677">Patel et al., Splitwise</a></td><td>Phase splitting with the same or different GPU types; cost and power results.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/features/disagg_prefill/">vLLM: Disaggregated prefilling</a></td><td>Why to use it, the KV connectors, and the note that it does not improve throughput.</td></tr>
+<tr><td><a href="https://docs.nvidia.com/dynamo/">NVIDIA Dynamo documentation</a></td><td>Disaggregated serving, the prefill queue, NIXL and planning.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, chapters 15 to 17</td><td>Disaggregated inference, NIXL and Dynamo at scale.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 18</td><td>Latency models and an xPyD traffic simulation.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The day 18 README of <em>100 Days of Inference</em> times a 10 GB transfer for a 70B model at 32K tokens over NVLink at 900 GB/s (about 11 ms). Prefill and decode engines are usually on different nodes, where the link is RDMA at about 50 GB/s per NIC, giving about 215 ms; and 900 GB/s is NVLink 4's two-direction total, about 450 GB/s each way.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. The Part C simulator was run with Python 3.13.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+const M={'8':{P:8.03e9,L:32,dm:4096,kv:131072,g:1,n:'Llama 3.1 8B'},'70':{P:70.6e9,L:80,dm:8192,kv:327680,g:4,n:'Llama 3.1 70B'},'ds':{P:37e9,L:61,dm:7168,kv:70272,g:8,n:'DeepSeek-V3'}};
+function xf(){const m=M[$('xfM').value],T=2**+$('xfT').value,kb=+$('xfK').value/2;$('xfTv').textContent=IE.tok(T);
+  const bytes=T*m.kv*kb;const fl=2*m.P*T+m.L*2*T*T*m.dm;const pre=fl/(m.g*989e12*0.4);
+  const links=[['NVLink 4 (450 GB/s)',450e9],['RDMA 400 Gb/s (50 GB/s)',50e9],['Ethernet 100 Gb/s (12.5 GB/s)',12.5e9]];
+  const rows=[['Prefill (40% MFU)',pre,'--pre']].concat(links.map(l=>[l[0],bytes/l[1],'--kv']));
+  const svg=$('xfSvg');svg.innerHTML='';const mx=Math.max(...rows.map(r=>r[1]));
+  rows.forEach((r,i)=>{const y=10+i*48;el('text',{x:0,y:y+20,fill:css('--ink'),'font-size':12},svg,r[0]);
+    const w=240*r[1]/mx;el('rect',{x:220,y,width:Math.max(w,2),height:28,rx:4,fill:css(r[2])},svg);
+    const ms=r[1]*1e3;el('text',{x:226+w,y:y+19,fill:css('--ink'),'font-size':12},svg,(ms<10?ms.toFixed(1):IE.int(ms))+' ms'+(i?'  ('+Math.round(r[1]/pre*100)+'% of prefill)':''));});
+  $('xfNote').textContent=`${m.n}: KV cache of a ${IE.tok(T)}-token prompt = ${IE.gb(bytes)} GB; prefill ≈ ${IE.int(fl/1e12)} TFLOP on ${m.g} GPU${m.g>1?'s':''}.`;}
+['xfM','xfT','xfK'].forEach(id=>$(id).addEventListener('input',xf));IE.onTheme(xf);
+function sz(){const R=+$('szR').value,Pt=+$('szP').value,O=+$('szO').value,S=+$('szS').value/1e3,U=+$('szU').value;$('szUv').textContent=Math.round(U*100)+'%';
+  const P=70.6e9,W=70.6e9,kvt=163840,ctx=Pt+O/2;
+  const prePerEng=4*1979e12*U/(2*P);
+  let bmax=0;for(let b=1;b<=4096;b++){const mem=(W+b*ctx*kvt)/(4*3.35e12),comp=2*P*b/(4*1979e12);const t=Math.max(mem,comp);if(t<=S&&(W+b*ctx*kvt)<=4*72e9)bmax=b;else if(b>bmax+1)break;}
+  const decPerEng=bmax>0?bmax/S:0;
+  const nP=Math.ceil(R*Pt/(prePerEng*0.7)),nD=decPerEng?Math.ceil(R*O/decPerEng):Infinity;
+  $('szStats').innerHTML=[['Prefill engines (70% busy)',nP+' ('+nP*4+' GPUs)'],['Decode engines',isFinite(nD)?nD+' ('+nD*4+' GPUs)':'TPOT target too tight'],['Ratio',isFinite(nD)?nP+'P'+nD+'D':'n/a'],['Max decode batch per engine',bmax]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['szR','szP','szO','szS','szU'].forEach(id=>$(id).addEventListener('input',sz));sz();
+})();
+</script>
