@@ -108,7 +108,8 @@
   <li><strong>vLLM</strong> (marked experimental): KV connectors such as NixlConnector, LMCacheConnector and MooncakeConnector, plus a proxy that sends the prefill request and then the decode request.</li>
   <li><strong>SGLang:</strong> PD disaggregation used for large DeepSeek deployments; the SGLang team reported DeepSeek-R1 on 96 H100s with 3 prefill nodes and 9 decode nodes.</li>
   <li><strong>llm-d and Ray Serve LLM:</strong> prefill and decode as separately scaled Kubernetes or Ray services.</li>
-  <li><strong>DeepSeek</strong> described serving V3 with separate prefill and decode deployments, each using a different degree of expert parallelism.</li>
+  <li><strong>DeepSeek</strong> described serving V3 with separate prefill and decode deployments, each using a different degree of expert parallelism. Its V4.1-Flash service (chapter 4.8) splits three ways, <strong>VE/prefill/decode</strong> (also called EPD): the vision encoder (VE) that turns images into tokens runs in its own pool on one cheaper GPU per instance, prefill on 8-GPU machines with small EP, decode on 64- to 128-GPU supernodes. Its open-source engine DeepInfer implements most of the engine side of this split, but not the KV cache system or the load balancers.</li>
+  <li><strong>Huawei CloudMatrix-Infer</strong> (arXiv 2506.12708) scales prefill, decode and caching as three independent peer pools on a 384-NPU supernode, with KV cache access over the supernode's unified bus.</li>
 </ul>
 <pre># vLLM, one prefill and one decode instance with NIXL (sketch; see the NixlConnector guide)
 vllm serve MODEL --port 8100 --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
@@ -122,7 +123,7 @@ vllm serve MODEL --port 8200 --kv-transfer-config '{"kv_connector":"NixlConnecto
 </div>
 <div class="box expert">
   <span class="lbl">Attention/FFN disaggregation</span>
-  <p>A further split separates attention (memory-bound, holds the KV cache) from the feed-forward or MoE layers (compute-heavy, holds the weights) during decode, sending activations between them twice per layer. For large MoE models that already pay all-to-alls for expert parallelism, the extra communication is affordable. It is an active research and early production area.</p>
+  <p>A further split separates attention (memory-bound, holds the KV cache) from the feed-forward or MoE layers (compute-heavy, holds the weights) during decode, sending activations between them twice per layer. For large MoE models that already pay all-to-alls for expert parallelism, the extra communication is affordable. It is an active research and early production area: MegaScale-Infer (ByteDance) and Step-3 (StepFun) are the two published designs, and Huawei's xDeepServe supports MoE-attention disaggregation in production (chapter 4.5). Think of disaggregation as having two axes: <em>along time</em> (prefill vs decode, this chapter) and <em>along the layer</em> (attention vs experts); a large MoE service can use both.</p>
 </div>
 <div class="box expert">
   <span class="lbl">Failure and backpressure</span>
@@ -255,6 +256,9 @@ for rate in [12, 20]:
 <h2 id="refs">13. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://github.com/deepseek-ai/DeepInfer">DeepInfer</a> deployment Q&amp;A</td><td>VE/prefill/decode disaggregation with different EP sizes per pool in DeepSeek's V4.1 service.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2506.12708">Serving Large Language Models on Huawei CloudMatrix384</a></td><td>Peer-to-peer prefill, decode and caching pools on a unified-bus supernode.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2504.02263">MegaScale-Infer</a> and <a href="https://arxiv.org/abs/2507.19427">Step-3</a></td><td>The two published attention-FFN disaggregation designs.</td></tr>
 <tr><td>Philip Kiely, <em>Inference Engineering</em>, section 5.5</td><td>How disaggregation works, conditional disaggregation, when to use it, xPyD and Dynamo's features.</td></tr>
 <tr><td><a href="https://hao-ai-lab.github.io/blogs/distserve-retro/">Hao AI Lab: Disaggregated inference 18 months later</a></td><td>The interference problem, adoption across Dynamo, llm-d, Ray, vLLM, SGLang, LMCache and Mooncake, heterogeneous hardware and attention/FFN disaggregation.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2401.09670">Zhong et al., DistServe</a></td><td>Goodput-optimized disaggregation; 7.4 times more requests or 12.6 times tighter SLOs.</td></tr>

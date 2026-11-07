@@ -96,6 +96,7 @@
   <div class="ws" id="lrNote"></div>
 </div>
 <p>The pattern holds broadly: reloading from CPU memory beats recomputation by an order of magnitude; local SSD is roughly break-even to a few times better; a slow network store can lose to recomputation for small models but wins for large ones, where recomputing costs far more FLOPs per KV byte. Compact caches (GQA, MLA, FP8 KV) make every tier more attractive, because fewer bytes stand in for the same tokens. Real systems also overlap loading with computing other layers, which hides part of the load time.</p>
+<p>The bytes moved can also be made smaller than the cache itself. <strong>CacheGen</strong> (arXiv 2310.07240, the University of Chicago group behind LMCache) encodes a KV cache into a compact bitstream using its statistical properties, and changes the compression level of different parts when network bandwidth drops, so loading stays fast enough to beat recomputing. The authors report 3.5 to 4.3 times smaller KV caches and 3.2 to 3.7 times less delay to fetch and process contexts, with negligible quality impact. It is the step from "cache tiers" to "KV streaming" that LMCache and disaggregated systems build on.</p>
 
 <h2 id="routing">6. Routing decides whether the cache helps</h2>
 <p>Every replica has its own cache. A request only hits if it lands on a replica that holds its prefix. Ordinary load balancers (round robin, least connections) are blind to this and scatter related requests. Options, from simplest:</p>
@@ -108,6 +109,17 @@
 
 <h2 id="beyond">7. Beyond exact prefixes</h2>
 <p>Prefix caching only reuses an exact prefix, because each token's keys and values depend on every token before it and on its position (chapter 2.3). RAG breaks this constantly: the same document appears in different prompts at different positions after different documents. CacheBlend reuses each document's precomputed KV wherever it appears and recomputes only a small subset of tokens to repair the cross-attention between chunks, keeping quality close to full prefill. LMCache implements this kind of non-prefix reuse. It is an approximation: evaluate it on your own data before relying on it.</p>
+
+<h3>Shared prefixes inside one decode batch: Hydragen</h3>
+<p>Prefix caching saves the prefill of a shared prefix. During decode, though, every sequence in the batch still reads the prefix's KV from HBM separately, one matrix-vector product per sequence. <strong>Hydragen</strong> (arXiv 2402.05099) splits attention into two parts: attention over the shared prefix, computed for all sequences at once by stacking their queries into one matrix-matrix product, and attention over each sequence's own suffix. The two partial results are merged exactly with the same softmax-rescaling trick as Flash-Decoding (chapter 4.2, section 7). The prefix KV is read once per step instead of once per sequence, and the prefix part runs on tensor cores. FlashInfer calls this cascade attention. vLLM had a cascade attention path for shared prefixes but has since removed it (at the commit chapter 8.2 reads, only a deprecated flag remains), so check your engine before counting on it. The saving, computed:</p>
+<pre>kv = 131_072                 # bytes per token, Llama 3.1 8B in BF16 (chapter 2.4)
+B, P, S = 64, 4_000, 500     # sequences in the batch, shared prefix tokens, own tokens per sequence
+plain = B * (P + S) * kv     # every sequence reads its own copy of the prefix KV
+hydra = (P + B * S) * kv     # prefix KV read once for all 64 queries, suffixes separately
+print(f"KV read per decode step: plain {plain/1e9:.1f} GB, shared-prefix {hydra/1e9:.1f} GB, {plain/hydra:.1f}x less")
+print(f"at 3.35 TB/s (H100): {plain/3.35e12*1e3:.1f} ms vs {hydra/3.35e12*1e3:.1f} ms of KV reading per step")</pre>
+<details><summary>What we computed</summary><pre class="out">KV read per decode step: plain 37.7 GB, shared-prefix 4.7 GB, 8.0x less
+at 3.35 TB/s (H100): 11.3 ms vs 1.4 ms of KV reading per step</pre><p>With 64 sequences sharing a 4,000-token prefix, the KV bytes read per step drop 8 times; the longer the shared prefix and the larger the batch, the bigger the gain. The authors report up to 32 times end-to-end throughput for CodeLlama-13B, and that growing the shared prefix from 1K to 16K tokens costs Hydragen under 15% of its throughput at large batch while baselines lose over 90%. The pattern to look for: many requests in flight at once with the same long system prompt or document (agents, few-shot evaluation, parallel sampling).</p></details>
 
 <h2 id="expert">8. Expert layer</h2>
 <div class="box expert">
@@ -289,6 +301,8 @@ cache-aware + load cap   hit 64.7%  prefill computed  7.62 M tokens  busiest/mea
 <h2 id="refs">14. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2402.05099">Juravsky et al., Hydragen</a></td><td>Exact shared-prefix attention that reads the prefix KV once per decode step.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2310.07240">Liu et al., CacheGen</a></td><td>KV compression and adaptive streaming so that loading beats recomputing at lower bandwidth.</td></tr>
 <tr><td>Philip Kiely, <em>Inference Engineering</em>, section 5.3</td><td>Prefix caching and context engineering, the G1 to G4 storage tiers, KVBM, and cache-aware routing.</td></tr>
 <tr><td><a href="https://llm-d.ai/blog/kvcache-wins-you-can-see">llm-d: KV-cache wins you can see</a></td><td>The 4.3 s to 0.6 s example, KV events and a live block index, and the routing benchmark.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/features/kv_offloading_usage/">vLLM: KV offloading usage guide</a></td><td>The OffloadingConnector, CPU and secondary tiers, and configuration.</td></tr>
@@ -303,7 +317,7 @@ cache-aware + load cap   hit 64.7%  prefill computed  7.62 M tokens  busiest/mea
   <li>The day 16 takeaways of <em>100 Days of Inference</em> say prefix-caching savings land in TTFT, not throughput. Under load, skipped prefill frees GPU time for other requests, so throughput rises too; the llm-d benchmark measured about twice the throughput with cache-aware routing.</li>
   <li>The 10 times price ratio between cached and uncached tokens is the one quoted in the llm-d post for one API when it was written. Provider prices change; check current pricing pages.</li>
 </ul>
-<p class="note">Facts checked on 7 November 2026. Lab Parts B and D were run on CPU with Transformers 5.22 and Python 3.13.</p>
+<p class="note">Facts checked on 7 November 2026. Lab Parts B and D were run on CPU with Transformers 5.22 and Python 3.13; the Hydragen arithmetic in section 7 was computed with Python 3.13.</p>
 <!--SCRIPT-->
 <script>
 (function(){

@@ -161,6 +161,9 @@
   <li>Some layer types are more sensitive. vLLM can leave chosen layers unquantized, for example sliding-window layers: <code>--kv-cache-dtype-skip-layers sliding_window</code>.</li>
   <li>With some backends (FlashAttention 3), the attention math itself then runs in FP8, and the queries are quantized too.</li>
 </ul>
+<p>Below 8 bits the layout of the values matters. <strong>KIVI</strong> (arXiv 2402.02750) studied the element distributions of real KV caches and found that keys have a few channels with large values while values do not, so keys should be quantized <em>per channel</em> (one scale per channel, shared across tokens) and values <em>per token</em>. With that split it stores the cache in 2 bits without tuning; the authors report almost the same quality with 2.6 times less peak memory (weights included), up to 4 times larger batches and 2.35 to 3.47 times the throughput. DeepSeek-V4.1-Flash stores its main KV in a 4-bit floating-point format trained in with quantization-aware training, and keeps its sliding window KV in FP8 because it is more sensitive (chapter 4.8).</p>
+<h3>W4A8KV4: QServe and the dequantization tax</h3>
+<p>Why does 4-bit weight-only quantization (W4A16) speed up a single user but not a busy server? <strong>QServe</strong> (MIT, arXiv 2405.04532) measured the answer: existing INT4 methods spend 20% to 90% extra runtime dequantizing weights or partial sums on the GPU's slower CUDA cores, which dominates once the batch is large enough to be compute-bound (chapter 2.5). Its <strong>QoQ</strong> algorithm ("quattuor-octo-quattuor", 4-8-4) uses 4-bit weights, 8-bit activations and a 4-bit KV cache, with progressive quantization so that the W4A8 matmul can run on INT8 tensor cores with cheap dequantization, and SmoothAttention to keep 4-bit KV accurate. Against TensorRT-LLM the authors report 1.2 to 1.4 times the throughput for Llama-3-8B and 2.4 to 3.5 times for Qwen1.5-72B on A100 and L40S. The lesson is general: a format helps only if the kernel can use it without moving work onto slow units.</p>
 
 <h2 id="quality">7. Measuring quality</h2>
 <p>The production standard is no measurable quality loss. Three checks, from cheapest to most meaningful:</p>
@@ -187,6 +190,10 @@
 <div class="box expert">
   <span class="lbl">Accumulation precision</span>
   <p>Low-precision inputs still need high-precision sums (chapter 1.3, section 8). The DeepSeek-V3 report measured that FP8 matmul accumulation on its H800 (Hopper) GPUs keeps only about 14 bits, with relative errors up to nearly 2%, so it promotes partial sums to FP32 on CUDA cores every 128 elements to stay accurate. Kernel libraries handle this, but it explains why "FP8 everywhere" is not free.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Two more ways around outliers</span>
+  <p><strong>QuaRot</strong> (arXiv 2404.00456) multiplies the hidden state by a random orthogonal (Hadamard) rotation that leaves the model's output unchanged but spreads outlier channels across all channels, so weights, activations and KV can all be quantized to 4 bits without keeping any channel in high precision; the authors report at most 0.47 WikiText-2 perplexity loss for 4-bit Llama-2-70B. <strong>SqueezeLLM</strong> (arXiv 2306.07629) keeps the outliers instead: a dense low-bit part with non-uniform levels chosen by sensitivity, plus a small sparse matrix holding outliers and sensitive weights in full precision.</p>
 </div>
 <div class="box expert">
   <span class="lbl">Packing and kernels</span>
@@ -376,6 +383,9 @@ vllm serve Qwen/Qwen2.5-1.5B-Instruct-AWQ --max-model-len 4096</pre>
 <h2 id="refs">14. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2402.02750">Liu et al., KIVI</a></td><td>2-bit KV cache with per-channel keys and per-token values.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2405.04532">Lin et al., QServe</a></td><td>W4A8KV4 (QoQ) and why dequantization overhead decides whether low bits pay at large batch.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2404.00456">Ashkboos et al., QuaRot</a> and <a href="https://arxiv.org/abs/2306.07629">Kim et al., SqueezeLLM</a></td><td>Rotations for outlier-free 4-bit; dense-and-sparse quantization.</td></tr>
 <tr><td>Philip Kiely, <em>Inference Engineering</em>, section 5.1</td><td>Number formats for inference, sensitivity of model components, the 30% to 50% per-level rule, and the three quality checks.</td></tr>
 <tr><td><a href="https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-quantization">Maarten Grootendorst: A Visual Guide to Quantization</a></td><td>Symmetric and asymmetric mapping, clipping, calibration, static vs dynamic, GPTQ, GGUF, QAT and BitNet with diagrams.</td></tr>
 <tr><td><a href="https://liyuan24.github.io/writings/2026_01_06_post_training_quantization.html">Liyuan: Post-training quantization</a></td><td>RTN and AWQ worked examples, and why AWQ packs 4-bit weights in an unusual order.</td></tr>

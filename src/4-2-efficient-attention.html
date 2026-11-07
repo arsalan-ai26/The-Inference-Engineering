@@ -60,6 +60,14 @@
 <p>If you simply drop the oldest tokens from a model trained with full attention, quality collapses once the text is longer than the window. The StreamingLLM paper found why: models put large attention weight on the first few tokens regardless of their meaning, using them as a "sink" for attention that has nowhere better to go. Keeping those first few tokens' KV plus a recent window restores stable output, up to millions of tokens in their tests. It does not give the model memory of the dropped middle; it only stops the collapse. Some recent models add a learned sink value per head for the same reason.</p>
 <h3>Sparse attention: pick the tokens that matter</h3>
 <p>DeepSeek Sparse Attention (DSA), introduced with DeepSeek-V3.2, keeps the full cache but lets each query attend to only k = 2,048 selected tokens. A small, cheap "lightning indexer" (few heads, can run in FP8) scores every earlier token, and the top-k are used for real attention. Core attention cost drops from O(T²) to O(T × k); the indexer is still O(T²) but much cheaper per pair. The model is trained to work this way, first by aligning the indexer with dense attention, then by training with sparse attention. Sparse attention needs its own kernels and cache handling (vLLM lists separate sparse MLA backends).</p>
+<p>Selecting the top 2,048 of hundreds of thousands of scores for every query is itself a kernel problem. DeepSeek's production top-k kernel, <strong>DeepSelect</strong>, serves DSA in V3.2, V4 and V4.1 and the sampler, on NVIDIA and Ascend; its README reports 2 to 20 times the speed of <code>torch.topk</code>, measured as effective memory bandwidth (top-k does no floating-point math). DeepSeek-V4 then combined DSA with compression: its Compressed Sparse Attention first merges the KV of every 4 tokens into one entry and runs the indexer and top-k over those entries, and V4.1's CSA2 shares the compressed KV and even the top-k selections across layers (chapter 4.8).</p>
+<h3>Before DSA: NSA and MoBA</h3>
+<p>Two trainable sparse attention designs from February 2025 preceded DSA and are worth knowing because their ideas recur:</p>
+<ul>
+  <li><strong>Native Sparse Attention (NSA)</strong>, DeepSeek with Peking University (arXiv 2502.11089), runs three branches per query and combines them: <em>compression</em> (attend to coarse summaries of blocks of tokens, for a global view), <em>selection</em> (attend to the full tokens of the most relevant blocks, chosen using the compression scores), and a <em>sliding window</em> over recent tokens, kept separate so the other branches do not just learn local patterns. Blocks are aligned to what GPU kernels load efficiently, and the whole thing is trained end to end; the authors report large speedups over full attention at 64K tokens in decode, forward and backward passes.</li>
+  <li><strong>Mixture of Block Attention (MoBA)</strong>, Moonshot AI (arXiv 2502.13189), applies the mixture-of-experts idea to attention: the context is split into blocks, a gate scores each block by the query's inner product with the block's mean-pooled keys, and the query attends only to its top-k blocks plus its own block (with a causal mask). It can switch between full and sparse attention, and the paper says it was deployed for Kimi's long-context requests.</li>
+</ul>
+<p>DSA differs from both by scoring individual tokens with a separate, cheap indexer rather than scoring blocks, which keeps the selection fine-grained at the cost of an O(T²) (but cheap) scoring pass.</p>
 <div class="tbl"><table>
 <tr><th>Approach</th><th>Cache size</th><th>Decode cost per token</th><th>Exact over the whole context?</th></tr>
 <tr><td>Full attention</td><td>Grows with T</td><td>Grows with T</td><td>Yes</td></tr>
@@ -280,6 +288,10 @@ for T2 in [1024, 2048, 4096]:
 <h2 id="refs">14. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2502.11089">Yuan et al., Native Sparse Attention</a></td><td>Compression, selection and sliding-window branches with hardware-aligned blocks, trained end to end.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2502.13189">Lu et al., MoBA: Mixture of Block Attention</a></td><td>Top-k block routing for attention, deployed for Kimi's long contexts.</td></tr>
+<tr><td><a href="https://github.com/deepseek-ai/DeepSelect">DeepSelect</a></td><td>The production top-k kernel behind DSA, on NVIDIA and Ascend.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2606.19348">DeepSeek-V4 report</a></td><td>Compressed Sparse Attention: DSA over compressed KV entries.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2205.14135">Dao et al., FlashAttention</a></td><td>IO-aware exact attention, tiling, the HBM access bound, and the A100 memory figures.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2307.08691">Dao, FlashAttention-2</a></td><td>Better parallelism and work partitioning; 50% to 73% of peak.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2407.08608">Shah et al., FlashAttention-3</a></td><td>Hopper asynchrony, warp specialization and FP8.</td></tr>

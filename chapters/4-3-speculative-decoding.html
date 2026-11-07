@@ -122,7 +122,7 @@
 <h3>Built-in multi-token prediction (MTP)</h3>
 <p>Some models are trained with extra modules that predict further tokens (DeepSeek-V3, and later several other open models). At inference these modules act as a ready-made drafter. DeepSeek reports that its second-token prediction is accepted 85% to 90% of the time, giving about 1.8 times more tokens per second. When a model ships MTP weights, they are usually the first thing to try.</p>
 <h3>No model at all: n-gram and suffix lookup</h3>
-<p>Take the last few generated tokens, search for the same sequence earlier in the prompt or output, and propose whatever followed it there. This is n-gram (prompt-lookup) speculation. It costs almost nothing and can propose long drafts, but it only works when the output repeats the input: code edits, rewriting a document, extracting quotes, RAG answers that copy passages. Suffix decoding extends the idea with a suffix tree over the prompt and earlier outputs (across requests), and adapts the draft length to how confident the match is. Its paper reports up to 5.3 times speedup on agentic workloads such as SWE-Bench, where agents repeat similar text often. Lookahead decoding generates its own n-grams in parallel instead of finding them in the context, at extra compute cost.</p>
+<p>Take the last few generated tokens, search for the same sequence earlier in the prompt or output, and propose whatever followed it there. This is n-gram (prompt-lookup) speculation. It costs almost nothing and can propose long drafts, but it only works when the output repeats the input: code edits, rewriting a document, extracting quotes, RAG answers that copy passages. Suffix decoding extends the idea with a suffix tree over the prompt and earlier outputs (across requests), and adapts the draft length to how confident the match is. Its paper reports up to 5.3 times speedup on agentic workloads such as SWE-Bench, where agents repeat similar text often. Lookahead decoding generates its own n-grams in parallel instead of finding them in the context, at extra compute cost (expert layer).</p>
 <div class="tbl"><table>
 <tr><th>Drafter</th><th>Training needed</th><th>Typical acceptance</th><th>Extra memory</th><th>Best for</th></tr>
 <tr><td>Draft model</td><td>None (better if distilled)</td><td>Moderate</td><td>Draft weights and KV</td><td>Quick setup</td></tr>
@@ -164,11 +164,18 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
                          "model": "RedHatAI/Llama-3.1-8B-Instruct-speculator.eagle3",
                          "num_speculative_tokens": 3}'</pre>
 <p>What to watch: the engine's acceptance metrics (vLLM reports draft and accepted token counts, and per-request acceptance), inter-token latency at your real concurrency, and total throughput. A setting that halves latency at concurrency 1 can lower throughput at concurrency 64. SGLang and TensorRT-LLM support the same families (EAGLE, MTP, draft models, n-gram).</p>
+<h3>A production example: verify only what is likely to be accepted</h3>
+<p>That last point (speculation can cost throughput at high concurrency) is the problem DeepSeek's production engine, DeepInfer, attacks with <strong>DSpark and confidence-scheduled verification</strong>. The drafter proposes 5 tokens per request; a confidence head predicts the probability that each one will be accepted; the scheduler sorts all draft tokens in the batch by expected acceptance and verifies only the prefix of drafts per request that maximizes throughput on a profiled cost curve. Easy requests get long verifications, hard ones short. DeepSeek reports that this cuts the draft tokens verified per step by about 30% with nearly the same accepted length, worth 4% to 7% more throughput at about 60 sequences per GPU and 11% at 96, and slightly negative at 16, where verification is cheap anyway (chapter 4.8 has the table and an interactive model). The idea generalizes: under load, the right draft length is a per-request scheduling decision, not a fixed setting.</p>
 
 <h2 id="expert">8. Expert layer</h2>
 <div class="box expert">
   <span class="lbl">Trees instead of chains</span>
   <p>A chain drafts one sequence; if token 2 is wrong, tokens 3 to k are lost. A tree drafts several alternatives at each position (for example the top 2 or 3 tokens) and verifies the whole tree in one pass with a tree-shaped attention mask, where each node sees only its ancestors. The accepted path is the longest branch that matches. Medusa and EAGLE-2 use trees; EAGLE-2 grows the tree dynamically from the drafter's confidence. Trees raise acceptance length at the cost of more verification tokens, which is fine at small batch and costly at large batch.</p>
+  <p>The first system to verify a token tree in one pass was <strong>SpecInfer</strong> (arXiv 2305.09781), which used small speculative models to build the tree and the large model as a tree verifier, reporting 1.5 to 2.8 times faster distributed serving. Trees get harder when the model keeps compressed or recurrent state: for DeepSeek-V4, whose attention compresses KV online, branches from a shared prefix compress into different states. A 2026 paper (arXiv 2609.24698) adds branch-aware verification and per-branch state isolation, and reports accepted lengths of about 2.83 to 3.41 tokens against 2.39 to 2.84 for chains at a budget of 8, with up to about 18.5% more throughput; past some budget throughput stops rising even though accepted length does.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Lookahead decoding: no drafter at all</span>
+  <p>Lookahead decoding (arXiv 2402.02057) treats generation as solving a system of equations by Jacobi iteration: it guesses several future tokens at once, refines all of them in parallel each step, collects the n-grams that appear along the way in a pool, and verifies candidates from the pool. It needs no draft model or datastore and stays exact. It spends extra FLOPs per step to cut the number of steps, so it suits small batches with spare compute; the authors report up to 1.8 times faster decoding on MT-Bench and up to 4 times with strong scaling over several GPUs on code completion.</p>
 </div>
 <div class="box expert">
   <span class="lbl">"Lossless" and numerics</span>
@@ -234,6 +241,7 @@ acceptance 0.372  predicted sum(min(p,q)) = 0.373</pre>
 <p><strong>Try:</strong> replace the rule with "accept if x is the target's top token" and run again. The output distribution is now wrong: it over-produces the target's favourite token.</p>
 
 <h3>Part D: draft and verify with two real models (CPU about 10 minutes, T4 about 1 minute)</h3>
+<p class="note">If you compare against <code>model.generate(do_sample=False)</code> instead of the hand-written greedy loop below, pass <code>repetition_penalty=1.0</code>: Qwen2.5's <code>generation_config.json</code> sets 1.1, which changes "greedy" output (chapters 7.3 and 8.3 hit the same trap).</p>
 <p>Qwen2.5-0.5B-Instruct drafts for Qwen2.5-1.5B-Instruct; they share a tokenizer. This is greedy speculation without a KV cache, to keep the code short: it shows acceptance and the number of target passes, not real speed. (Without a cache every pass re-reads the whole context, so wall-clock time is not meaningful here.)</p>
 <pre>import torch, time
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -325,6 +333,10 @@ k=6: identical=False target passes=18 (vs 60) acceptance=0.42 tokens/pass=3.33</
 <h2 id="refs">14. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2305.09781">Miao et al., SpecInfer</a></td><td>Tree-based speculative inference and one-pass tree verification.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2402.02057">Fu et al., Lookahead decoding</a></td><td>Exact parallel decoding by Jacobi iteration with an n-gram pool, no drafter.</td></tr>
+<tr><td><a href="https://github.com/deepseek-ai/DeepInfer">DeepInfer</a> README and deployment Q&amp;A</td><td>DSpark with confidence-scheduled, variable-length verification in production.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2609.24698">Tree-structured speculative decoding for DeepSeek-V4</a></td><td>Why compressed attention states complicate tree verification, and the measured gains.</td></tr>
 <tr><td>Philip Kiely, <em>Inference Engineering</em>, section 5.2</td><td>The draft, verify, accept loop; draft-target, Medusa, EAGLE, n-gram and lookahead; the 10 times draft-size rule; disabling at large batch.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2211.17192">Leviathan, Kalman and Matias, Fast Inference from Transformers via Speculative Decoding</a></td><td>The acceptance rule, the expected-tokens formula, and 2 to 3 times speedups with identical outputs.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2401.10774">Cai et al., Medusa</a></td><td>Extra decoding heads and tree verification.</td></tr>
