@@ -73,9 +73,14 @@
 <tr><td>AWS Trainium and Inferentia</td><td>Cost per token on AWS for training and inference</td><td>AWS Neuron SDK; vLLM integration</td><td>Teams standardized on AWS</td></tr>
 <tr><td>Groq LPU</td><td>Weights spread over many chips' on-chip SRAM (about 230 MB per chip); deterministic, compiler-scheduled execution</td><td>Groq's own stack; offered as a cloud API</td><td>Very low latency per user</td></tr>
 <tr><td>Cerebras WSE-3</td><td>A whole wafer as one chip with about 44 GB of on-chip SRAM (vendor figure)</td><td>Cerebras stack; cloud API</td><td>Very high tokens per second per user</td></tr>
+<tr><td>Huawei Ascend (910C, 950) and CloudMatrix384</td><td>NPUs with their own matrix units, scaled up as a 384-NPU supernode on a unified bus with pooled memory</td><td>CANN; vendor engines (CloudMatrix-Infer, xDeepServe); DeepSeek's kernels and DeepInfer have Ascend 950 backends</td><td>Chinese clouds and labs; DeepSeek's own service; MoE serving at very wide EP</td></tr>
 <tr><td>Others (SambaNova, Etched, Furiosa, Qualcomm, Tenstorrent)</td><td>Dataflow designs, transformer-specific ASICs, power efficiency</td><td>Vendor stacks</td><td>Specialized deployments</td></tr>
 </table></div>
 <p>Two patterns repeat across these designs. First, <strong>minimize data movement</strong>: reading DRAM costs far more energy and time than arithmetic, so many accelerators trade compute area for on-chip memory or replace caches with large software-managed scratchpads. Second, <strong>software is the moat</strong>: without CUDA's ecosystem every alternative must rebuild kernels, engines and quantization support, and its usefulness for you depends on whether your model and engine are supported on day one.</p>
+
+<h3>Huawei Ascend and the CloudMatrix384 supernode</h3>
+<p>Ascend is the main non-NVIDIA platform for frontier serving in China, and since September 2026 a first-class target of DeepSeek's open-source stack: FlashMLA, DeepEP, DeepGEMM, TileKernels and DeepSelect all ship Ascend 950 backends with the same Python APIs, and DeepInfer runs on Ascend 950 NPUs with CANN 9.2 (chapter 4.8). FlashMLA's README reports its sparse attention kernels at 410 TFLOP/s in prefill (95% of the hardware peak) and 360 TFLOP/s in decode (83%) on the Ascend 950.</p>
+<p>The system matters as much as the chip. <strong>CloudMatrix384</strong> (arXiv 2506.12708) puts 384 Ascend 910 NPUs and 192 Kunpeng CPUs on one <strong>Unified Bus</strong> network, so any NPU reaches any other directly and resources can be pooled: a scale-up domain several times larger than an NVL72 rack. Huawei's serving system on it ran DeepSeek-R1 with expert parallelism across 320 NPUs and reports 6,688 prefill and 1,943 decode tokens per second per NPU (decode under 50 ms TPOT); the production service paper (arXiv 2508.02520) reports 2,400 decode tokens per second per Ascend 910C at about 50 ms. Software is the price, as section 4 says: kernels must be ported (TileLang's second backend is one answer, chapter 5.4), and features can lag. DeepInfer's README lists batch-invariant inference and deterministic sampling as NVIDIA only.</p>
 
 <h2 id="choose">5. Choosing hardware: a worked method</h2>
 <ol>
@@ -101,6 +106,10 @@
 <div class="box expert">
   <span class="lbl">Energy is the real constraint</span>
   <p>At data-center scale, power and cooling limit how many accelerators can be installed. Moving a byte from DRAM costs orders of magnitude more energy than a multiply, and smaller number formats need far smaller multipliers (an FP8 multiplier needs a small fraction of the adders of an FP32 one). Both push hardware toward low precision and on-chip memory, and both make tokens per joule a metric that matters alongside tokens per dollar.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Why models look the way they do: DeepSeek's hardware papers</span>
+  <p>Two DeepSeek papers read hardware from the model builder's side. <strong>Fire-Flyer AI-HPC</strong> (SC'24, arXiv 2408.14158) describes a 10,000-GPU cluster built from PCIe A100s rather than NVLink systems, with a two-layer network, its own all-reduce (HFReduce) and file system (3FS); the authors report performance close to DGX-A100 at half the cost and 40% less energy. <strong>Insights into DeepSeek-V3</strong> (ISCA 2025, arXiv 2505.09343) connects each V3 design choice to a hardware limit: MLA because HBM is scarce (70 KB of KV per token against 327 KB for Qwen-2.5 72B and 516 KB for Llama-3.1 405B), FP8 because tensor-core throughput doubles, node-limited routing because NVLink was about 4 times faster than InfiniBand on the H800, and the observation that wide-MoE decode speed is capped by interconnect bandwidth (about 67 tokens per second over 400 Gb/s InfiniBand in their idealized model, about 1,200 over an NVL72-class fabric). It ends with explicit requests to hardware vendors: more precise FP8 accumulation, native fine-grained scaling, merged scale-up and scale-out networks, lower-latency networking and memory-centric designs. Read it to predict what the next generation of models will assume about hardware (chapter 4.8).</p>
 </div>
 <div class="box expert">
   <span class="lbl">Rack-scale systems change the unit of deployment</span>
@@ -167,6 +176,10 @@
 <h2 id="refs">12. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2505.09343">Insights into DeepSeek-V3: Scaling Challenges and Reflections on Hardware for AI Architectures</a></td><td>The hardware constraints behind MLA, FP8 and node-limited routing; requests to vendors.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2408.14158">Fire-Flyer AI-HPC</a></td><td>A cost-driven PCIe A100 cluster with HFReduce and 3FS.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2506.12708">Serving Large Language Models on Huawei CloudMatrix384</a> and <a href="https://arxiv.org/abs/2508.02520">Huawei Cloud MaaS on CloudMatrix384</a></td><td>The 384-NPU supernode, its serving system and production throughput.</td></tr>
+<tr><td><a href="https://github.com/deepseek-ai/FlashMLA">FlashMLA README</a></td><td>Measured Ascend 950 attention throughput against its peak.</td></tr>
 <tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 3.2 to 3.5</td><td>GPU generations, Grace and Vera CPUs, instances, MIG, other accelerators and local inference.</td></tr>
 <tr><td><a href="https://fleetwood.dev/posts/domain-specific-architectures">Fleetwood: Domain-specific architectures for AI inference</a></td><td>Designing inference hardware backwards from the workload: data movement, low precision, scratchpads and SRAM.</td></tr>
 <tr><td><a href="https://jax-ml.github.io/scaling-book/gpus/">How to Scale Your Model: GPUs</a></td><td>H100 and B200 compared with TPUs, and networking.</td></tr>
@@ -178,6 +191,7 @@
 </table></div>
 <h3>Notes on sources</h3>
 <ul>
+  <li>Cambricon and Moore Threads accelerators are left out: no primary source with inference-relevant specifications was found on 7 November 2026. Ascend chip specifications are also not given, for the same reason; only throughput reported by DeepSeek and Huawei papers is quoted.</li>
   <li>The day 20 README of <em>100 Days of Inference</em> quotes 3.9 PFLOP/s FP8 for the H100 (the sparse figure; dense is about 1.98) and says Ada data center GPUs top out at 24 GB. The L40 and L40S are Ada GPUs with 48 GB.</li>
   <li>The Kiely book says Ethernet tops out at 100 Gb/s per network card. 400 Gb/s Ethernet cards are standard in AI clusters (RoCE), and 800 Gb/s cards for both Ethernet and InfiniBand have started shipping.</li>
   <li>The Fleetwood post describes the H100's L2 cache as 80 MB. NVIDIA's H100 SXM has 50 MB of L2.</li>

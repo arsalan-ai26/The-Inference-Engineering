@@ -117,6 +117,14 @@ def softmax_kernel(out_ptr, in_ptr, in_stride, out_stride, n_cols, BLOCK: tl.con
   <p>With tensor parallelism, engines fuse the all-reduce with the following residual add and RMSNorm, or overlap GEMM tiles with sending finished tiles to other GPUs. These "compute-communication" fusions need kernels that talk to the network or NVLink directly, and are an active area in vLLM, SGLang and TensorRT-LLM.</p>
 </div>
 <div class="box expert">
+  <span class="lbl">Fine-grained overlap at the kernel level: Comet</span>
+  <p>For MoE layers, the same idea works inside the expert computation. ByteDance's Comet (arXiv 2502.19811) splits the expert matmuls and the all-to-all into fine-grained pieces using their data dependencies, so each tile of the matmul starts as soon as the tokens it needs have arrived and results are sent as soon as they are finished. It reports 1.96 times faster MoE layers. DeepSeek-V4's MegaMoE kernel goes further and fuses dispatch, both expert matmuls and combine into one kernel (chapter 4.5).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">TileLang: tiles with explicit layouts and pipelines</span>
+  <p>TileLang (Peking University and collaborators, arXiv 2504.17577) sits between Triton and CuTe. Like Triton, you write the dataflow of one tile in Python; unlike Triton, the schedule (thread binding, memory layout, tensor-core instructions and software pipelining) is exposed as annotations you can set, with the compiler choosing the rest. DeepSeek uses it for TileKernels (MoE routing, FP8 and FP4 quantization, Engram gating and mHC kernels) and for custom kernels inside DeepInfer, with backends for both NVIDIA and Huawei Ascend: the same Python API runs on either (chapter 4.8).</p>
+</div>
+<div class="box expert">
   <span class="lbl">Numerics in fused kernels</span>
   <p>Fusion changes the order of floating-point operations, so fused and unfused results can differ in the last bits. Compute reductions in FP32 even for BF16 inputs (as the SiLU kernel in the lab does), and test fused kernels against a high-precision reference with tolerances. Chapter 6.6 discusses why this matters for reproducibility.</p>
 </div>
@@ -224,6 +232,8 @@ print("max error", (silu_mul(g, u) - torch.nn.functional.silu(g) * u).abs().max(
 <h2 id="refs">11. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2504.17577">Wang et al., TileLang</a> and <a href="https://github.com/deepseek-ai/TileKernels">DeepSeek TileKernels</a></td><td>A tiled programming model with explicit scheduling; production kernels written in it for NVIDIA and Ascend.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2502.19811">Zhang et al., Comet</a></td><td>Fine-grained computation-communication overlap for MoE.</td></tr>
 <tr><td>Philip Kiely, <em>Inference Engineering</em>, section 4.1</td><td>CUDA kernels for inference, cuBLAS, CUTLASS, CuTe, FlashInfer, kernel selection and fusion.</td></tr>
 <tr><td><a href="https://triton-lang.org/main/getting-started/tutorials/index.html">Triton tutorials</a>: vector addition and fused softmax</td><td>The two kernels in the lab, and the 5MN + 2M traffic analysis of naive softmax.</td></tr>
 <tr><td><a href="https://horace.io/brrr_intro.html">Horace He: Making deep learning go brrrr</a></td><td>Why operator fusion is the most important compiler optimization.</td></tr>

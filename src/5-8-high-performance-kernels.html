@@ -85,7 +85,7 @@
   <li><strong>CUTLASS 3 and CuTe:</strong> NVIDIA's C++ template library for GEMMs and convolutions, built on CuTe's layout algebra, which describes how tensors map to threads, warps and memory. FlashAttention-3 uses it.</li>
   <li><strong>CuTe-DSL:</strong> the same concepts from Python, with much faster compile times; FlashAttention-4 is written in it.</li>
   <li><strong>Triton:</strong> block-level programming in Python with an MLIR-based compiler; the default for portable kernels and the target of <code>torch.compile</code> (chapter 5.4).</li>
-  <li><strong>Tile-based DSLs from research groups</strong>, such as ThunderKittens (tiles of registers and shared memory as first-class objects) and TileLang, aim for near-hand-written performance with much less code.</li>
+  <li><strong>Tile-based DSLs from research groups</strong>, such as ThunderKittens (tiles of registers and shared memory as first-class objects) and TileLang, aim for near-hand-written performance with much less code. TileLang (arXiv 2504.17577) separates the dataflow you write from the schedule (thread binding, layout, tensor-core instructions, pipelining), which you can annotate; DeepSeek writes its TileKernels library and DeepInfer's custom kernels in it, for NVIDIA and Ascend from one source.</li>
   <li><strong>Other ecosystems:</strong> HIP and Composable Kernel on AMD (Triton also targets AMD), Pallas for TPUs and GPUs in JAX.</li>
 </ul>
 
@@ -99,6 +99,13 @@
   <li><strong>Autotuning</strong> (<code>@triton.autotune</code>): run several configurations (block sizes, <code>num_warps</code>, <code>num_stages</code>) on the real shapes and keep the fastest.</li>
 </ol>
 <p>Graph compilers sit one level up: TorchInductor decides <em>what</em> to fuse in a whole model and emits Triton for each fused group (chapter 5.7). AI-assisted kernel writing (benchmarks such as KernelBench evaluate models on producing correct, fast kernels) is an active area; generated kernels need the same testing discipline as hand-written ones.</p>
+
+<h3>Three production kernels, read from their design notes</h3>
+<ul>
+  <li><strong>FlashMLA's decode kernel is compute-bound.</strong> Its April 2025 deep dive computes the FLOPs per byte of MLA decode: roughly 2 × h<sub>q</sub> × s<sub>q</sub> (query heads times query tokens per request), because every query head reads the same shared latent. On an H800 throttled to about 865 TFLOP/s against 3.35 TB/s, that makes the kernel compute-bound once h<sub>q</sub>s<sub>q</sub> ≥ ½ × 865 ÷ 3.35 ≈ 128, which DeepSeek's decode meets with 128 heads and no tensor parallelism. That is the opposite of ordinary decode attention (chapter 4.2), so the kernel is designed to keep tensor cores busy: a "seesaw" schedule splits the output across two warpgroups so tensor-core matmuls of one overlap the softmax of the other, with fine-grained TMA copies (a 64 × 576 K block in 9 pieces) so each matmul starts as soon as its piece lands. It reached 660 TFLOP/s, about 80% of the throttled peak.</li>
+  <li><strong>DeepGEMM compiles at run time.</strong> It JIT-compiles each GEMM for its exact shape when first called, so no kernel needs to be built ahead for every shape, and it applies FP8 block scales with promotion to higher precision during accumulation (chapter 4.1). Its grouped GEMMs group only the M dimension (tokens), matching MoE where all experts share a shape: a contiguous layout for prefill, where tokens per expert vary, and a masked layout for decode, fed directly by DeepEP's low-latency output.</li>
+  <li><strong>DeepSelect replaces a sort with a filter.</strong> Top-k over hundreds of thousands of indexer scores is memory-bound: the input must be read once, and the question is how little else you do. Its algorithm keeps a running threshold (the current k-th largest value), scans the input in blocks in random order, keeps only elements above the threshold in a small candidate buffer in shared memory, and when the buffer fills, runs a radix-select top-k on it and raises the threshold. Each input element is read exactly once, contiguously, and the extra work is about O(k log(N/k)) in expectation; the random block order guarantees this bound even for adversarial inputs. Lab Part E runs the algorithm.</li>
+</ul>
 
 <h2 id="testing">6. Testing and benchmarking kernels</h2>
 <ul>
@@ -178,6 +185,45 @@ print("max error", (matmul(a, b) - a @ b).abs().max().item())</pre>
 <h3>Part D: read a production kernel</h3>
 <p>Pick one: a FlashAttention forward kernel, a CUTLASS example GEMM for your GPU generation, or a fused MoE Triton kernel in vLLM or SGLang. Identify its tile sizes, how it pipelines loads, where the accumulator lives, what the epilogue does, and how it handles shapes that are not multiples of the tile. Write a one-page summary with a diagram.</p>
 
+<h3>Part E: DeepSelect's top-k algorithm (CPU, seconds)</h3>
+<p>Implement the algorithm from DeepSelect's deep-dive document in NumPy (the small top-k uses <code>argpartition</code> in place of the radix select in shared memory), check it against a full sort, and count how many elements reach the small top-k. Predict first: for one million scores and k = 512, what fraction of the input reaches it?</p>
+<pre># DeepSelect's top-k algorithm (from its deep-dive doc), in NumPy, checked against a full sort
+import numpy as np
+rng = np.random.default_rng(0)
+
+def deep_select(x, k, B=1024, B2=1024):
+    cand_v, cand_i = np.empty(0), np.empty(0, dtype=np.int64)
+    thr, processed = -np.inf, 0                   # threshold, elements handed to the small top-k
+    def small_topk(v, i):                         # stands in for the radix select in shared memory
+        keep = np.argpartition(-v, k - 1)[:k] if len(v) &gt; k else np.arange(len(v))
+        return v[keep], i[keep]
+    for b in rng.permutation((len(x) + B - 1) // B):           # random block order
+        blk = x[b * B:(b + 1) * B]
+        m = blk &gt; thr                                           # filter with the current threshold
+        cand_v = np.concatenate([cand_v, blk[m]]); cand_i = np.concatenate([cand_i, np.nonzero(m)[0] + b * B])
+        if len(cand_v) &gt;= k + B2:                               # compact
+            processed += len(cand_v); cand_v, cand_i = small_topk(cand_v, cand_i); thr = cand_v.min()
+    processed += len(cand_v)
+    v, i = small_topk(cand_v, cand_i)
+    return i[np.argsort(-v)], processed
+
+k = 512
+for N in (8_192, 65_536, 262_144, 1_048_576):
+    x = rng.standard_normal(N).astype(np.float32)
+    idx, work = deep_select(x, k)
+    ok = set(idx) == set(np.argsort(-x)[:k])
+    m = -(-N // 1024); bound = (1 + k / 1024) * (k + 1024 + 1024) * sum(1 / i for i in range(1, m + 1))
+    print(f"N={N:&gt;9,}  correct={ok}  given to the small top-k: {work:&gt;7,} ({work/N:6.1%} of N), expected bound {bound:,.0f}")
+# an adversarial-looking input: sorted ascending (the last block holds the whole answer)
+x = np.sort(rng.standard_normal(262_144)).astype(np.float32)
+idx, work = deep_select(x, k)
+print(f"sorted input, N=262,144  correct={set(idx)==set(range(262_144-k,262_144))}  work {work:,} ({work/262_144:.1%})")</pre>
+<details><summary>What we measured</summary><pre class="out">N=    8,192  correct=True  given to the small top-k:   4,346 ( 53.1% of N), expected bound 10,437
+N=   65,536  correct=True  given to the small top-k:   6,918 ( 10.6% of N), expected bound 18,217
+N=  262,144  correct=True  given to the small top-k:   9,186 (  3.5% of N), expected bound 23,517
+N=1,048,576  correct=True  given to the small top-k:  10,883 (  1.0% of N), expected bound 28,835
+sorted input, N=262,144  correct=True  work 10,240 (3.9%)</pre><p>The answer is always exact, and the work after filtering grows only with the logarithm of N: at one million scores about 1% of the input reaches the small top-k, under the document's expected bound. Even a sorted input, the worst case for a scan in order, costs little because of the random block order. On a GPU the scan is a single coalesced read and the small top-k runs in shared memory, which is why the kernel runs at near memory bandwidth. A full sort would touch every element many times.</p></details>
+
 <h2 id="realworld">10. In the real world</h2>
 <div class="box real">
   <span class="lbl">Who writes kernels</span>
@@ -212,6 +258,10 @@ print("max error", (matmul(a, b) - a @ b).abs().max().item())</pre>
 <h2 id="refs">13. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://github.com/deepseek-ai/FlashMLA/blob/main/docs/20250422-new-kernel-deep-dive.md">FlashMLA: A deep dive into the new Flash MLA kernel</a></td><td>Why MLA decode is compute-bound, and the seesaw schedule.</td></tr>
+<tr><td><a href="https://github.com/deepseek-ai/DeepGEMM">DeepGEMM</a></td><td>JIT-compiled FP8 GEMMs with fine-grained scaling; contiguous and masked grouped GEMMs for MoE.</td></tr>
+<tr><td><a href="https://github.com/deepseek-ai/DeepSelect/blob/main/docs/DeepSelect-deep-dive.md">DeepSelect deep dive</a></td><td>The threshold-filter top-k algorithm and its expected bound.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2504.17577">TileLang</a></td><td>Tiled programming with explicit, annotatable schedules.</td></tr>
 <tr><td><a href="https://siboehm.com/articles/22/CUDA-MMM">Simon Boehm: How to optimize a CUDA matmul kernel for cuBLAS-like performance</a></td><td>The step-by-step GEMM progression, measured on an A6000, with profiling at each step.</td></tr>
 <tr><td><a href="https://triton-lang.org/main/getting-started/tutorials/index.html">Triton tutorials</a>, especially matrix multiplication</td><td>Block-level GEMM, L2-friendly tile ordering and autotuning.</td></tr>
 <tr><td><a href="https://github.com/NVIDIA/cutlass">NVIDIA CUTLASS and CuTe</a></td><td>Templates, layout algebra and examples for every recent GPU generation.</td></tr>
@@ -221,7 +271,7 @@ print("max error", (matmul(a, b) - a @ b).abs().max().item())</pre>
 <tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em></td><td>Kernel optimization and tooling in production performance engineering.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 technical report</a></td><td>FP8 GEMM accumulation strategy and communication kernels.</td></tr>
 </table></div>
-<p class="note">Facts checked on 7 November 2026. The Part A kernel was checked with Triton 3.9 in interpreter mode.</p>
+<p class="note">Facts checked on 7 November 2026. The Part A kernel was checked with Triton 3.9 in interpreter mode; Part E was run with NumPy 2 on CPU.</p>
 <!--SCRIPT-->
 <script>
 (function(){
