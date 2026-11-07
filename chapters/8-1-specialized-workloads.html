@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>8.1 Specialized inference workloads</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="8.1">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 8 · Chapter 8.1</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 8 · Specialized workloads, engine internals and research · Chapter 8.1</div>
+<h1>Specialized inference workloads</h1>
+<p class="lede">The same engine serves very different workloads, and each one stresses a different part of it. A reasoning model writes tens of thousands of tokens and fills the KV cache; a batch job cares only about tokens per dollar; a vision model spends its prefill on image tokens; an RL trainer needs fresh weights in the engine every few minutes; a diffusion model has no tokens at all. This chapter profiles eight workloads side by side, shows for each which earlier technique matters most and what to measure, and gives a method for defining a workload and its SLO before choosing anything.</p>
+<div class="meta">
+  <span class="chip">Level: expert</span>
+  <span class="chip">Time: 3 hours, plus 2 workload projects</span>
+  <span class="chip">Needs: Parts 2 to 6, 7.4, 7.6</span>
+  <span class="chip">Compute: Colab CPU (projects: any GPU)</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>A reasoning model averages 16,000 output tokens per request. What runs out first on an 8B model on one H100: compute or KV memory?</li>
+    <li>For an overnight batch job of 10 million prompts, which SLO do you set?</li>
+    <li>Why is an image costly for a vision-language model even when the text prompt is short?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>KV memory. At about 128 KB per token, 16,000 tokens is about 2.1 GB per request, so roughly 24 requests fill a 50 GB KV pool, far below the batch size at which decode would become compute-bound (chapter 2.5).</li>
+    <li>A deadline for the whole job (for example done by 6 a.m.) and a cost per million tokens; per-request latency does not matter. Use offline inference with large batches.</li>
+    <li>The vision encoder must run, and the image becomes hundreds to thousands of tokens of prefill and KV cache, more than the text itself (chapter 3.7).</li>
+  </ol></details>
+</div>
+
+<h2 id="method">1. Define the workload before the system</h2>
+<p>For each workload write down five things; they decide almost every later choice:</p>
+<ol>
+  <li><strong>Shape:</strong> input and output length distributions, shared prefixes, media per request.</li>
+  <li><strong>Arrival:</strong> interactive (open-loop, bursty), batch (all at once), or in a training loop.</li>
+  <li><strong>SLO:</strong> TTFT and TPOT percentiles, a job deadline, or rollout throughput.</li>
+  <li><strong>Quality target:</strong> the evaluation and the acceptable regression for any optimization (chapter 7.6).</li>
+  <li><strong>Cost target:</strong> cost per request, per million tokens, or per training step.</li>
+</ol>
+
+<h2 id="profiles">2. Eight workload profiles</h2>
+<div class="tbl"><table>
+<tr><th>Workload</th><th>What dominates</th><th>Technique that matters most</th><th>Metric to watch</th></tr>
+<tr><td>Structured output and tool calling</td><td>Grammar checks per token; parser correctness</td><td>Constrained decoding with precompiled grammars (chapter 3.5); correct tool parsers</td><td>Valid-output rate, tool-call accuracy, TPOT overhead</td></tr>
+<tr><td>Multi-LoRA</td><td>Adapter loading and mixed-adapter batches</td><td>Multi-LoRA serving, adapter-aware routing (chapter 7.6)</td><td>Adapter load time, TPOT with many adapters per batch</td></tr>
+<tr><td>Vision-language and multimodal</td><td>Encoder compute and media tokens in prefill and KV</td><td>Encoder caching, media limits and pruning, separate encoder capacity</td><td>TTFT per image or video second, media tokens per request</td></tr>
+<tr><td>Agentic, multi-turn</td><td>Re-reading long, growing prefixes</td><td>Prefix caching, session routing, KV offload (chapter 6.8)</td><td>Cache hit rate, time per task</td></tr>
+<tr><td>Reasoning models</td><td>Very long outputs; KV growth during decode</td><td>KV capacity (FP8 KV, GQA/MLA models), thinking budgets, speculative decoding</td><td>Reasoning tokens per request, KV usage, preemptions</td></tr>
+<tr><td>Batch and offline</td><td>Throughput per dollar</td><td>Largest batches, offline mode, cheapest capacity (spot, off-peak)</td><td>Tokens per second per GPU, job completion time</td></tr>
+<tr><td>RL rollouts</td><td>Long-tail generation inside training; weight updates</td><td>Fast weight sync, asynchronous rollouts, matched numerics (chapters 7.4, 7.6)</td><td>Rollout tokens per second, sampler-trainer log-prob gap</td></tr>
+<tr><td>Diffusion</td><td>Number of denoising steps; compute-bound kernels</td><td>Fewer steps, lower precision, compiled kernels, caching across steps</td><td>Seconds per image, quality at the step budget</td></tr>
+</table></div>
+<div class="widget" id="wpW">
+  <div class="wt">Interactive: what a workload does to one GPU</div>
+  <div class="ws">Llama 3.1 8B in BF16 on one 80 GB H100: about 16 GB of weights, a 50 GB KV pool, 128 KB of KV per token (chapter 2.4). Pick a workload and adjust its shape; the numbers show how many requests fit and which limit applies first.</div>
+  <div class="ctrls">
+    <label>Workload <select id="wpK"><option value="chat">Chat</option><option value="rag">RAG over documents</option><option value="agent">Agent step</option><option value="reason" selected>Reasoning</option><option value="vlm">Vision-language (2 images)</option><option value="batch">Batch summarization</option></select></label>
+    <label>Input tokens <input type="number" id="wpI" style="width:84px"></label>
+    <label>Output tokens <input type="number" id="wpO" style="width:84px"></label>
+  </div>
+  <div class="stats" id="wpStats"></div>
+  <p class="cap" id="wpNote"></p>
+</div>
+
+<h2 id="vlm">3. Vision-language and multimodal</h2>
+<p>Images and video pass through a vision encoder whose output becomes media tokens in the language model's context (chapter 3.7). Serving levers in vLLM:</p>
+<ul>
+  <li><code>limit_mm_per_prompt</code> caps images or videos per request, which bounds the worst-case memory a request can claim.</li>
+  <li><strong>Precomputed embeddings</strong> (<code>enable_mm_embeds</code>): pass encoder outputs instead of raw images, so the encoder can run elsewhere or be cached across requests that reuse the same image.</li>
+  <li><strong>Video token pruning</strong> (<code>--video-pruning-rate</code>): drop a fraction of video tokens after the encoder, cutting prefill time and KV use at some cost in accuracy.</li>
+  <li>Encoder work competes with prefill and decode; disaggregated designs give the encoder its own GPUs (the omni-modality pipelines of chapter 3.7).</li>
+</ul>
+
+<h2 id="reasoning">4. Reasoning models</h2>
+<p>Reasoning models write a thinking section before the answer; vLLM's reasoning parsers split it into a separate <code>reasoning</code> field (formerly <code>reasoning_content</code>; clients reading the old name silently get nothing). Whether thinking is on is model-specific: Qwen3 thinks by default (disable with <code>enable_thinking=False</code> in the chat template arguments), while some other models need it switched on. Serving consequences:</p>
+<ul>
+  <li><strong>KV grows during decode.</strong> Each request's cache keeps growing for minutes, so the KV pool, not compute, limits concurrency. Preemptions and recomputation appear under load (chapter 3.3). FP8 KV cache and models with GQA or MLA help most.</li>
+  <li><strong>Thinking budgets.</strong> vLLM's <code>thinking_token_budget</code> sampling parameter forces the end-of-thinking marker once the budget is reached, optionally with a transition phrase so the answer follows naturally. Budgets turn an unbounded cost into a bounded one; evaluate quality at each budget.</li>
+  <li><strong>Long-tail latency.</strong> Hugging Face measured SmolLM3's thinking mode at a median of about 16,000 tokens on AIME25 with a fat tail, against about 2,000 without thinking: plan capacity for the tail, not the median.</li>
+  <li><strong>Speculative decoding</strong> (chapter 4.3) helps the long decode at low concurrency; structured outputs apply only after reasoning if the parser separates them.</li>
+</ul>
+
+<h2 id="batch">5. Batch and offline inference</h2>
+<p>When nobody waits for individual answers, optimize tokens per dollar. vLLM's offline <code>LLM</code> class takes a whole list of prompts and schedules them with continuous batching at the largest batch memory allows, without an HTTP server. The lab measures the basic trade-off: batch 16 gave 6.3 times the total throughput of batch 1, while each request got 2.6 times slower. Other levers: sort or group prompts by length, share prefixes (put the common instructions first), use the cheapest hardware that fits, run in troughs of interactive traffic (chapter 6.5), and choose quantization by quality per dollar. Completion time for a job ≈ total tokens ÷ throughput, so measure throughput at the batch size you will use.</p>
+
+<h2 id="rl">6. RL rollout inference</h2>
+<p>In RL (chapter 7.4) the engine generates rollouts inside the training loop. verl, an open implementation of the HybridFlow design, connects trainers (PyTorch FSDP, Megatron-LM) with rollout engines (vLLM, SGLang) through modular interfaces. Differences from serving:</p>
+<ul>
+  <li><strong>Weights change</strong> every step or few steps: the engine needs fast in-place weight updates, and its caches (prefix cache, CUDA graphs) must stay valid.</li>
+  <li><strong>The tail sets the pace</strong> in synchronous training: one very long rollout holds the whole step. Asynchronous and partial rollouts trade some on-policyness for throughput.</li>
+  <li><strong>Numerics matter</strong>: the sampler's log-probabilities feed the loss; track the trainer-sampler gap or use batch-invariant kernels (chapter 7.6).</li>
+  <li><strong>Colocation:</strong> sharing GPUs between trainer and engine (TRL's colocate mode, verl's hybrid engine) needs memory handoff between phases.</li>
+</ul>
+
+<h2 id="diffusion">7. Diffusion inference</h2>
+<p>Diffusion models refine noise into an image or video over a number of steps; each step is a large, compute-bound forward pass of a U-Net or diffusion transformer. Hugging Face Diffusers lists the levers: run in reduced precision (FP16 or BF16, and TF32 matmuls on Ampere and later); use scaled dot-product attention, which picks FlashAttention or memory-efficient kernels automatically; compile the heavy components (U-Net or transformer, VAE) with <code>torch.compile</code>; and combine techniques. The largest lever is fewer steps (better schedulers, distilled few-step models), which trades quality for time: measure quality at each step budget, as chapter 3.7 described for serving systems such as SGLang Diffusion and vLLM-Omni.</p>
+
+<h2 id="expert">8. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Mixed workloads on one fleet</span>
+  <p>Interactive chat, long reasoning requests and batch jobs on the same replicas interfere: long decodes hold KV blocks, long prefills stall decodes (chapter 3.2), batch traffic fills queues. Production systems separate them by pool (routing by expected length or model mode), by priority (batch yields to interactive, chapter 6.4), or by time (batch in troughs), and measure each class against its own SLO.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Encoder caching for repeated media</span>
+  <p>Many multimodal workloads reuse the same image or document across turns. Caching encoder outputs by a hash of the media (and the processor settings) avoids re-encoding, the multimodal analogue of prefix caching; it needs the same safety rules (scope to model and processor version, and to tenant, chapter 6.9).</p>
+</div>
+
+<h2 id="mistakes">9. Common mistakes</h2>
+<ul>
+  <li>One SLO for all workloads on a shared fleet.</li>
+  <li>Planning reasoning capacity from median output length.</li>
+  <li>Reading <code>reasoning_content</code> after the field was renamed.</li>
+  <li>Running batch jobs through the interactive endpoint at small batch sizes.</li>
+  <li>No limit on media per request.</li>
+  <li>RL rollouts with a different chat template or numerics from training.</li>
+</ul>
+
+<h2 id="lab">10. Lab</h2>
+<h3>Part A: throughput-first vs latency-first</h3>
+<pre>import torch, time
+from transformers import AutoTokenizer, AutoModelForCausalLM
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(name); tok.padding_side = "left"
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).eval()
+prompt = tok.apply_chat_template([{"role": "user", "content": "Summarize the benefits of unit tests in one paragraph."}],
+                                 tokenize=False, add_generation_prompt=True)
+for bs in [1, 4, 16]:
+    enc = tok([prompt] * bs, return_tensors="pt", padding=True)
+    with torch.no_grad():
+        model.generate(**enc, max_new_tokens=4, do_sample=False)              # warm-up
+        t = time.perf_counter()
+        model.generate(**enc, max_new_tokens=64, min_new_tokens=64, do_sample=False, pad_token_id=tok.eos_token_id)
+        dt = time.perf_counter() - t
+    print(f"batch {bs}: {bs*64/dt:.1f} tok/s total, {64/dt:.1f} tok/s per request")</pre>
+<p>Predict first: how much does total throughput grow from batch 1 to batch 16, and what happens to each request's speed?</p>
+<details><summary>What we measured (2 CPU cores)</summary><pre class="out">batch  1:    8.7 output tok/s total,   8.7 tok/s per request,   7.4 s per batch
+batch  4:   18.1 output tok/s total,   4.5 tok/s per request,  14.1 s per batch
+batch 16:   54.8 output tok/s total,   3.4 tok/s per request,  18.7 s per batch</pre>
+<p>Total throughput grew 6.3 times while each request slowed 2.6 times: the trade batch jobs make on purpose. On a GPU the curve is far steeper at first, because decode at batch 1 is memory-bound (chapter 2.5); with vLLM's offline <code>LLM.generate</code> on thousands of prompts, expect total throughput tens of times higher than batch 1.</p></details>
+<h3>Part B: reasoning budgets and KV</h3>
+<p>Use the widget's Reasoning profile. With 128 KB of KV per token and a 50 GB pool, compute concurrent requests at output lengths of 2,000, 8,000, 16,000 and 32,000 tokens. Then serve a small reasoning model (for example Qwen3-0.6B or 1.7B) with vLLM's reasoning parser, send 50 maths problems with <code>thinking_token_budget</code> at 256, 1,024 and unlimited, and record accuracy and tokens per answer. Expect accuracy to rise with budget and flatten, and the unlimited run to show a long tail of very long answers.</p>
+<h3>Part C: two workload projects</h3>
+<p>Pick two workloads from section 2. For each: write the five-part definition from section 1, serve it on one GPU with the settings from this chapter, measure the metric from the table, and write which earlier technique changed the result most and by how much.</p>
+
+<h2 id="realworld">11. In the real world</h2>
+<div class="box real">
+  <span class="lbl">In practice</span>
+  <ul>
+    <li><strong>Providers</strong> offer cheaper batch APIs for latency-tolerant work and route reasoning modes to pools sized for long outputs.</li>
+    <li><strong>Multimodal products</strong> cap media, cache encoder outputs and size encoder capacity separately.</li>
+    <li><strong>RL teams</strong> run engines inside training with asynchronous rollouts and weight sync.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">12. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz81"></div>
+<script type="application/json" id="qz81">[
+{"q":"For a reasoning model with very long outputs, the first limit on one GPU is usually:","o":["Compute","KV cache memory","Network","Tokenization"],"a":1,"e":"Each request's KV grows for thousands of tokens."},
+{"q":"vLLM's thinking_token_budget:","o":["Limits input length","Forces the end of the thinking section once the budget is reached","Disables reasoning","Sets temperature"],"a":1,"e":"Optionally with a transition phrase."},
+{"q":"In the lab, batch 16 vs batch 1 gave:","o":["Same throughput","6.3× total throughput, each request 2.6× slower","Faster requests","Lower throughput"],"a":1,"e":"The batch job trade-off."},
+{"q":"limit_mm_per_prompt is useful because it:","o":["Speeds up text","Bounds the memory one request's media can claim","Caches images","Prunes video"],"a":1,"e":"Media tokens are expensive."},
+{"q":"What differs for RL rollouts compared with serving?","o":["Nothing","Weights change often and the longest rollout sets the pace","No KV cache","No sampling"],"a":1,"e":"Fast weight sync and async designs help."},
+{"q":"The largest lever for diffusion latency is usually:","o":["Prefix caching","The number of denoising steps","Speculative decoding","LoRA"],"a":1,"e":"Then precision, attention kernels and compilation."}
+]</script>
+
+<h2 id="summary">13. Summary</h2>
+<ul>
+  <li>Define shape, arrival, SLO, quality target and cost target before choosing a system.</li>
+  <li>Each workload stresses a different resource: grammar checks, adapters, encoders, prefixes, KV growth, batch throughput, weight sync or denoising steps.</li>
+  <li>Reasoning: plan KV for the tail, use thinking budgets. Batch: maximize batch size and minimize cost. Multimodal: limit and cache media. RL: fast weight sync, async rollouts, matched numerics. Diffusion: fewer steps, lower precision, compiled kernels.</li>
+</ul>
+
+<h2 id="refs">14. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/features/multimodal_inputs.html">vLLM: Multimodal inputs</a></td><td>Media limits, precomputed embeddings and video token pruning.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/features/reasoning_outputs.html">vLLM: Reasoning outputs</a></td><td>Reasoning parsers, the reasoning field, per-model thinking switches and thinking budgets.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/serving/offline_inference.html">vLLM: Offline inference</a></td><td>The LLM class for batch workloads.</td></tr>
+<tr><td><a href="https://verl.readthedocs.io/en/latest/">verl documentation</a></td><td>RL training with FSDP or Megatron trainers and vLLM or SGLang rollouts (HybridFlow).</td></tr>
+<tr><td><a href="https://huggingface.co/docs/diffusers/optimization/fp16">Hugging Face Diffusers: Accelerate inference</a></td><td>Precision, attention backends and compilation for diffusion models.</td></tr>
+<tr><td><a href="https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook">Hugging Face, The Smol Training Playbook</a></td><td>Measured output length distributions of thinking and non-thinking modes.</td></tr>
+<tr><td>Chapter 3.7 sources (vLLM-Omni, SGLang Diffusion, Cornserve)</td><td>Multimodal and diffusion serving systems.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. Part A measured on 2 CPU cores with PyTorch 2.15 and Transformers 5.22; Parts B and C are exercises with expected behaviour.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {$}=IE;
+const W={chat:[800,300,'Interactive: TTFT and TPOT both matter; mostly limited by batch size and SLO.'],rag:[6000,250,'Prefill-heavy: TTFT dominates; prefix caching of shared documents and chunked prefill help most.'],agent:[30000,100,'Huge, mostly cached prefix and tiny output: cache hit rate decides cost (chapter 6.8).'],reason:[500,16000,'Decode-heavy with growing KV: the KV pool limits concurrency long before compute does.'],vlm:[2900,200,'About 2,600 of the input tokens are media tokens (two 1,024 × 1,024 images in Qwen2.5-VL, chapter 3.7), plus encoder time before prefill.'],batch:[1500,200,'No latency SLO: run at the largest batch that fits and optimize tokens per dollar.']};
+let cur='';
+function wp(){const k=$('wpK').value;if(k!==cur){$('wpI').value=W[k][0];$('wpO').value=W[k][1];cur=k;}
+  const I=+$('wpI').value,O=+$('wpO').value;const kvTok=131072;const pool=50e9;const peak=(I+O)*kvTok;const conc=Math.floor(pool/peak);
+  $('wpStats').innerHTML=[['KV per request at the end',(peak/1e9).toFixed(2)+' GB'],['Requests that fit in the KV pool',IE.int(conc)],['Prefill tokens per request',IE.int(I)],['Decode steps per request',IE.int(O)],['First limit',conc<64?'KV memory':(conc<300?'Batch / SLO':'Compute')]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');
+  $('wpNote').textContent=W[k][2];}
+['wpK','wpI','wpO'].forEach(id=>$(id).addEventListener('input',wp));wp();
+})();
+</script>
+
+</body>
+</html>

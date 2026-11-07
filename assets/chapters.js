@@ -368,7 +368,7 @@ window.IE_CHAPTERS = [
 "title": "Specialized inference workloads",
 "slug": "8-1-specialized-workloads",
 "part": 8,
-"ready": false
+"ready": true
 },
 {
 "n": "8.2",
