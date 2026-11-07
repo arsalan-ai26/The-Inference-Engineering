@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>From agent builder to inference engineer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Guide</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Contents"></nav>
+<main><article>
+<div class="kicker">Guide · Chapter 0</div>
+<h1>From agent builder to inference engineer</h1>
+<p class="lede">If you build agents and LLM applications, you already use inference every day, through an API. This page maps what you know to what the book teaches, gives a one-month fast track and the full order, and ends with a table that sends you to the right chapter when something breaks.</p>
+
+<h2 id="map">1. What you already know, seen from the server</h2>
+<div class="tbl"><table>
+<tr><th>You see this as an agent builder</th><th>The server sees this</th><th>Read</th></tr>
+<tr><td>An API call</td><td>A request that waits in a queue, then joins a running batch at the next step; your latency depends on who else is in the batch</td><td><a href="../chapters/3-2-batching-scheduling.html">3.2</a>, <a href="../chapters/6-4-routing-queueing.html">6.4</a></td></tr>
+<tr><td>Input and output tokens on the bill</td><td>Two different jobs: prefill reads the whole prompt at once and is compute-bound; decode makes one token per step and is memory-bound</td><td><a href="../chapters/2-4-kv-cache.html">2.4</a>, <a href="../chapters/2-5-inference-arithmetic.html">2.5</a></td></tr>
+<tr><td>The system prompt and tool definitions</td><td>A prefix whose KV cache can be reused across calls, if it never changes; cached input is billed at a fraction of the price</td><td><a href="../chapters/4-4-kv-reuse.html">4.4</a>, <a href="../chapters/6-8-agentic-workloads.html">6.8</a></td></tr>
+<tr><td>Tool calls and JSON mode</td><td>Structured output: a grammar that masks the tokens the model may produce at each step</td><td><a href="../chapters/3-5-prefix-caching-structured-output.html">3.5</a></td></tr>
+<tr><td>"It feels slow"</td><td>Time to first token plus time per output token × output length; each has different causes and fixes</td><td><a href="../chapters/6-1-benchmarking.html">6.1</a></td></tr>
+<tr><td>The monthly invoice</td><td>GPU-hours ÷ tokens per GPU-hour; throughput at your latency target sets the price per token</td><td><a href="../chapters/6-5-capacity-cost.html">6.5</a></td></tr>
+<tr><td>"Should we fine-tune a small model?"</td><td>A cost and latency decision: a smaller model is cheaper per token, if its quality holds on your traffic</td><td><a href="../chapters/7-1-post-training-landscape.html">7.1</a>, <a href="../chapters/7-5-distillation.html">7.5</a></td></tr>
+<tr><td>The embedding model and reranker in your RAG pipeline</td><td>Prefill-only workloads with no KV cache growth, served differently from chat models</td><td><a href="../chapters/8-1-specialized-workloads.html#embed">8.1</a></td></tr>
+<tr><td>Long agent sessions</td><td>KV caches that must live for minutes to days, in GPU memory, host memory or SSD, and requests routed to where their cache is</td><td><a href="../chapters/4-7-long-context.html">4.7</a>, <a href="../chapters/4-8-deepseek-inference-stack.html">4.8</a></td></tr>
+</table></div>
+<p>Three habits from application work carry over directly. Measure before you change anything (chapter 6.1 is the inference version of a load test). Treat every number from a vendor or a paper as a claim to check. And keep prompts stable: the single most effective inference optimization an agent builder controls is a prefix that never changes.</p>
+
+<h2 id="how">2. How the book works</h2>
+<ul>
+  <li><strong>Each chapter starts with a skip check.</strong> If you can answer its three questions, skim the chapter and do the lab.</li>
+  <li><strong>Labs run on a CPU or a free Colab GPU.</strong> Every result shown was run, and labelled as measured; parts that need bigger GPUs are labelled as expected behaviour. Chapter 1.6 and the <a href="compute.html">compute guide</a> cover renting a GPU when you need one.</li>
+  <li><strong>Numbers are computed, not estimated by hand.</strong> Worked examples show the code that produced them; change the inputs and rerun.</li>
+  <li><strong>Every chapter ends with references and notes on sources.</strong> The <a href="reading-list.html">reading list</a> collects all the papers; the <a href="glossary.html">glossary</a> and <a href="formulas.html">formula sheet</a> collect the terms and equations.</li>
+</ul>
+
+<h2 id="fast">3. A one-month fast track</h2>
+<p>For an engineer who needs to make serving decisions soon, about 10 hours a week:</p>
+<div class="tbl"><table>
+<tr><th>Week</th><th>Chapters</th><th>You will be able to</th></tr>
+<tr><td>1. The mechanics</td><td><a href="../chapters/2-4-kv-cache.html">2.4</a>, <a href="../chapters/2-5-inference-arithmetic.html">2.5</a>, <a href="../chapters/3-2-batching-scheduling.html">3.2</a>, <a href="../chapters/3-3-paged-attention.html">3.3</a></td><td>Predict memory use, decode speed and the effect of batching for any model</td></tr>
+<tr><td>2. The levers</td><td><a href="../chapters/3-5-prefix-caching-structured-output.html">3.5</a>, <a href="../chapters/4-1-quantization.html">4.1</a>, <a href="../chapters/4-3-speculative-decoding.html">4.3</a>, <a href="../chapters/4-4-kv-reuse.html">4.4</a></td><td>Choose between caching, quantization and speculation for a workload</td></tr>
+<tr><td>3. Production</td><td><a href="../chapters/6-1-benchmarking.html">6.1</a>, <a href="../chapters/6-4-routing-queueing.html">6.4</a>, <a href="../chapters/6-5-capacity-cost.html">6.5</a>, <a href="../chapters/6-8-agentic-workloads.html">6.8</a></td><td>Benchmark honestly, route by cache, price a deployment, design agents around the KV cache</td></tr>
+<tr><td>4. Scale and a real system</td><td><a href="../chapters/4-5-model-parallelism.html">4.5</a>, <a href="../chapters/4-6-disaggregation.html">4.6</a>, <a href="../chapters/4-8-deepseek-inference-stack.html">4.8</a>, <a href="../chapters/8-2-read-an-engine.html">8.2</a></td><td>Read a frontier service design and an engine's source with understanding</td></tr>
+</table></div>
+<p>Come back to Part 1 when a formula is unfamiliar, Part 5 when a profile shows a kernel problem, and Part 7 when fine-tuning is on the table.</p>
+
+<h2 id="full">4. The full order</h2>
+<p>Read the parts in order; each builds on the ones before. At about 10 to 15 hours a week the whole book takes about 31 weeks: Part 1 (math, PyTorch and neural nets, 2.5 weeks), Part 2 (transformer inference mechanics, 3.5), Part 3 (engines and serving, 3.5), Part 4 (model optimization, 5), Part 5 (GPUs and kernels, 4), Part 6 (production, 5), Part 7 (post-training, 3) and Part 8 (specialized workloads, engine internals and research, 5), ending with the capstone in chapter 8.5.</p>
+
+<h2 id="broken">5. When something breaks: where to read</h2>
+<div class="tbl"><table>
+<tr><th>Symptom</th><th>Usual causes</th><th>Read</th></tr>
+<tr><td>Slow time to first token</td><td>Long or uncached prompts, queueing, prefill competing with decode, cache misses from an unstable prefix or cache-blind routing</td><td><a href="../chapters/3-2-batching-scheduling.html">3.2</a>, <a href="../chapters/4-4-kv-reuse.html">4.4</a>, <a href="../chapters/4-6-disaggregation.html">4.6</a>, <a href="../chapters/6-4-routing-queueing.html">6.4</a></td></tr>
+<tr><td>Slow or uneven streaming (time per output token)</td><td>Large batches, long contexts, a long prefill inserted between decode steps, speculation that no longer pays at high load</td><td><a href="../chapters/2-5-inference-arithmetic.html">2.5</a>, <a href="../chapters/3-2-batching-scheduling.html">3.2</a>, <a href="../chapters/4-3-speculative-decoding.html">4.3</a></td></tr>
+<tr><td>Out of memory, or very few requests fit</td><td>KV cache budget too small for the context limit, weights in too high a precision, no tensor or expert parallelism</td><td><a href="../chapters/2-4-kv-cache.html">2.4</a>, <a href="../chapters/3-3-paged-attention.html">3.3</a>, <a href="../chapters/4-1-quantization.html">4.1</a>, <a href="../chapters/4-5-model-parallelism.html">4.5</a></td></tr>
+<tr><td>Preemptions and recomputation under load</td><td>KV pool exhausted by long outputs (reasoning) or long sessions</td><td><a href="../chapters/3-3-paged-attention.html">3.3</a>, <a href="../chapters/8-1-specialized-workloads.html">8.1</a></td></tr>
+<tr><td>Wrong or changed outputs</td><td>A different chat template or generation config, quantization, a kernel or engine upgrade, batch-dependent numerics</td><td><a href="../chapters/2-1-tokenization.html">2.1</a>, <a href="../chapters/6-6-observability-correctness.html">6.6</a>, <a href="../chapters/7-6-evaluating-serving-finetuned.html">7.6</a></td></tr>
+<tr><td>Cost spike</td><td>Cache hit rate fell, traffic mix changed (longer outputs), autoscaling too eager, GPUs idle between bursts</td><td><a href="../chapters/6-3-autoscaling.html">6.3</a>, <a href="../chapters/6-5-capacity-cost.html">6.5</a>, <a href="../chapters/6-8-agentic-workloads.html">6.8</a></td></tr>
+<tr><td>Slow cold starts</td><td>Large images and weights, compilation and CUDA graph capture at startup</td><td><a href="../chapters/6-2-packaging-startup.html">6.2</a>, <a href="../chapters/5-7-compilation-cuda-graphs.html">5.7</a></td></tr>
+<tr><td>Failures, hangs and partial outages</td><td>GPU or network faults, one failed GPU stopping a wide expert-parallel group, missing health checks</td><td><a href="../chapters/6-9-fault-tolerance-security.html">6.9</a></td></tr>
+</table></div>
+<p class="note">Written on 7 November 2026.</p>
+
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+</body>
+</html>
