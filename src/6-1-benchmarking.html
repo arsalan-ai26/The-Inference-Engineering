@@ -1,0 +1,297 @@
+<div class="kicker">Part 6 · Production inference infrastructure · Chapter 6.1</div>
+<h1>Benchmarking</h1>
+<p class="lede">Every claim in this book about speed and cost ends in a number, and in production that number comes from a benchmark. A good benchmark answers one question: how many requests per second can this system serve while meeting its latency targets, on traffic like ours? Getting that answer right is harder than it looks: tools define metrics differently, averages hide the tail, and synthetic traffic flatters caches and speculators. This chapter defines the metrics precisely, shows how to design a load test, how to find the saturation point, and how to read published benchmarks critically.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 4 hours with the lab</span>
+  <span class="chip">Needs: 2.4, 3.2</span>
+  <span class="chip">Compute: Colab CPU; T4 for Part C</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Two tools report different "tokens per second" for the same run. Name one reason.</li>
+    <li>Why is mean TTFT a poor target?</li>
+    <li>What is goodput?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>They count over different time windows (first request to last response, or whole benchmark duration), include or exclude warm-up requests, or count input tokens too.</li>
+    <li>A few very slow requests, the ones users notice and complain about, barely move the mean. Targets are set on percentiles such as p95 or p99.</li>
+    <li>The rate of requests (or tokens) completed while meeting all latency targets. Requests that miss their SLO do not count.</li>
+  </ol></details>
+</div>
+
+<h2 id="metrics">1. The metrics, precisely</h2>
+<p>Chapter 2.4 introduced TTFT, TPOT and E2E latency. Benchmarks add throughput and percentiles, and tools differ in the details, so write down which definition you use.</p>
+<div class="tbl"><table>
+<tr><th>Metric</th><th>Definition</th><th>Watch for</th></tr>
+<tr><td>TTFT (time to first token)</td><td>From sending the request to receiving the first token with content</td><td>Includes queueing, prefill and network. Grows with prompt length and load.</td></tr>
+<tr><td>ITL (inter-token latency)</td><td>Time between consecutive output tokens</td><td>Report percentiles: one stall shows up in p99 ITL, not in the mean.</td></tr>
+<tr><td>TPOT (time per output token)</td><td>(E2E − TTFT) ÷ (output tokens − 1) for one request</td><td>Some tools call this ITL; some include TTFT in the average, which mixes prefill into a decode metric.</td></tr>
+<tr><td>E2E latency</td><td>From sending the request to receiving the last token</td><td>Dominated by output length for long answers.</td></tr>
+<tr><td>Output tokens per second, system</td><td>All output tokens ÷ measurement window</td><td>Window choice matters: first request to last response vs whole run; warm-up and cool-down included or not.</td></tr>
+<tr><td>Tokens per second, per user</td><td>Output tokens ÷ E2E for one request; approaches 1 ÷ TPOT for long outputs</td><td>Falls as load rises while system throughput rises.</td></tr>
+<tr><td>Requests per second</td><td>Completed requests ÷ window</td><td>Meaningless without the sequence lengths.</td></tr>
+<tr><td>Goodput</td><td>Requests per second that meet every SLO</td><td>The number to optimize (chapter 3.2).</td></tr>
+</table></div>
+<div class="box ex">
+  <span class="lbl">Worked example: one streamed request</span>
+  <p>A request is sent at t = 0. The first token arrives at 0.35 s, the 200th and last at 6.32 s. TTFT = 0.35 s. E2E = 6.32 s. TPOT = (6.32 − 0.35) ÷ 199 = 30 ms. Tokens per second for this user: 200 ÷ 6.32 = 31.6, close to 1 ÷ TPOT = 33 because the answer is long.</p>
+</div>
+<div class="box watch">
+  <span class="lbl">Watch out: tools disagree</span>
+  <p>NVIDIA's GenAI-Perf and Ray's LLMPerf, for example, differ in whether ITL averages include the first token and in the time window for system throughput; NVIDIA observed that start-up and tear-down overheads can be a third of a short single-concurrency run. Use one tool for comparisons, state its definitions, and never compare numbers across tools without checking.</p>
+</div>
+
+<h2 id="percentiles">2. Percentiles and why averages mislead</h2>
+<p>Latency distributions in serving are skewed: most requests are fast, a few are much slower (they arrived during a long prefill, waited in a queue, or were preempted). The p50 (median) describes the typical user; p95 and p99 describe the unhappy ones, and at scale "1% of requests" is many users per minute. SLOs are written on percentiles: for example "p95 TTFT under 1 s and p95 TPOT under 50 ms at 20 requests per second".</p>
+<ul>
+  <li>Measure enough requests for the percentile you report: p99 from 100 requests is one request.</li>
+  <li>Report percentiles per metric separately; the request with the worst TTFT is often not the one with the worst TPOT.</li>
+  <li>Never average percentiles across runs or replicas; merge the raw samples and recompute.</li>
+</ul>
+
+<h2 id="design">3. Designing a load test</h2>
+<p>The best benchmark is real traffic: shadowing copies production requests to the system under test without returning its answers to users. When that is not possible, match production on every dimension that changes performance:</p>
+<ul>
+  <li><strong>Sequence lengths:</strong> the distribution of input and output lengths (ISL and OSL), not just averages. Long tails matter: a few 30K-token prompts change everything.</li>
+  <li><strong>Request contents:</strong> real prompts, so prefix-cache hit rates (chapter 4.4) and speculative acceptance (chapter 4.3) are realistic. Random tokens make both look worse; one repeated prompt makes caching look perfect.</li>
+  <li><strong>Arrival pattern:</strong> real traffic arrives randomly (often modelled as Poisson) and in bursts, not as a fixed number of clients waiting politely.</li>
+  <li><strong>Parameters:</strong> temperature, max tokens, stop conditions, structured output, reasoning effort, as in production. Forcing every request to its maximum length (ignore end-of-sequence) is useful for steady measurements but changes the length distribution.</li>
+</ul>
+<h3>Two ways to apply load</h3>
+<ul>
+  <li><strong>Fixed concurrency (closed loop):</strong> N clients, each sending a new request as soon as its previous one finishes. Easy to reason about, and it never overloads the server, because slower responses slow the clients down. Good for capacity curves at a given batch.</li>
+  <li><strong>Fixed request rate (open loop):</strong> requests arrive on a schedule regardless of how the server is doing. This is how users behave; when the server falls behind, queues grow and latency explodes. Use it to find the real saturation point.</li>
+</ul>
+<h3>Find the knee</h3>
+<p>Sweep the request rate upward. Throughput first rises with load; past saturation, it flattens while queueing makes latency climb steeply. The useful operating point is below the knee, where the SLO percentiles still hold.</p>
+<div class="widget" id="lkW">
+  <div class="wt">Interactive: a load sweep on a simulated engine</div>
+  <div class="ws">A step-level simulation of one Llama 3.1 8B replica on an H100 (idealized costs from chapter 2.5, chunked prefill with a 2,048-token budget, Poisson arrivals, 60 simulated seconds per point). Set your traffic and SLOs; the chart shows throughput and p95 latencies against request rate. Goodput counts requests that met both SLOs.</div>
+  <div class="ctrls">
+    <label>Input tokens <input type="number" id="lkI" value="2000" step="250" min="100" style="width:80px"></label>
+    <label>Output tokens <input type="number" id="lkO" value="250" step="50" min="10" style="width:70px"></label>
+    <label>SLO: p95 TTFT (ms) <input type="number" id="lkT" value="1000" step="100" style="width:70px"></label>
+    <label>SLO: p95 TPOT (ms) <input type="number" id="lkP" value="40" step="5" style="width:60px"></label>
+    <button class="pri" id="lkGo">Run sweep</button>
+  </div>
+  <div class="svgwrap"><svg id="lkSvg" viewBox="0 0 680 300" width="680" style="max-width:100%;height:auto" role="img" aria-label="Throughput and latency against request rate"></svg></div>
+  <div class="stats" id="lkStats"></div>
+</div>
+
+<h2 id="tools">4. Tools</h2>
+<div class="tbl"><table>
+<tr><th>Tool</th><th>What it is</th></tr>
+<tr><td><code>vllm bench serve</code></td><td>vLLM's benchmark client; works against any OpenAI-compatible server; datasets (random, ShareGPT and others), request rate or max concurrency, percentiles, and goodput against SLOs</td></tr>
+<tr><td>SGLang <code>bench_serving</code> and genai-bench</td><td>SGLang's benchmark script, and a CLI with dashboards for any inference server</td></tr>
+<tr><td>NVIDIA GenAI-Perf / AIPerf</td><td>NVIDIA's client-side benchmarking tools with detailed metric definitions</td></tr>
+<tr><td>LLMPerf</td><td>A load-testing client from the Ray team</td></tr>
+<tr><td>Locust, k6</td><td>General load-testing tools for user-flow tests across a whole application</td></tr>
+<tr><td>lm-evaluation-harness and task datasets</td><td>Not for speed, but as realistic prompts and as a check that an optimization did not change quality</td></tr>
+</table></div>
+<pre>vllm bench serve --model Qwen/Qwen2.5-1.5B-Instruct \
+  --dataset-name random --random-input-len 2000 --random-output-len 250 \
+  --request-rate 4 --num-prompts 300 \
+  --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,95,99 \
+  --goodput ttft:1000 tpot:40</pre>
+<p class="note">Check <code>vllm bench serve --help</code> for your version; option names evolve.</p>
+
+<h2 id="practice">5. Benchmarking practice</h2>
+<ol>
+  <li><strong>Baseline first.</strong> Record the current system with a fixed configuration before changing anything.</li>
+  <li><strong>Change one thing at a time</strong>, in the system and in the benchmark. Test optimizations alone and together: some interfere (speculative decoding at large batch, chapter 4.3).</li>
+  <li><strong>Warm up</strong>, then measure a steady state long enough for stable percentiles; repeat runs and report the spread.</li>
+  <li><strong>Control the environment:</strong> same GPU type and count, engine version, model revision, precision, and client location. Run the client close to the server, or measure network latency separately.</li>
+  <li><strong>Check quality</strong> on a task set alongside speed; a faster but wrong system is not an improvement.</li>
+  <li><strong>Keep the artifacts:</strong> command lines, configs, raw per-request results. You will need them when someone asks why a number changed.</li>
+</ol>
+
+<h2 id="public">6. Reading published benchmarks</h2>
+<p>Vendor and third-party benchmarks are useful for orientation, not for decisions. For every number, find:</p>
+<ul>
+  <li>Model, precision (BF16, FP8, FP4) and whether quality was checked.</li>
+  <li>Hardware: GPU type and count, form factor, interconnect.</li>
+  <li>Engine and version, parallel layout, speculative decoding on or off.</li>
+  <li>Workload: ISL/OSL, concurrency or rate, cache hit rates, output forced to max length or not.</li>
+  <li>Which metric: per-user or per-system throughput, per GPU or per node, at what latency.</li>
+</ul>
+<p>Independent sites such as Artificial Analysis publish API and hardware benchmarks with a stated methodology; read the methodology page first. Throughput per GPU at a fixed per-user speed (an interactivity target) is the most useful single comparison across hardware, because it reflects the latency-throughput trade-off instead of hiding it.</p>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Coordinated omission</span>
+  <p>A closed-loop client that waits for each response before sending the next silently stops sending when the server stalls, so the stall barely appears in its latency samples. Open-loop (fixed-rate) clients avoid this; when using closed-loop tools, compute latency from the intended send time, not the actual one.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">The latency-throughput frontier</span>
+  <p>Instead of a single number, plot per-user tokens per second (x) against system tokens per second per GPU (y) over a sweep of concurrency, for each configuration. The upper-right frontier shows the best trade-offs; configurations below it are dominated. Hardware and engine comparisons in this form are much harder to game.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Benchmarking agents and multi-call workloads</span>
+  <p>Agent workloads chain many dependent calls with growing prefixes (chapter 6.8). Per-call TTFT and throughput miss what users feel: total task time. Replaying recorded agent traces, with their real inter-call gaps and cache reuse, is the closest equivalent to shadowing.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Benchmarking with one prompt repeated (perfect cache hits) or random tokens (no hits, no speculative acceptance).</li>
+  <li>Reporting mean latency only.</li>
+  <li>Only closed-loop tests, so the system never shows its behaviour under overload.</li>
+  <li>Comparing numbers from different tools or definitions.</li>
+  <li>Running the client on a busy machine far from the server.</li>
+  <li>Measuring during warm-up, compilation or autoscaling.</li>
+  <li>Quoting peak throughput at a latency nobody would accept.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p><strong>Goal:</strong> build a streaming benchmark client, design a rate sweep, and find the saturation point of a real server.</p>
+<h3>Part A: predict with the widget</h3>
+<p>For 2,000 input and 250 output tokens with SLOs of 1,000 ms p95 TTFT and 40 ms p95 TPOT, run the sweep. At what rate does goodput peak? Which SLO breaks first? Now change output to 1,000 tokens: which SLO breaks first now, and why?</p>
+<h3>Part B: a streaming benchmark client (CPU, with a mock server)</h3>
+<p>The mock server below behaves like an engine: prefill grows with prompt length and every step slows as more requests share the GPU. Run it with <code>uvicorn mock_server:app --port 8000</code>, then run the client.</p>
+<pre># mock_server.py
+import asyncio, json
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+app = FastAPI(); active = 0
+@app.post("/v1/completions")
+async def completions(req: Request):
+    body = await req.json()
+    n_in = len(body["prompt"].split()); n_out = body.get("max_tokens", 64)
+    async def gen():
+        global active
+        active += 1
+        try:
+            await asyncio.sleep(0.02 + n_in * 0.0002 * (1 + active / 8))   # prefill
+            for i in range(n_out):
+                await asyncio.sleep(0.01 * (1 + active / 16))               # decode step
+                yield f"data: {json.dumps({'choices': [{'text': f' t{i}', 'index': 0}]})}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            active -= 1
+    return StreamingResponse(gen(), media_type="text/event-stream")</pre>
+<pre># bench_client.py
+import asyncio, time, random, sys
+from openai import AsyncOpenAI
+client = AsyncOpenAI(base_url=sys.argv[1] if len(sys.argv) &gt; 1 else "http://localhost:8000/v1", api_key="x")
+MODEL = sys.argv[2] if len(sys.argv) &gt; 2 else "mock"
+
+async def one(prompt, max_tokens):
+    t0 = time.perf_counter(); ttft = None; times = []
+    stream = await client.completions.create(model=MODEL, prompt=prompt, max_tokens=max_tokens, stream=True)
+    async for chunk in stream:
+        now = time.perf_counter()
+        if chunk.choices and chunk.choices[0].text:
+            if ttft is None: ttft = now - t0
+            times.append(now)
+    # TODO: compute the inter-token latencies from times, and the E2E latency
+    return ttft, itl, e2e, len(times)
+
+async def run(rate, n=60, prompt_words=500, out=64):
+    random.seed(0); tasks = []
+    prompt = " ".join(["word"] * prompt_words)
+    t_start = time.perf_counter()
+    for _ in range(n):
+        tasks.append(asyncio.create_task(one(prompt, out)))
+        await asyncio.sleep(random.expovariate(rate))          # open loop: Poisson arrivals
+    res = await asyncio.gather(*tasks)
+    dur = time.perf_counter() - t_start
+    ttft = sorted(r[0] for r in res); itl = sorted(x for r in res for x in r[1])
+    p = lambda xs, q: xs[min(len(xs) - 1, int(q * len(xs)))]
+    print(f"rate {rate}/s TTFT p50 {p(ttft,.5)*1e3:.0f} p99 {p(ttft,.99)*1e3:.0f} ms  "
+          f"ITL p50 {p(itl,.5)*1e3:.1f} p99 {p(itl,.99)*1e3:.1f} ms  "
+          f"throughput {sum(r[3] for r in res)/dur:.0f} tok/s")
+
+async def main():
+    for rate in [1, 4, 8, 16]:
+        await run(rate)
+asyncio.run(main())</pre>
+<details><summary>Solution</summary>
+<pre>    e2e = time.perf_counter() - t0
+    itl = [b - a for a, b in zip(times, times[1:])]</pre></details>
+<details><summary>What we measured against the mock server</summary><pre class="out">rate 1/s   TTFT p50 160 p99 197 ms  ITL p50 11.6 p99 13.6 ms  throughput  57 tok/s
+rate 4/s   TTFT p50 199 p99 227 ms  ITL p50 13.7 p99 15.4 ms  throughput 216 tok/s
+rate 8/s   TTFT p50 265 p99 307 ms  ITL p50 16.6 p99 19.8 ms  throughput 401 tok/s
+rate 16/s  TTFT p50 387 p99 543 ms  ITL p50 23.5 p99 30.3 ms  throughput 640 tok/s</pre>
+<p>Throughput rises with load while every latency percentile worsens, and the tail (p99) worsens fastest. The same client works against any OpenAI-compatible server: pass its URL and model name.</p></details>
+<h3>Part C: find a real saturation point (T4)</h3>
+<p>Serve Qwen2.5-1.5B-Instruct with vLLM on a T4. Choose SLOs (for example p95 TTFT 1,000 ms, p95 TPOT 60 ms) and a workload (for example 1,000 input and 200 output tokens). Run <code>vllm bench serve</code> at request rates 1, 2, 4, 8 and 16 with <code>--goodput</code>. Plot throughput, p95 TTFT and p95 TPOT against rate. Mark the highest rate that meets both SLOs. Then rerun with a ShareGPT-style dataset instead of random tokens and explain any difference (lengths, cache hits).</p>
+<h3>Part D: read a public benchmark</h3>
+<p>Pick one published LLM benchmark result (a vendor blog, MLPerf Inference, or Artificial Analysis). Fill in the checklist from section 6. Which fields are missing, and how could each change the conclusion?</p>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Benchmarking in production teams</span>
+  <ul>
+    <li><strong>Release gates:</strong> teams rerun a fixed benchmark suite on every engine or model upgrade and block regressions in goodput or p99 latency.</li>
+    <li><strong>Capacity planning</strong> uses the measured knee per replica to size fleets (chapter 6.5).</li>
+    <li><strong>Shadow traffic</strong> validates big changes (new hardware, disaggregation) on real request mixes before cutover.</li>
+    <li><strong>Procurement</strong> asks vendors for frontier curves on the team's own workload, not headline numbers.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz61"></div>
+<script type="application/json" id="qz61">[
+{"q":"TTFT 0.4 s, E2E 4.4 s, 101 output tokens. TPOT is:","o":["44 ms","40 ms","4 ms","400 ms"],"a":1,"e":"(4.4 − 0.4) ÷ 100 = 40 ms."},
+{"q":"Which load pattern reveals behaviour under overload?","o":["Fixed concurrency (closed loop)","Fixed request rate (open loop)","One request at a time","Warm-up only"],"a":1,"e":"Open-loop arrivals keep coming even when the server falls behind."},
+{"q":"Why not benchmark with one repeated prompt?","o":["It is slower","It makes prefix caching (and some speculation) unrealistically effective","Tools forbid it","It breaks streaming"],"a":1,"e":"Every request after the first would hit the cache."},
+{"q":"Past the saturation point, throughput:","o":["Keeps rising linearly","Flattens while latency climbs steeply","Drops to zero","Doubles"],"a":1,"e":"The server cannot do more work; extra requests just queue."},
+{"q":"How should p99 latencies from three replicas be combined?","o":["Average the three p99s","Merge raw samples and recompute p99","Take the minimum","Take the median of the three"],"a":1,"e":"Percentiles do not average."},
+{"q":"Goodput counts:","o":["All completed requests","Requests that met every SLO","Input tokens","Failed requests"],"a":1,"e":"It is throughput that users actually experienced as acceptable."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Define metrics precisely (TTFT, ITL, TPOT, E2E, system and per-user throughput, goodput) and use one tool's definitions consistently.</li>
+  <li>Use percentiles; averages hide the tail users feel.</li>
+  <li>Match production on lengths, contents, arrival pattern and parameters; shadow real traffic when you can.</li>
+  <li>Sweep the request rate with open-loop load to find the knee, and operate below it at your SLOs.</li>
+  <li>Read published benchmarks with a checklist: model, precision, hardware, engine, workload, metric, latency.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 4.5</td><td>Realistic benchmarks, shadowing, tooling and benchmarking discipline.</td></tr>
+<tr><td><a href="https://developer.nvidia.com/blog/llm-benchmarking-fundamental-concepts/">NVIDIA: LLM benchmarking fundamental concepts</a></td><td>Precise metric definitions and how GenAI-Perf and LLMPerf differ.</td></tr>
+<tr><td><a href="https://artificialanalysis.ai/benchmarks/hardware">Artificial Analysis: hardware benchmarks</a></td><td>An independent hardware comparison with published methodology.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/benchmarking/">vLLM benchmarking documentation</a></td><td>The <code>vllm bench serve</code> tool, datasets, metrics and goodput.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2401.09670">Zhong et al., DistServe</a></td><td>Goodput as the serving metric to optimize.</td></tr>
+<tr><td>Chi Wang and Peiheng Hu, <em>Hands-On LLM Serving and Optimization</em>, chapter 4</td><td>Serving best practices including measurement.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. Part B was run against the mock server with Python 3.13, FastAPI and the OpenAI SDK.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+function rng(seed){let s=seed>>>0;return()=>{s=(s*1664525+1013904223)>>>0;return s/4294967296;};}
+function sim(rate,I,O,T=60){const W=16.06e9,KV=131072,BW=3.35e12,PF=989e12*0.4/(2*8.03e9),BUD=2048;const r=rng(7+Math.round(rate*100));
+  let t=0,next=-Math.log(1-r())/rate,q=[],run=[],ttft=[],tpot=[],done=0,toks=0,ok=0;
+  while(t<T||q.length||run.length){if(t>T*3)break;
+    while(next<=t&&next<T){q.push({a:next,left:I});next+=-Math.log(1-r())/rate;}
+    if(!q.length&&!run.length){t=next<T?next:T*3;continue;}
+    let left=BUD-run.length,chunk=0;while(q.length&&left>0){const k=Math.min(left,q[0].left);q[0].left-=k;left-=k;chunk+=k;if(q[0].left===0){const x=q.shift();run.push({a:x.a,s:null,m:0});}}
+    const ctx=run.reduce((s,x)=>s+I+x.m,0);const dt=Math.max((W+ctx*KV)/BW,(2*8.03e9*run.length)/(989e12*0.5))+chunk/PF;t+=dt;
+    for(let i=run.length-1;i>=0;i--){const x=run[i];if(x.s===null){x.s=t;x.m=1;ttft.push(t-x.a);x.tt=t-x.a;}else x.m++;toks++;
+      if(x.m>=O){const tp=(t-x.s)/(O-1);tpot.push(tp);x.tp=tp;run.splice(i,1);if(x.a<T){done++;if(x.tt*1e3<=+$('lkT').value&&tp*1e3<=+$('lkP').value)ok++;}}}}
+  const p=(a,q)=>{if(!a.length)return NaN;const s=a.slice().sort((x,y)=>x-y);return s[Math.min(s.length-1,Math.floor(q*s.length))];};
+  return{rate,thr:toks/Math.max(t,1e-9),t95:p(ttft,.95),p95:p(tpot,.95),good:ok/T};}
+function draw(res){const svg=$('lkSvg');svg.innerHTML='';const x0=60,x1=600,y0=260,y1=20;const mr=Math.max(...res.map(r=>r.rate));
+  const X=v=>x0+v/mr*(x1-x0);const mt=Math.max(...res.map(r=>r.thr))*1.1;const Y=v=>y0-v/mt*(y0-y1);
+  const lt=Math.min(5000,Math.max(...res.map(r=>r.t95*1e3)));const YL=v=>y0-Math.min(v,lt)/lt*(y0-y1);
+  for(let i=0;i<=4;i++){const v=mt*i/4;el('line',{x1:x0,x2:x1,y1:Y(v),y2:Y(v),stroke:css('--line')},svg);el('text',{x:x0-6,y:Y(v)+4,'text-anchor':'end',fill:css('--kv'),'font-size':10},svg,IE.int(v));el('text',{x:x1+4,y:Y(v)+4,fill:css('--dec'),'font-size':10},svg,IE.int(lt*i/4)+' ms');}
+  res.forEach(r=>el('text',{x:X(r.rate),y:y0+16,'text-anchor':'middle',fill:css('--ink2'),'font-size':10},svg,r.rate.toFixed(1)));
+  el('text',{x:(x0+x1)/2,y:y0+34,'text-anchor':'middle',fill:css('--ink2'),'font-size':12},svg,'request rate (per second)');
+  const line=(f,c,dash)=>{let d='';res.forEach(r=>{const v=f(r);if(isFinite(v))d+=(d?'L':'M')+X(r.rate).toFixed(1)+','+v.toFixed(1);});el('path',{d,fill:'none',stroke:css(c),'stroke-width':2.5,'stroke-dasharray':dash||''},svg);};
+  line(r=>Y(r.thr),'--kv');line(r=>YL(r.t95*1e3),'--dec');line(r=>YL(r.p95*1e3*25),'--pre','5 4');
+  el('line',{x1:x0,x2:x1,y1:YL(+$('lkT').value),y2:YL(+$('lkT').value),stroke:css('--bad'),'stroke-dasharray':'3 3'},svg);
+  el('text',{x:x0,y:12,fill:css('--kv'),'font-size':11},svg,'tok/s (left)');el('text',{x:x0+110,y:12,fill:css('--dec'),'font-size':11},svg,'p95 TTFT (right)');el('text',{x:x0+250,y:12,fill:css('--pre'),'font-size':11},svg,'p95 TPOT ×25 (right)');el('text',{x:x0+420,y:12,fill:css('--bad'),'font-size':11},svg,'TTFT SLO');
+  const best=res.reduce((a,b)=>b.good>a.good?b:a);
+  $('lkStats').innerHTML=[['Peak throughput',IE.int(Math.max(...res.map(r=>r.thr)))+' tok/s'],['Best goodput',best.good.toFixed(1)+' req/s at '+best.rate.toFixed(1)+'/s'],['p95 TTFT there',IE.int(best.t95*1e3)+' ms'],['p95 TPOT there',(best.p95*1e3).toFixed(1)+' ms']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+let last=null;
+function go(){const I=+$('lkI').value,O=+$('lkO').value;const cap=24700/(I+O*0.2);const rates=[];for(let i=1;i<=10;i++)rates.push(Math.max(0.2,cap*1.3*i/10));last=rates.map(r=>sim(r,I,O));draw(last);}
+$('lkGo').onclick=go;IE.onTheme(()=>{if(last)draw(last);});go();
+})();
+</script>

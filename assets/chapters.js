@@ -249,7 +249,7 @@ window.IE_CHAPTERS = [
 "title": "Benchmarking",
 "slug": "6-1-benchmarking",
 "part": 6,
-"ready": false
+"ready": true
 },
 {
 "n": "6.2",
