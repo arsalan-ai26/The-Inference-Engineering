@@ -81,7 +81,7 @@ for part in data['parts']:
         else:
             lis.append(f'<li><span class="num">{n}</span><span>{html.escape(title)}</span></li>')
     cards.append(f'<section class="part" id="part-{part["n"]}"><div class="pn">Part {part["n"]} · {part["weeks"]}</div><h2>{html.escape(part["title"])}</h2><ol>{"".join(lis)}</ol></section>')
-extra = ''.join(f'<li><a href="{href}">{t}</a></li>' for href, t in [('guides/start-here.html','Chapter 0: from agent builder to inference engineer (start here)'),('guides/compute.html','Compute guide: free GPUs, rentals and costs'),('guides/glossary.html','Glossary'),('guides/formulas.html','Formula sheet'),('guides/reading-list.html','Reading list: every paper the book cites')] if os.path.exists(os.path.join(ROOT, href)))
+extra = ''.join(f'<li><a href="{href}">{t}</a></li>' for href, t in [('guides/start-here.html','Chapter 0: from agent builder to inference engineer (start here)'),('guides/compute.html','Compute guide: free GPUs, rentals and costs'),('guides/glossary.html','Glossary'),('guides/formulas.html','Formula sheet'),('guides/reading-list.html','Reading list: every paper the book cites'),('guides/next-tracks.html','After the book: kernel engineering and research engineering')] if os.path.exists(os.path.join(ROOT, href)))
 idx = head('The Inference Engineering Book', '') + f'''
 <body class="index">
 <div class="iwrap">

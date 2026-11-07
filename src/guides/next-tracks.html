@@ -1,0 +1,93 @@
+<div class="kicker">Guide</div>
+<h1>After the book: kernel engineering and research engineering</h1>
+<p class="lede">The book prepares you for applied inference roles. Two specializations need more: <strong>kernel engineering</strong> (writing the GPU code that engines call) and <strong>research engineering</strong> (turning research ideas into working, measured systems and models). This guide gives each track a staged path, the best free resources we found, and the portfolio evidence hiring teams look for. Every link was checked on 8 November 2026.</p>
+
+<h2 id="kernel">1. Kernel engineering</h2>
+<p><strong>The job:</strong> write and tune the kernels behind attention, GEMMs, MoE routing, quantization and communication, for one or more GPU generations; read profiler output fluently; and know when a compiler (Triton, torch.compile) is good enough and when hand-written CUDA, CUTLASS or a tile DSL is needed. In the book: chapters 5.1 to 5.8, especially 5.4 and 5.8, and chapter 4.8's DeepSeek kernels.</p>
+<h3>Stages</h3>
+<div class="tbl"><table>
+<tr><th>Stage</th><th>Goal</th><th>Resources</th><th>Done when</th></tr>
+<tr><td>1. CUDA fundamentals</td><td>Threads, blocks, warps, shared memory, coalescing, occupancy</td><td>PMPP book; CUDA Programming Guide; GPU Puzzles; GPU MODE lectures 1 to 10; Modal GPU Glossary</td><td>You can write and explain a tiled matrix transpose and a reduction, and predict their bandwidth</td></tr>
+<tr><td>2. The matmul worklog</td><td>Take an SGEMM from naive to near cuBLAS, one optimization at a time</td><td>Simon Boehm's worklog and code; Horace He's "Go Brrrr"</td><td>Your own kernel reaches a stated fraction of cuBLAS, with a table of what each step bought</td></tr>
+<tr><td>3. Tensor cores and modern pipelines</td><td>WMMA/MMA, TMA, warp specialization, asynchronous pipelines on Hopper and Blackwell</td><td>Aleksa Gordić's matmul anatomy; "Outperforming cuBLAS on H100"; Colfax Research tutorials; CUTLASS Blackwell docs</td><td>You can read a FlashAttention-3 or FlashMLA kernel and explain its pipeline</td></tr>
+<tr><td>4. Productive DSLs</td><td>Write kernels quickly in Triton, CuTe DSL, ThunderKittens or TileLang</td><td>Triton tutorials and Triton Puzzles; CuTe DSL notebooks; ThunderKittens; TileLang</td><td>One kernel written in two DSLs, compared on speed and effort</td></tr>
+<tr><td>5. Profiling and correctness</td><td>Nsight Compute roofline and stall analysis; numerical testing</td><td>Nsight Compute profiling guide; CUDA Best Practices Guide; chapter 5.6</td><td>A profile-driven report for one of your kernels</td></tr>
+<tr><td>6. Compete and contribute</td><td>Measured results others can check</td><td>GPU MODE KernelBot competitions and reference kernels; LeetGPU; KernelBench</td><td>A leaderboard entry or a merged kernel PR in an engine or kernel library</td></tr>
+</table></div>
+<h3>Resources</h3>
+<div class="tbl"><table>
+<tr><th>Resource</th><th>Type</th><th>What you get</th></tr>
+<tr><td><a href="https://www.elsevier.com/books/programming-massively-parallel-processors/hwu/978-0-323-91231-0">Hwu, Kirk and El Hajj, Programming Massively Parallel Processors (4th edition)</a></td><td>Book (paid)</td><td>The standard CUDA textbook: memory hierarchy, tiling, reductions, scans, sparse and convolution patterns.</td></tr>
+<tr><td><a href="https://docs.nvidia.com/cuda/cuda-programming-guide/">NVIDIA CUDA Programming Guide</a> and <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/">CUDA C++ Best Practices Guide</a></td><td>Official docs</td><td>The programming model, and NVIDIA's own optimization checklist.</td></tr>
+<tr><td><a href="https://www.gpumode.com/">GPU MODE</a>: <a href="https://www.youtube.com/@GPUMODE">lecture videos</a>, <a href="https://github.com/gpu-mode/lectures">lecture materials</a>, <a href="https://github.com/gpu-mode/resource-stream">resource stream</a></td><td>Community</td><td>Free lectures, hackathons, working groups and a curated list of GPU programming material; the largest open community for this work.</td></tr>
+<tr><td><a href="https://github.com/srush/GPU-Puzzles">Sasha Rush, GPU Puzzles</a> and <a href="https://github.com/srush/Triton-Puzzles">Triton Puzzles</a></td><td>Exercises</td><td>Short notebook puzzles that teach the CUDA and Triton models by doing.</td></tr>
+<tr><td><a href="https://modal.com/gpu-glossary">Modal, GPU Glossary</a></td><td>Reference</td><td>Clear definitions of GPU hardware and software terms, linked together.</td></tr>
+<tr><td><a href="https://siboehm.com/articles/22/CUDA-MMM">Simon Boehm, How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance</a> (<a href="https://github.com/siboehm/SGEMM_CUDA">code</a>)</td><td>Worklog</td><td>The canonical step-by-step SGEMM optimization, each step measured.</td></tr>
+<tr><td><a href="https://horace.io/brrr_intro.html">Horace He, Making Deep Learning Go Brrrr From First Principles</a></td><td>Essay</td><td>Compute, memory bandwidth and overhead as the three regimes; the mental model behind chapter 2.5.</td></tr>
+<tr><td><a href="https://www.aleksagordic.com/blog/matmul">Aleksa Gordić, Inside NVIDIA GPUs: Anatomy of high performance matmul kernels</a></td><td>Long-form blog</td><td>From GPU architecture and PTX/SASS to warp tiling and asynchronous tensor-core pipelines.</td></tr>
+<tr><td><a href="https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog">Outperforming cuBLAS on H100: a Worklog</a></td><td>Worklog</td><td>The same journey as Boehm's on Hopper, with tensor cores, TMA and warp specialization.</td></tr>
+<tr><td><a href="https://research.colfax-intl.com/">Colfax Research</a></td><td>Tutorials</td><td>Detailed CUTLASS and CuTe tutorials for Hopper and Blackwell features; Colfax co-authored FlashAttention-3.</td></tr>
+<tr><td><a href="https://github.com/NVIDIA/cutlass">NVIDIA CUTLASS</a>, <a href="https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/notebooks.html">CuTe DSL notebooks</a>, <a href="https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell.html">Blackwell functionality</a></td><td>Library and docs</td><td>NVIDIA's templates for high-performance GEMM and attention, and the Python CuTe DSL for writing such kernels without C++ templates.</td></tr>
+<tr><td><a href="https://triton-lang.org/main/getting-started/tutorials/index.html">Triton tutorials</a></td><td>Official tutorials</td><td>Vector add to fused attention and matmul, in Python.</td></tr>
+<tr><td><a href="https://github.com/HazyResearch/ThunderKittens">ThunderKittens</a> and its <a href="https://hazyresearch.stanford.edu/blog/2024-05-12-tk">introductory post, "GPUs Go Brrr"</a></td><td>Library and essay</td><td>Tile primitives for fast kernels, and a readable account of what makes H100 kernels fast.</td></tr>
+<tr><td><a href="https://github.com/tile-ai/tilelang">TileLang</a></td><td>DSL</td><td>The tile language DeepSeek uses for TileKernels and DeepInfer, with NVIDIA and Ascend backends (chapter 5.4).</td></tr>
+<tr><td><a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/">Nsight Compute Profiling Guide</a></td><td>Official docs</td><td>What each metric and stall reason means; how the roofline is built.</td></tr>
+<tr><td><a href="https://github.com/gpu-mode/reference-kernels">GPU MODE reference kernels</a> and <a href="https://leetgpu.com/">LeetGPU</a></td><td>Competitions and practice</td><td>Problems with leaderboards (KernelBot runs GPU MODE's competitions); LeetGPU offers GPU programming problems in the browser.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2502.10517">KernelBench</a> (<a href="https://github.com/ScalingIntelligence/KernelBench">code</a>) and <a href="https://arxiv.org/abs/2607.16241">KernelBench-Verified</a></td><td>Benchmark and critique</td><td>A benchmark of PyTorch-to-kernel tasks, and a 2026 paper showing that models often game it (weak baselines without TF32, hard-coded bypasses for test values). Required reading before trusting any "AI-written kernel beats PyTorch" claim.</td></tr>
+</table></div>
+<div class="box expert">
+  <span class="lbl">Portfolio evidence for kernel roles</span>
+  <ul>
+    <li>A public worklog of one kernel from naive to tuned, each step measured against a vendor library, with Nsight Compute screenshots.</li>
+    <li>A kernel that fixes a real gap: a fused operation an engine lacks, or an existing kernel for a new GPU generation, merged upstream.</li>
+    <li>Correctness tests against a reference across shapes and dtypes, and honest baselines (the KernelBench-Verified lesson).</li>
+  </ul>
+</div>
+
+<h2 id="research">2. Research engineering</h2>
+<p><strong>The job:</strong> build the training, evaluation and inference infrastructure researchers use; implement ideas from papers fast and correctly; run careful experiments and ablations; and know when a result is real. It needs breadth across modeling, training and systems, plus experimental discipline. In the book: chapter 8.4 (reproducing a paper), 8.5 (the capstone), Part 7, and the optional math chapters 1.7 to 1.10.</p>
+<h3>Stages</h3>
+<div class="tbl"><table>
+<tr><th>Stage</th><th>Goal</th><th>Resources</th><th>Done when</th></tr>
+<tr><td>1. Build a model from scratch</td><td>Every piece of an LLM in your own code: tokenizer, model, training loop, sampling</td><td>Karpathy's Zero to Hero; the Annotated Transformer; nanochat</td><td>You trained a small model end to end and can explain each loss curve feature</td></tr>
+<tr><td>2. A full course</td><td>Systems-aware language modeling: data, scaling, kernels, parallelism, inference, alignment</td><td>Stanford CS336 (lectures and assignments)</td><td>CS336's assignments completed, including its systems assignment</td></tr>
+<tr><td>3. Scaling and training systems</td><td>Parallelism, memory, throughput at cluster scale</td><td>How To Scale Your Model; the Ultra-Scale Playbook</td><td>You can plan a parallelism layout for a given model and cluster, with numbers</td></tr>
+<tr><td>4. Experimental discipline</td><td>Tuning, debugging training, evaluation, statistics</td><td>Karpathy's recipe; Google's tuning playbook; lm-evaluation-harness; chapter 1.10</td><td>Every result you report has error bars, a strong baseline and an ablation</td></tr>
+<tr><td>5. Reproduce and extend</td><td>Reproduce a paper, then find something new in it</td><td>Chapter 8.4; the ML Reproducibility Challenge; the 2021 reproducibility experience report</td><td>A written reproduction, including what did not reproduce</td></tr>
+<tr><td>6. Speed and taste</td><td>Fast iteration on a shared benchmark; choosing good problems</td><td>The modded-nanogpt speedrun; Schulman's guide to ML research</td><td>A speedrun-style improvement, or a short report on an idea that others can rerun</td></tr>
+</table></div>
+<h3>Resources</h3>
+<div class="tbl"><table>
+<tr><th>Resource</th><th>Type</th><th>What you get</th></tr>
+<tr><td><a href="https://cs336.stanford.edu/">Stanford CS336: Language Modeling from Scratch</a> (Spring 2026)</td><td>Course</td><td>The closest course to a research engineer's job: build tokenizers, transformers, kernels, parallel training, scaling-law fits, inference and alignment yourself.</td></tr>
+<tr><td><a href="https://karpathy.ai/zero-to-hero.html">Andrej Karpathy, Neural Networks: Zero to Hero</a></td><td>Video course</td><td>Backpropagation to GPT, written from scratch on screen.</td></tr>
+<tr><td><a href="https://github.com/karpathy/nanochat">nanochat</a></td><td>Code</td><td>A minimal, hackable harness for training a chat LLM on one GPU node, end to end.</td></tr>
+<tr><td><a href="https://nlp.seas.harvard.edu/annotated-transformer/">The Annotated Transformer</a></td><td>Annotated code</td><td>The original Transformer paper, line by line in PyTorch.</td></tr>
+<tr><td><a href="https://jax-ml.github.io/scaling-book/">How To Scale Your Model</a> (Google DeepMind)</td><td>Online book</td><td>Rooflines, sharding and the arithmetic of training and serving at scale (written around TPUs, with the ideas carrying over to GPUs).</td></tr>
+<tr><td><a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook">Hugging Face, The Ultra-Scale Playbook</a></td><td>Online book</td><td>Data, tensor, pipeline, context and expert parallelism on GPU clusters, with thousands of measured runs.</td></tr>
+<tr><td><a href="https://karpathy.github.io/2019/04/25/recipe/">Karpathy, A Recipe for Training Neural Networks</a></td><td>Essay</td><td>A procedure for building and debugging training without fooling yourself.</td></tr>
+<tr><td><a href="https://github.com/google-research/tuning_playbook">Google Research, Deep Learning Tuning Playbook</a></td><td>Guide</td><td>A systematic process for hyperparameter tuning and experiment design.</td></tr>
+<tr><td><a href="https://github.com/EleutherAI/lm-evaluation-harness">EleutherAI lm-evaluation-harness</a></td><td>Tool</td><td>The standard open harness for evaluating language models on many tasks.</td></tr>
+<tr><td><a href="https://reproml.org/">ML Reproducibility Challenge (MLRC 2026)</a></td><td>Program</td><td>A yearly challenge to reproduce published papers, with reports reviewed and published.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2107.00821">An Experience Report on Machine Learning Reproducibility</a></td><td>Paper</td><td>Practical lessons from reproducing models for the TensorFlow Model Garden.</td></tr>
+<tr><td><a href="https://github.com/KellerJordan/modded-nanogpt">modded-nanogpt (the NanoGPT speedrun)</a></td><td>Shared benchmark</td><td>A collaborative race for the fastest GPT-2-level training on 8 GPUs; Muon came from here. Each record is a small, verified research result.</td></tr>
+<tr><td><a href="http://joschu.net/blog/opinionated-guide-ml-research.html">John Schulman, An Opinionated Guide to ML Research</a></td><td>Essay</td><td>Choosing problems, keeping notes and making progress, from an OpenAI co-founder.</td></tr>
+<tr><td><a href="https://lilianweng.github.io/">Lilian Weng's blog</a></td><td>Blog</td><td>Long, well-referenced surveys of research topics; good for getting up to speed on an area.</td></tr>
+</table></div>
+<div class="box expert">
+  <span class="lbl">Portfolio evidence for research engineering roles</span>
+  <ul>
+    <li>A reproduction write-up (chapter 8.4's template) with code, configs and raw results, including the parts that did not reproduce.</li>
+    <li>A from-scratch model trained to a reported quality, with the training curves and the bugs you found along the way.</li>
+    <li>An ablation study with error bars that changes a conclusion, even a small one.</li>
+    <li>Infrastructure others used: an evaluation harness, a data pipeline, a training or rollout speedup, merged into an open project.</li>
+  </ul>
+</div>
+
+<h2 id="both">3. For both tracks</h2>
+<ul>
+  <li><strong>Read primary sources.</strong> The <a href="reading-list.html">reading list</a> collects every paper the book cites; DeepSeek's kernel repositories and design notes (chapters 4.8 and 5.8) are some of the best published kernel and systems engineering.</li>
+  <li><strong>Work in public.</strong> Worklogs, reproduction reports and merged pull requests are the evidence both kinds of team look for.</li>
+  <li><strong>Budget GPU time by stage</strong>, as in chapter 8.5: develop on CPU or a small GPU and rent large GPUs only for measurement runs.</li>
+</ul>
+<p class="note">Links and descriptions checked on 8 November 2026 against each resource's own page. Paid and free status may change.</p>
