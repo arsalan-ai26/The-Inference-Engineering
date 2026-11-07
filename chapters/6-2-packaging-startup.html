@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>6.2 Packaging, API layer, startup and shutdown</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="6.2">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 6 · Chapter 6.2</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 6 · Production inference infrastructure · Chapter 6.2</div>
+<h1>Packaging, API layer, startup and shutdown</h1>
+<p class="lede">A tuned engine on a laptop is not a service. To serve traffic it must be packaged so it runs the same everywhere, expose a stable API, start quickly when capacity is added, report when it is ready, and stop without dropping requests. This chapter covers containers for GPU inference, how model weights get onto the GPU, every stage of a cold start and how to shorten it, the API layer in front of the engine, health checks, and graceful shutdown.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 1.6, 3.1, 5.7</span>
+  <span class="chip">Compute: Colab CPU; T4 for Part C</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why are model weights for large models usually not baked into the container image?</li>
+    <li>What is the difference between a liveness probe and a readiness probe for an inference server?</li>
+    <li>Name four stages of a cold start.</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Weights of tens to hundreds of GB dwarf the software image, slow every image pull and rebuild, and change independently of the code. They are loaded separately from a fast nearby store.</li>
+    <li>Liveness asks "is the process healthy, or should it be restarted?". Readiness asks "can it take traffic now?". A server loading weights is alive but not ready.</li>
+    <li>Getting a GPU node, pulling the image, loading weights, starting the engine (memory profiling, compilation, graph capture, warm-up).</li>
+  </ol></details>
+</div>
+
+<h2 id="containers">1. Containers for GPU inference</h2>
+<p>A container packages an application with everything it depends on, so it runs the same on every node. For inference that matters more than usual, because the dependency chain is long and fragile: GPU driver (on the host) → CUDA runtime and libraries → PyTorch → kernel libraries (FlashAttention, FlashInfer, Triton) → the engine → your code. A version mismatch anywhere can mean a crash, a silent slow path, or different outputs.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Image:</strong> an immutable package built from a Dockerfile, made of layers. <strong>Container:</strong> a running instance of an image with a thin writable layer that disappears when it stops. <strong>Registry:</strong> where images are stored and pulled from.</p>
+  <p><strong>NVIDIA Container Toolkit:</strong> lets containers use the host's GPUs and driver. The host driver must be new enough for the CUDA version inside the image (chapter 1.6).</p>
+</div>
+<h3>Practices</h3>
+<ul>
+  <li><strong>Start from the engine's official image</strong> (for example <code>vllm/vllm-openai</code> or SGLang's image) rather than building CUDA and PyTorch yourself.</li>
+  <li><strong>Pin everything:</strong> image tags by digest, Python packages by exact version (a lock file from uv, pip-tools or poetry). A rebuild next month must produce the same image.</li>
+  <li><strong>Keep images lean.</strong> An inference image is already large (the CUDA libraries and PyTorch alone are several GB). Every extra GB slows every pull on every new node.</li>
+  <li><strong>Order layers by change frequency:</strong> base and dependencies first, your code last, so code changes rebuild and ship only a small top layer.</li>
+  <li><strong>New model releases</strong> often need pre-release engine builds; plan to rebuild on the stable release when it arrives.</li>
+</ul>
+<pre>FROM vllm/vllm-openai:v0.X.Y           # pin an exact version (use the digest in production)
+COPY requirements.lock /tmp/
+RUN pip install --no-cache-dir -r /tmp/requirements.lock
+COPY app/ /app/                          # small, changes often: last
+ENV HF_HOME=/models                      # weights mounted here, not baked in
+ENTRYPOINT ["vllm", "serve"]</pre>
+<p><strong>Prebuilt model containers</strong> such as NVIDIA NIM bundle a model, an optimized engine for specific GPUs, an OpenAI-compatible API, metrics and health endpoints. They are quick to adopt and a good reference; custom images give more control over engine versions, kernels and configuration.</p>
+
+<h2 id="weights">2. Getting weights onto the GPU</h2>
+<p>Loading weights is usually the longest part of a cold start for large models: a 70B model in BF16 is 141 GB.</p>
+<div class="tbl"><table>
+<tr><th>Source</th><th>Typical bandwidth</th><th>Notes</th></tr>
+<tr><td>Hugging Face Hub (internet)</td><td>Limited by egress and your network</td><td>Fine for development; slow and rate-limited at scale. Use a token.</td></tr>
+<tr><td>Object storage (S3, GCS) in the same region</td><td>Hundreds of MB/s to several GB/s with parallel streams</td><td>Needs parallel, chunked downloads to be fast.</td></tr>
+<tr><td>Shared network file system or node-local cache</td><td>Several GB/s</td><td>Pre-populated caches near the GPUs are the usual answer at scale.</td></tr>
+<tr><td>Local NVMe on the node</td><td>Several GB/s per drive</td><td>Fastest; requires the weights to already be there.</td></tr>
+</table></div>
+<p>Three tricks shorten loading:</p>
+<ul>
+  <li><strong>Smaller weights:</strong> quantized checkpoints (chapter 4.1) halve or quarter the bytes to move.</li>
+  <li><strong>Streaming straight to the GPU:</strong> loaders that read file chunks in parallel and copy them to GPU memory as they arrive, instead of reading the whole file first (vLLM supports alternative load formats, for example a Run:ai model streamer, for this).</li>
+  <li><strong>Memory-mapped safetensors:</strong> the file is mapped into memory and read only when tensors are used. Note what this means for measurement: "loading" a mapped file looks instant; the real cost appears when bytes are copied to the GPU (Part A of the lab shows this).</li>
+</ul>
+<p>With tensor parallelism each GPU loads only its shard, so loading parallelizes across GPUs if storage can keep up.</p>
+
+<h2 id="coldstart">3. Anatomy of a cold start</h2>
+<p>A cold start is the time from deciding to add a replica to that replica serving traffic. Each stage has its own fix:</p>
+<div class="tbl"><table>
+<tr><th>Stage</th><th>What happens</th><th>How to shorten it</th></tr>
+<tr><td>GPU node procurement</td><td>A node is provisioned or freed and assigned</td><td>Warm node pools; reserved capacity; contract terms on node start time</td></tr>
+<tr><td>Image pull</td><td>Container layers are downloaded and unpacked</td><td>Lean images; layer caching on nodes; registries near the cluster; lazy-loading image formats</td></tr>
+<tr><td>Weight loading</td><td>Weights move from storage to GPU memory</td><td>Local caches, parallel streaming loaders, quantized checkpoints</td></tr>
+<tr><td>Engine start</td><td>Memory profiling, KV cache allocation, <code>torch.compile</code>, CUDA graph capture</td><td>Compile caches (chapter 5.7), fewer graph sizes, prebuilt engines</td></tr>
+<tr><td>Warm-up</td><td>First requests trigger lazy initialization and caching</td><td>Send synthetic warm-up requests before reporting ready</td></tr>
+</table></div>
+<div class="widget" id="csW">
+  <div class="wt">Interactive: a cold-start budget</div>
+  <div class="ws">Estimate each stage and see which dominates. Defaults: Llama 3.1 70B on 4 GPUs from a regional object store. Change the source and precision to see what moves. Assumptions: image pulls at about 0.5 GB/s; engine start 90 s with compilation and graph capture, 20 s with caches; 10 s warm-up; node provisioning about 3 minutes.</div>
+  <div class="ctrls">
+    <label>Model weights (GB) <input type="number" id="csW_" value="141" min="1" style="width:70px"></label>
+    <label>Weight source <select id="csS"><option value="0.1">Internet hub (≈0.1 GB/s)</option><option value="1" selected>Regional object store (≈1 GB/s)</option><option value="5">Node-local NVMe cache (≈5 GB/s)</option></select></label>
+    <label>Image size (GB) <input type="number" id="csI" value="12" min="1" style="width:60px"></label>
+    <label><input type="checkbox" id="csC" checked> compile and capture graphs (no cache)</label>
+    <label><input type="checkbox" id="csN"> node must be provisioned</label>
+  </div>
+  <div class="svgwrap"><svg id="csSvg" viewBox="0 0 680 56" width="680" style="max-width:100%;height:auto" role="img" aria-label="Cold start stages"></svg></div>
+  <div class="stats" id="csStats"></div>
+</div>
+<p>The autoscaler's behaviour depends on this number (chapter 6.3): if adding a replica takes ten minutes, you must scale up ten minutes before you need it, and you cannot afford to scale down eagerly.</p>
+<h3>Avoiding the cold start entirely</h3>
+<ul>
+  <li><strong>Warm pools:</strong> idle replicas already loaded, at the cost of paying for them.</li>
+  <li><strong>Sleep and wake:</strong> some engines can offload weights to CPU memory and free GPU memory while idle, then restore them much faster than a full start (vLLM has a sleep mode for this, used for example in reinforcement learning loops).</li>
+  <li><strong>Snapshots:</strong> checkpointing a started process (CPU and GPU state) and restoring it, which some platforms offer to skip engine start-up.</li>
+</ul>
+
+<h2 id="api">4. The API layer</h2>
+<p>Clients talk to an HTTP API, almost always OpenAI-compatible (<code>/v1/chat/completions</code>, <code>/v1/completions</code>, <code>/v1/embeddings</code>, <code>/v1/models</code>), so the same client SDKs and frameworks work with any backend (chapter 3.1). Around the engine's own server, production stacks add:</p>
+<ul>
+  <li><strong>A gateway</strong> for authentication (API keys, tokens), rate limits and quotas per customer, request size limits, and routing to models and versions.</li>
+  <li><strong>Validation</strong> of prompts against the model's context window and of parameters (max tokens, temperature ranges, structured output schemas) before they reach the GPU.</li>
+  <li><strong>Streaming:</strong> server-sent events over HTTP for token streams; WebSockets or gRPC for bidirectional real-time use such as voice. Long-lived streams need load balancers and timeouts configured for them.</li>
+  <li><strong>Timeouts and cancellation:</strong> when a client disconnects, the engine must stop generating and free its KV cache (chapter 3.3).</li>
+  <li><strong>Asynchronous (batch) endpoints</strong> for work that is not latency-sensitive: the request is accepted at once and the result delivered later by polling or a webhook, which lets the platform schedule it into idle capacity.</li>
+</ul>
+<p>Client-side overhead counts too: establishing a TLS connection costs tens of milliseconds, a real share of a 300 ms latency budget. Reuse connections (the standard SDKs do), and keep clients close to the servers.</p>
+
+<h2 id="health">5. Health checks, readiness and graceful shutdown</h2>
+<ul>
+  <li><strong>Startup and readiness:</strong> report ready only after weights are loaded, graphs captured and a warm-up request succeeded. Until then the load balancer must not send traffic. vLLM exposes <code>/health</code>; NIMs expose separate live and ready endpoints.</li>
+  <li><strong>Liveness:</strong> restart a replica whose engine has crashed or hung. Make liveness checks cheap and tolerant: a replica busy with a long prefill is not dead.</li>
+  <li><strong>Graceful shutdown:</strong> when a replica is removed (scale-down, rollout, node maintenance), first take it out of the load balancer, then let in-flight requests finish, then stop. In Kubernetes: a <code>preStop</code> hook that marks the pod not ready and waits, and a <code>terminationGracePeriodSeconds</code> longer than your p99 request duration. Too short cuts long answers mid-stream; too long slows every rollout.</li>
+</ul>
+<div class="box watch">
+  <span class="lbl">Watch out: long requests and shutdown</span>
+  <p>Reasoning models and long generations can run for minutes. Size drain timeouts from the measured p99 request duration, and decide what happens to requests that exceed it (retry elsewhere, or return a partial result with an error).</p>
+</div>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Compound and multi-model services</span>
+  <p>Many products chain models (speech recognition, an LLM, speech synthesis; or an embedding model, a reranker and an LLM). Package and scale each model as its own service, sized for its own hardware, but keep them in the same cluster: a few tens of milliseconds per hop between regions adds up across a pipeline. Chapter 6.3 covers scaling each component independently.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Reproducible builds for regulated environments</span>
+  <p>Air-gapped and regulated deployments need images and weights built, scanned and signed in advance, with no downloads at start-up. That means mirroring model weights, pinning every artifact by hash, and testing the exact image that ships.</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Unpinned dependencies, so a rebuild silently changes the engine or a kernel.</li>
+  <li>Downloading weights from the internet on every cold start.</li>
+  <li>Reporting ready before warm-up, so the first users pay compilation time.</li>
+  <li>Liveness probes that kill replicas during long prefills.</li>
+  <li>No drain on shutdown, so every deploy cuts off streaming answers.</li>
+  <li>Measuring "load time" of memory-mapped files without touching the data.</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<p><strong>Goal:</strong> measure weight loading honestly, write a deployable image definition, and time a real engine's start-up stages.</p>
+<h3>Part A: load two model sizes (CPU, a minute)</h3>
+<pre>import time, os, glob, torch
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file
+dev = "cuda" if torch.cuda.is_available() else "cpu"
+for mid in ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct"]:
+    path = snapshot_download(mid)                                   # downloads once, then cached
+    files = glob.glob(os.path.join(path, "*.safetensors"))
+    size = sum(os.path.getsize(f) for f in files)
+    t = time.perf_counter()
+    tensors = {}
+    for f in files: tensors.update(load_file(f))                    # memory-mapped: lazy
+    t_map = time.perf_counter() - t
+    t = time.perf_counter()
+    on_dev = {k: v.to(dev, copy=True) for k, v in tensors.items()}  # forces every byte to be read
+    if dev == "cuda": torch.cuda.synchronize()
+    t_read = time.perf_counter() - t
+    print(f"{mid}: {size/1e9:.2f} GB  map {t_map:.2f} s  read+copy {t_read:.2f} s  "
+          f"({size/t_read/1e9:.2f} GB/s)")</pre>
+<details><summary>What we measured, and why</summary><pre class="out">Qwen2.5-0.5B-Instruct: 0.99 GB  map 0.04 s  read+copy 0.47 s  (2.09 GB/s)
+Qwen2.5-1.5B-Instruct: 3.09 GB  map 0.06 s  read+copy 2.20 s  (1.40 GB/s)</pre>
+<p>Mapping is instant for both: no bytes were read. The real cost appears when data is copied, and it scales with size (3.1 times the bytes took about 4.7 times as long here). The first run of <code>snapshot_download</code> (not timed) is the internet download, usually far slower than both. Extrapolate: at 1.4 GB/s, how long would a 141 GB model take, and what would you change?</p></details>
+<h3>Part B: write the deployment definition</h3>
+<p>Write a Dockerfile (based on the official vLLM image, pinned) and a Kubernetes Deployment for Qwen2.5-1.5B-Instruct with: weights from a mounted volume, a startup probe and a readiness probe on <code>/health</code>, a liveness probe with a generous timeout, a <code>preStop</code> hook that waits for draining, and a termination grace period. Justify each timeout with a number (your measured start-up time, your p99 request duration).</p>
+<h3>Part C: time a real cold start (T4)</h3>
+<p>Start <code>vllm serve Qwen/Qwen2.5-1.5B-Instruct</code> with timestamps on the log, after clearing the Hugging Face cache, and split the start-up into: download, weight loading, memory profiling and KV allocation, compilation, CUDA graph capture, and ready. Restart with the cache warm, then with <code>--enforce-eager</code>. Make a table of the three runs and name the biggest lever.</p>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Packaging and start-up in production</span>
+  <ul>
+    <li><strong>Platforms</strong> keep weights in caches close to GPU nodes and stream them in parallel, because weight loading dominates cold starts for large models.</li>
+    <li><strong>Teams ship compile caches</strong> with their images or volumes so new replicas skip <code>torch.compile</code> and engine builds.</li>
+    <li><strong>Gateways</strong> (cloud API gateways, Envoy-based AI gateways, LiteLLM-style proxies) handle authentication, quotas and routing in front of engines.</li>
+    <li><strong>Rollouts</strong> rely on readiness probes and graceful draining to deploy without dropping streams (chapter 6.5).</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz62"></div>
+<script type="application/json" id="qz62">[
+{"q":"Which usually dominates the cold start of a 70B model?","o":["Python import time","Loading weights","Readiness probe interval","DNS"],"a":1,"e":"Hundreds of GB must reach GPU memory."},
+{"q":"Why put application code in the last image layer?","o":["Security","Code changes then rebuild and ship only a small layer","Docker requires it","Smaller weights"],"a":1,"e":"Layers below are reused from cache."},
+{"q":"A replica is loading weights. It should be:","o":["Ready but not live","Live but not ready","Neither","Both"],"a":1,"e":"The process is healthy but cannot take traffic yet."},
+{"q":"terminationGracePeriodSeconds should be set from:","o":["The image size","The p99 request duration plus a buffer","The GPU count","A fixed 5 seconds"],"a":1,"e":"In-flight requests need time to finish during draining."},
+{"q":"Loading a safetensors file takes 0.05 s for 3 GB. Most likely:","o":["The disk is 60 GB/s","The file was memory-mapped and not yet read","Compression","GPU direct storage"],"a":1,"e":"Bytes are read only when tensors are used."},
+{"q":"Which reduces engine start-up time without changing the model?","o":["Bigger images","Compile caches and fewer CUDA graph sizes","More replicas","FP32"],"a":1,"e":"Compilation and capture are reused or shortened."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>Containers freeze a fragile dependency chain; start from official engine images, pin everything, keep images lean, and keep weights separate.</li>
+  <li>Weight loading dominates cold starts for large models; use nearby caches, parallel streaming and quantized checkpoints.</li>
+  <li>Cold start = node + image + weights + engine start + warm-up; shorten each with its own fix, or avoid it with warm pools and sleep modes.</li>
+  <li>An OpenAI-compatible API behind a gateway handles authentication, quotas, validation, streaming, cancellation and async jobs.</li>
+  <li>Readiness after warm-up, tolerant liveness, and graceful draining make deploys and scale-downs invisible to users.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 7.1, 7.2.2 and 7.5</td><td>Containers, dependency management, NIMs, cold-start stages, client overhead, async inference and streaming protocols.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/deployment/docker.html">vLLM: Using Docker</a></td><td>Official images and running vLLM in containers.</td></tr>
+<tr><td><a href="https://docs.nvidia.com/nim/">NVIDIA NIM documentation</a></td><td>Prebuilt model containers with health and metrics endpoints.</td></tr>
+<tr><td><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/">Kubernetes: Pod lifecycle</a> and probes</td><td>Startup, readiness and liveness probes, preStop hooks and termination grace periods.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/design/torch_compile/">vLLM: torch.compile integration</a></td><td>The compile cache that shortens restarts.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, days 22 and 23</td><td>A production Dockerfile, NIM anatomy and a cold-start breakdown.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. Part A was run on CPU with safetensors and PyTorch 2.15.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+function cs(){const W=+$('csW_').value,S=+$('csS').value,I=+$('csI').value;const st=[];
+  if($('csN').checked)st.push(['Node',180,'--mute']);st.push(['Image pull',I/0.5,'--pre']);st.push(['Weights',W/S,'--dec']);
+  st.push(['Engine start',$('csC').checked?90:20,'--kv']);st.push(['Warm-up',10,'--good']);
+  const tot=st.reduce((a,b)=>a+b[1],0);const svg=$('csSvg');svg.innerHTML='';let x=0;
+  st.forEach(s=>{const w=680*s[1]/tot;el('rect',{x,y:10,width:Math.max(w-2,2),height:36,rx:4,fill:css(s[2])},svg);if(w>60)el('text',{x:x+6,y:33,fill:'#fff','font-size':12},svg,s[0]);x+=w;});
+  const f=s=>s<120?Math.round(s)+' s':(s/60).toFixed(1)+' min';
+  $('csStats').innerHTML=[['Total cold start',f(tot)]].concat(st.map(s=>[s[0],f(s[1])])).map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['csW_','csS','csI','csC','csN'].forEach(id=>$(id).addEventListener('input',cs));IE.onTheme(cs);
+})();
+</script>
+
+</body>
+</html>

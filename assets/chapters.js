@@ -256,7 +256,7 @@ window.IE_CHAPTERS = [
 "title": "Packaging, API layer, startup and shutdown",
 "slug": "6-2-packaging-startup",
 "part": 6,
-"ready": false
+"ready": true
 },
 {
 "n": "6.3",
