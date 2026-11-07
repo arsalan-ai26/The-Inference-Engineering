@@ -45,6 +45,7 @@
 </ul>
 <p><strong>Linear attention</strong> arrives at the same place from the attention side. Remove the softmax from attention and the sum Σ v_j k_jᵀ can be kept as a running matrix: a fixed-size state of shape [d_k, d_v] per head. Each new token adds its own outer product. Reading is one matrix-vector product with the query.</p>
 <div class="formula">state_t = decay_t ⊙ state_{t−1} + v_t k_tᵀ        output_t = state_t q_t</div>
+<p>Plain linear attention only ever adds to the state, so old associations pile up and blur. The <strong>delta rule</strong> fixes this: before writing value v_t under key k_t, it first reads what the state currently returns for k_t and writes only the difference, so new information replaces the old along the same key instead of being added on top. <strong>Gated DeltaNet</strong> (NVIDIA and MIT, arXiv 2412.06464) combines this targeted update with a gate that can quickly erase the whole state; the authors describe the two as complementary (gating for fast erasure, the delta rule for precise updates). Qwen3-Next and Kimi Linear (next section) build their linear layers on this idea.</p>
 <div class="box def">
   <span class="lbl">Inference impact</span>
   <p><strong>Memory per sequence is constant</strong>, whatever the context: a few MB per sequence instead of a cache that grows. <strong>Decode cost per token is constant</strong> too: no attention over n past tokens. The price is <strong>recall</strong>: a fixed-size state cannot store every detail of a million tokens, so pure linear models are weaker at exact retrieval ("what was the number on page 3?").</p>
@@ -58,7 +59,9 @@
 <tr><td>Kimi Linear 48B-A3B</td><td>27 layers: 3 Kimi Delta Attention layers, then 1 MLA layer, repeated</td><td>MoE; the paper reports up to 75% less KV cache and up to 6 times decode throughput at 1M context</td></tr>
 <tr><td>NVIDIA Nemotron 3 Nano 30B-A3B</td><td>Mamba-2 layers mixed with a few attention layers</td><td>MoE</td></tr>
 <tr><td>Jamba (AI21)</td><td>Mamba and attention layers interleaved</td><td>MoE; an early large hybrid</td></tr>
+<tr><td>MiniMax-01 and MiniMax-M1 (456B, 45.9B active)</td><td>7 lightning attention (linear) blocks, then 1 softmax attention block, repeated</td><td>MoE with 32 experts; trained to 1M context, extrapolates to 4M at inference (report)</td></tr>
 </table></div>
+<p><strong>MiniMax-01</strong> (arXiv 2501.08313) was the first linear-attention hybrid at frontier scale. Its <strong>lightning attention</strong> is linear attention computed blockwise, so the running state is passed between blocks of tokens rather than token by token, which keeps the hardware busy during training and prefill. <strong>MiniMax-M1</strong> (arXiv 2506.13585) is the same architecture trained for long reasoning. Because each generated token costs constant work in the linear layers, the report states that M1 uses less than 50% of DeepSeek-R1's FLOPs at a generation length of 64K tokens and about 25% at 100K. That is section 5's point in architectural form: when outputs are very long, attention cost per generated token decides the bill.</p>
 <p class="note">Layer patterns read from the models' config.json files on Hugging Face.</p>
 
 <div class="widget" id="hyW">
@@ -76,6 +79,10 @@
   <span class="lbl">Inference impact</span>
   <p>A 3:1 hybrid cuts the KV cache about 4 times and keeps exact recall through its attention layers. Engines must now manage <strong>two kinds of per-sequence memory</strong>: a paged KV cache for the attention layers and a fixed state slot for the linear layers. Two features get harder: <strong>prefix caching</strong> (chapter 4.4), because you cannot slice a recurrent state at an arbitrary earlier token unless you saved a checkpoint there, and <strong>speculative decoding</strong> (chapter 4.3), because rejected tokens have already been folded into the state and must be undone. Engines such as vLLM added a hybrid cache manager for this (chapter 3.3).</p>
 </div>
+
+<h3>Compressing attention instead of replacing it: DeepSeek-V4 and V4.1</h3>
+<p>DeepSeek took the other route: keep softmax attention in every layer, but make what it stores and reads much smaller. <strong>DeepSeek-V4</strong> (arXiv 2606.19348) interleaves two attention types: Compressed Sparse Attention, which merges the KV of every 4 tokens into one entry and lets each query attend to only the top-k entries chosen by a lightning indexer (chapter 4.2), and Heavily Compressed Attention, which merges every 128 tokens into one entry and attends to all of them. Both add a 128-token sliding window. At one million tokens the report puts V4-Pro at 27% of DeepSeek-V3.2's per-token FLOPs and 10% of its KV cache.</p>
+<p><strong>DeepSeek-V4.1-Flash</strong> (arXiv 2609.19969) adds a <strong>causal encoder-decoder</strong>: the lower 20 of its 40 layers form an encoder, and the upper 20 layers take their global KV from the encoder's last hidden state rather than computing their own (an idea the report credits to YOCO). Prefill therefore runs only the encoder over the prompt, and the model activates 8B parameters per token in prefill against 16B in decode. The arithmetic consequence follows from chapter 2.5: prefill costs about 2 × active parameters FLOPs per token, so halving the active parameters halves prefill FLOPs per token (attention aside), which is exactly where agent workloads with long, mostly new inputs spend their money (chapter 6.8). Chapter 4.8 covers both models and the engine that serves them.</p>
 
 <h2 id="diffusion">4. Diffusion language models</h2>
 <p>All models so far generate left to right, one token per pass. A <strong>diffusion language model</strong> generates differently:</p>
@@ -114,6 +121,7 @@
 <ul>
   <li><strong>Parallel sampling.</strong> Generate several answers from one prompt and pick or vote. The prompt's KV cache is shared (chapter 3.3), so this uses batching well.</li>
   <li><strong>Parallel-Distill-Refine.</strong> Generate drafts in parallel, distill them into a short bounded workspace, refine, and repeat. Context stays short, so latency and memory stay bounded while accuracy rises.</li>
+  <li><strong>Thinking budgets in one model.</strong> Qwen3 (arXiv 2505.09388) puts a thinking mode and a non-thinking mode in the same model, switched per request by the chat template, and adds a thinking budget that caps how many reasoning tokens a request may use. GLM-4.5 (arXiv 2508.06471) also offers thinking and direct-response modes. For serving this means one deployment handles both short and very long outputs, so output length (and therefore batch composition and KV growth) is set per request by the caller.</li>
   <li><strong>Recursive language models.</strong> Instead of reading a huge context directly, the model works in a code environment (a Python REPL) holding the data, inspects pieces of it, and calls sub-models on small pieces. One giant request becomes many short ones.</li>
 </ul>
 <div class="box def">
@@ -254,6 +262,10 @@ diffusion_decode(3)</pre>
 <tr><td><a href="https://arxiv.org/abs/2312.00752">Gu and Dao, Mamba: Linear-Time Sequence Modeling with Selective State Spaces</a></td><td>Input-dependent (selective) state-space layers and the hardware-aware scan.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2510.26692">Kimi Team, Kimi Linear</a></td><td>Kimi Delta Attention and a 3:1 hybrid with MLA; reported KV and throughput gains at 1M context.</td></tr>
 <tr><td><a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct">Qwen3-Next-80B-A3B model card and config</a></td><td>The 3:1 Gated DeltaNet hybrid with a very sparse MoE.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2412.06464">Yang, Kautz and Hatamizadeh, Gated Delta Networks</a></td><td>The gated delta rule that Qwen3-Next and Kimi Linear build on.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2501.08313">MiniMax, MiniMax-01</a> and <a href="https://arxiv.org/abs/2506.13585">MiniMax-M1</a></td><td>Lightning attention in a 456B MoE at 1M context; FLOPs against DeepSeek-R1 at long generation lengths.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2606.19348">DeepSeek-V4</a> and <a href="https://arxiv.org/abs/2609.19969">DeepSeek-V4.1-Flash</a></td><td>Compressed and sparse attention at 1M tokens; the causal encoder-decoder with different active parameters in prefill and decode.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2505.09388">Qwen Team, Qwen3 Technical Report</a> and <a href="https://arxiv.org/abs/2508.06471">GLM-4.5</a></td><td>Thinking and non-thinking modes in one model; thinking budgets.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2502.09992">Nie et al., Large Language Diffusion Models (LLaDA)</a></td><td>An 8B masked-diffusion language model and its sampling procedure.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2503.09573">Arriola et al., Block Diffusion</a></td><td>Semi-autoregressive block diffusion that keeps KV caching across blocks.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2510.01123">Rethinking Thinking Tokens: LLMs as Improvement Operators</a></td><td>Kept from triage: Parallel-Distill-Refine, which bounds context while spending more compute.</td></tr>

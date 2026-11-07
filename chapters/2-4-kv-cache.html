@@ -142,6 +142,7 @@
 <tr><td>Qwen3-30B-A3B (MoE)</td><td class="n">48</td><td class="n">4</td><td class="n">128</td><td class="n">98,304</td></tr>
 <tr><td>Llama 3.1 70B</td><td class="n">80</td><td class="n">8</td><td class="n">128</td><td class="n">327,680</td></tr>
 <tr><td>DeepSeek-V3 (MLA, see expert layer)</td><td class="n">61</td><td class="n">n/a</td><td class="n">512 + 64</td><td class="n">70,272</td></tr>
+<tr><td>DeepSeek-V4.1-Flash (CSA2, FP4 KV; reported, not computed)</td><td class="n">40</td><td class="n">n/a</td><td class="n">n/a</td><td class="n">890 global</td></tr>
 </table></div>
 <p class="note">Look at Qwen3-30B-A3B. It has almost 4 times the parameters of Llama 3.1 8B but a smaller cache per token. Cache size depends on layers and KV heads, not on total parameters. Mixture-of-experts (2.6) adds parameters in the MLP blocks, which store nothing in the cache.</p>
 
@@ -278,6 +279,7 @@
 <div class="box expert">
   <span class="lbl">Multi-head latent attention (MLA)</span>
   <p>DeepSeek-V2 and V3 do not store K and V per head. They store one compressed latent vector per token per layer (512 values) plus a small shared RoPE key (64 values). At decode time they project the latent back to keys and values, or fold that projection into the query. For DeepSeek-V3: 61 × (512 + 64) × 2 bytes = 70,272 bytes per token, although the model has 671B parameters. An MHA design at that scale would be many times larger. Note the formula has no "2 ×" for K and V: one latent serves both.</p>
+  <p>Later DeepSeek models went much further. DeepSeek-V4.1-Flash reports 890 bytes of global KV per token (arXiv 2609.19969), about 79 times less than V3 in BF16, from two levers on top of compression along the sequence: layers share one global KV instead of each storing its own (cross-layer reuse), and the main KV is stored in a 4-bit floating-point format. It also keeps a small fixed-size sliding window state per sequence. Chapter 4.8 follows that path generation by generation.</p>
 </div>
 <div class="box expert">
   <span class="lbl">Sliding-window and hybrid attention</span>
@@ -491,6 +493,7 @@ print(per_tok, 2 * qc.num_hidden_layers * qc.num_key_value_heads * head_dim * 2)
 <tr><td><a href="https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices">Databricks: LLM Inference Performance Engineering</a></td><td>TTFT, TPOT and MBU with real measurements. Core for 2.5.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2305.13245">Ainslie et al., GQA</a> and <a href="https://arxiv.org/abs/1911.02150">Shazeer, MQA</a></td><td>The original papers on sharing KV heads.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2405.04434">DeepSeek-V2 paper</a></td><td>Where MLA is introduced, with its cache-size comparison.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2609.19969">DeepSeek-V4.1-Flash report</a></td><td>890 bytes of global KV per token through cross-layer reuse and FP4 KV; per-token KV across DeepSeek generations.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/configuration/engine_args.html">vLLM engine arguments</a></td><td>The current meaning and defaults of the memory settings in section 6.</td></tr>
 <tr><td><a href="https://saisandeshk.github.io/ai-atlas/#/inference">AI Atlas: Inference, KV memory and prefix reuse</a></td><td>Self-tests and traps for this topic, and the table 5-10 note.</td></tr>
 <tr><td>Model configs on Hugging Face (<code>config.json</code> for each model in the table)</td><td>The ground truth for layers, KV heads and head size.</td></tr>

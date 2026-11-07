@@ -78,6 +78,8 @@
 <tr><td>Qwen3-30B-A3B</td><td class="n">30.5 B</td><td class="n">3.3 B</td><td class="n">128, 8</td><td class="n">61 GB</td></tr>
 <tr><td>Qwen3-235B-A22B</td><td class="n">235 B</td><td class="n">22 B</td><td class="n">128, 8</td><td class="n">470 GB</td></tr>
 <tr><td>DeepSeek-V3</td><td class="n">671 B</td><td class="n">37 B</td><td class="n">256 (+1 shared), 8</td><td class="n">1,342 GB (ships in FP8: 671 GB)</td></tr>
+<tr><td>Kimi K2 (reported)</td><td class="n">1 T</td><td class="n">32 B</td><td class="n">not in the abstract</td><td class="n">about 2 TB</td></tr>
+<tr><td>LongCat-Flash (reported)</td><td class="n">560 B</td><td class="n">18.6 to 31.3 B (27 B average)</td><td class="n">varies per token</td><td class="n">about 1.1 TB</td></tr>
 <tr><td>Granite 3.0 1B-A400M</td><td class="n">1.33 B</td><td class="n">about 0.4 B</td><td class="n">32, 8</td><td class="n">2.7 GB</td></tr>
 </table></div>
 <p class="note">Totals and active counts from the model cards and configs.</p>
@@ -148,6 +150,10 @@
 <div class="box expert">
   <span class="lbl">Load balancing without an auxiliary loss</span>
   <p>DeepSeek-V3 balances expert load by adding a per-expert bias to the routing scores, adjusted during training, instead of the usual extra balancing loss. At serving time, DeepSeek also published an expert-parallel load balancer (EPLB) that replicates heavily used experts and places them across GPUs.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Variable compute per token: zero-computation experts</span>
+  <p>Meituan's LongCat-Flash (arXiv 2509.01322, 560B parameters) adds <strong>zero-computation experts</strong>: routing slots that return their input unchanged and cost nothing. When the router sends some of a token's top-k choices there, the token uses fewer real experts, so the model activates between 18.6B and 31.3B parameters per token (27B on average) depending on context. Its second design, <strong>shortcut-connected MoE</strong>, feeds the MoE block from a shortcut connection off the layer's first attention output, so the expert all-to-all can start earlier and run while other computation in the layer proceeds; the report describes this as enlarging the computation-communication overlap window. The authors report over 100 tokens per second per user at $0.70 per million output tokens. For serving, variable active parameters mean a variable cost per token: batches with many "easy" tokens run faster, so throughput depends on the content, and capacity planning (chapter 6.5) should use measured averages, not the maximum.</p>
 </div>
 <div class="box expert">
   <span class="lbl">Expert offloading for local inference</span>
@@ -283,6 +289,8 @@ for label, t in texts.items():
 <tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, chapters 14 to 16</td><td>Expert parallelism, MoE communication and serving MoE models at scale.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI, DeepSeek-V3 Technical Report</a></td><td>Fine-grained and shared experts, auxiliary-loss-free balancing, and the 671B / 37B design.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2401.04088">Jiang et al., Mixtral of Experts</a></td><td>The 8-expert, top-2 design that popularized open MoE models.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2509.01322">Meituan LongCat Team, LongCat-Flash Technical Report</a></td><td>Zero-computation experts (18.6B to 31.3B active of 560B) and shortcut-connected MoE.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2507.20534">Kimi Team, Kimi K2: Open Agentic Intelligence</a></td><td>A 1T-parameter MoE with 32B active, trained with the MuonClip optimizer.</td></tr>
 <tr><td>Model configs on Hugging Face (Qwen3-30B-A3B, DeepSeek-V3, Granite 3.0 1B-A400M)</td><td>The numbers in the worked example and lab.</td></tr>
 </table></div>
 <h3>Notes on sources</h3>
