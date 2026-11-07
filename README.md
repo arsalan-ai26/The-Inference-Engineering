@@ -13,6 +13,9 @@ Read it on GitHub Pages: open `index.html` from the published site.
 ```
 index.html            table of contents
 chapters/<n>-<m>-<slug>.html   one self-contained page per chapter
+guides/               compute guide, glossary and formula sheet
+labs/                 runnable lab code for Part 8 (mini inference engine, tests, benchmarks)
+src/, tools/          chapter sources and the build and glossary scripts
 ```
 
 No build step. Each page is plain HTML, CSS and JavaScript.

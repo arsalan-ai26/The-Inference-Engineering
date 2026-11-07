@@ -84,7 +84,26 @@
 <tr><td>Mean time to failure</td><td class="mono">MTTF = 1 ÷ (nodes × failures per node per unit time)</td><td>A 512-node job at 6.5 per 1,000 node-days: about 7 hours.</td><td><a href="../chapters/6-9-fault-tolerance-security.html">6.9</a></td></tr>
 <tr><td>Error budget</td><td class="mono">allowed failures = (1 − SLO) × requests</td><td>99.9% of 1,000,000 requests: 1,000 failures.</td><td><a href="../chapters/6-6-observability-correctness.html">6.6</a></td></tr>
 </table></div>
-<h2 id="calc">10. Calculator: weights, KV cache and decode floor</h2>
+<h2 id="ft">10. Fine-tuning and post-training (Part 7)</h2><div class="tbl"><table><tr><th>What</th><th>Formula</th><th>Notes</th><th>Chapter</th></tr>
+<tr><td>Full fine-tuning memory</td><td class="mono">≈ 16 × parameters + activations + logits</td><td>BF16 weights and grads, FP32 master copy, two Adam moments.</td><td><a href="../chapters/7-3-lora-qlora.html">7.3</a></td></tr>
+<tr><td>LoRA update</td><td class="mono">W x + (α ÷ r) × B (A x); trainable r × (d + k) per matrix</td><td>B starts at zero, so training starts at the base model.</td><td><a href="../chapters/7-3-lora-qlora.html">7.3</a></td></tr>
+<tr><td>LoRA adapter size (all 7 linear layers)</td><td class="mono">r × layers × (9h + 2·kv + 3f)</td><td>h hidden, kv = KV heads × head size, f MLP width.</td><td><a href="../chapters/7-3-lora-qlora.html">7.3</a></td></tr>
+<tr><td>QLoRA weight memory</td><td class="mono">≈ parameters × (4 + 0.127) ÷ 8 bytes</td><td>NF4 plus double-quantized scales.</td><td><a href="../chapters/7-3-lora-qlora.html">7.3</a></td></tr>
+<tr><td>Activation memory per layer</td><td class="mono">≈ s × b × h × (34 + 5 a s ÷ h) bytes</td><td>Korthikanti et al.; with gradient checkpointing keep about 2 s b h per layer.</td><td><a href="../chapters/7-3-lora-qlora.html">7.3</a></td></tr>
+<tr><td>DPO loss</td><td class="mono">−log σ(β [(log π − log π_ref)(chosen) − (log π − log π_ref)(rejected)])</td><td>Zero margin gives log 2 ≈ 0.693.</td><td><a href="../chapters/7-4-preference-rl.html">7.4</a></td></tr>
+<tr><td>GRPO advantage</td><td class="mono">Â_i = (r_i − mean(r)) ÷ std(r)</td><td>Groups with identical rewards give no signal.</td><td><a href="../chapters/7-4-preference-rl.html">7.4</a></td></tr>
+<tr><td>Overlong penalty (DAPO)</td><td class="mono">0 up to L_max − L_cache; (L_max − L_cache − |y|) ÷ L_cache up to L_max; −1 beyond</td><td>Stops length-based reward hacking.</td><td><a href="../chapters/7-4-preference-rl.html">7.4</a></td></tr>
+<tr><td>On-policy distillation reward</td><td class="mono">−(log p_student − log p_teacher) per student token</td><td>An estimate of negative reverse KL.</td><td><a href="../chapters/7-5-distillation.html">7.5</a></td></tr>
+<tr><td>Evaluation interval</td><td class="mono">p ± 1.96 × √(p (1 − p) ÷ n)</td><td>At 80% accuracy: ±7.8 points at n = 100, ±1.8 at 2,000.</td><td><a href="../chapters/7-6-evaluating-serving-finetuned.html">7.6</a></td></tr>
+<tr><td>Sharded model state per GPU (ZeRO-3, FSDP)</td><td class="mono">≈ 16 × parameters ÷ data-parallel GPUs</td><td>ZeRO-1 shards optimizer state, ZeRO-2 also gradients.</td><td><a href="../chapters/7-7-training-systems.html">7.7</a></td></tr>
+<tr><td>Muon FLOP overhead</td><td class="mono">≤ T × m ÷ B</td><td>T Newton-Schulz steps, m model width, B tokens per batch.</td><td><a href="../chapters/7-7-training-systems.html">7.7</a></td></tr>
+</table></div>
+<h2 id="eng">11. Engines and workloads (Part 8)</h2><div class="tbl"><table><tr><th>What</th><th>Formula</th><th>Notes</th><th>Chapter</th></tr>
+<tr><td>KV per request for long outputs</td><td class="mono">(input + output tokens) × KV bytes per token</td><td>128 KB per token for Llama 3 8B: 16,000 tokens ≈ 2.1 GB.</td><td><a href="../chapters/8-1-specialized-workloads.html">8.1</a></td></tr>
+<tr><td>Slot of token p</td><td class="mono">block_table[p // block_size] × block_size + p % block_size</td><td>Where its keys and values live in the paged cache.</td><td><a href="../chapters/8-3-mini-engine.html">8.3</a></td></tr>
+<tr><td>Decode stall without chunking</td><td class="mono">≈ time of the whole new prefill</td><td>Chunking bounds it to about one chunk's time.</td><td><a href="../chapters/8-4-reproduce-a-paper.html">8.4</a></td></tr>
+</table></div>
+<h2 id="calc">12. Calculator: weights, KV cache and decode floor</h2>
 <div class="widget">
 <div class="wt">Interactive: one dense model on one GPU</div>
 <div class="ws">Defaults are Llama 3.1 8B (32 layers, 8 KV heads, head size 128) on an H100 SXM (80 GB, 3.35 TB/s), matching chapter 2.4 Example C. Memory checks use a 0.92 memory fraction and a 2 GB runtime reserve, as in chapter 2.4. Step time is a lower bound, so real engines are slower.</div>

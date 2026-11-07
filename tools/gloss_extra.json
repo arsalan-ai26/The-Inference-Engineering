@@ -503,5 +503,75 @@
   "Pareto curve (throughput vs interactivity)",
   "An engine's throughput per GPU plotted against tokens per second per user across concurrency levels; a curve above and to the right is better at every operating point.",
   "6.10"
+ ],
+ [
+  "DPO (Direct Preference Optimization)",
+  "Preference tuning on chosen and rejected answer pairs with a classification loss against a frozen reference model; no reward model and no sampling during training.",
+  "7.4"
+ ],
+ [
+  "GRPO (Group Relative Policy Optimization)",
+  "An RL method that samples a group of answers per prompt and uses each answer's reward minus the group mean (divided by the spread) as its advantage, with no value model.",
+  "7.4"
+ ],
+ [
+  "RLHF and RLVR",
+  "RL from human feedback (a reward model trained on human comparisons) and RL with verifiable rewards (automatic checks such as unit tests or exact maths answers).",
+  "7.1"
+ ],
+ [
+  "Reward hacking",
+  "The policy finds outputs that score highly under the reward but are not what was wanted, such as padding answers to earn a length-correlated reward.",
+  "7.4"
+ ],
+ [
+  "Overlong penalty",
+  "A reward term that penalizes answers beyond a length threshold, used to stop RL from inflating answer length.",
+  "7.4"
+ ],
+ [
+  "Catastrophic forgetting",
+  "Loss of skills that are not in the fine-tuning data, such as general instruction following, after training on a narrow task.",
+  "7.2"
+ ],
+ [
+  "NF4 and double quantization",
+  "QLoRA's 4-bit NormalFloat format for normally distributed weights, and the quantization of its block scales to cut their overhead to about 0.127 bits per parameter.",
+  "7.3"
+ ],
+ [
+  "Multi-LoRA serving",
+  "Serving many LoRA adapters on one base model in the same batches, fetching adapters to the GPU as requests need them.",
+  "7.6"
+ ],
+ [
+  "Train-inference mismatch",
+  "Differences between the probabilities a trainer computes and those the inference engine sampled with, from different kernels, templates or precision.",
+  "7.6"
+ ],
+ [
+  "Thinking budget",
+  "A per-request cap on reasoning tokens, after which the engine forces the end of the thinking section.",
+  "8.1"
+ ],
+ [
+  "Generation stall",
+  "A pause in ongoing decodes while a whole new prefill runs in one iteration; chunked prefill removes it.",
+  "8.4"
+ ],
+ [
+  "Muon",
+  "An optimizer for hidden-layer weight matrices that orthogonalizes the momentum update with a few Newton-Schulz iterations.",
+  "7.7"
+ ],
+ [
+  "Evolution strategies (ES)",
+  "Gradient-free optimization that evaluates a population of randomly perturbed models and moves toward the better ones; EGGROLL makes the perturbations low rank.",
+  "7.7"
+ ],
+ [
+  "Slot mapping",
+  "The position of each token's keys and values in a paged KV cache: block table entry p // block size, offset p % block size.",
+  "8.3"
  ]
 ]

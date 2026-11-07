@@ -90,7 +90,7 @@ idx = head('The Inference Engineering Book', '') + f'''
 <div class="legend"><span><b class="t-pre">Prefill</b> is indigo</span><span><b class="t-dec">Decode</b> is amber</span><span><b class="t-kv">KV cache</b> is teal</span><span>The same colours are used in every chapter.</span></div>
 {('<div class="box real"><span class="lbl">Guides</span><ul>' + extra + '</ul></div>') if extra else ''}
 <div class="igrid">{''.join(cards)}</div>
-<p class="note" style="margin-top:40px">Chapters are released as they are written. Facts, defaults and prices carry the date they were checked.</p>
+<p class="note" style="margin-top:40px">All 57 chapters are complete. Facts, defaults and prices carry the date they were checked.</p>
 </div>
 <script src="assets/book.js"></script>
 </body>
