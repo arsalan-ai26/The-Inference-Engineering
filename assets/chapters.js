@@ -186,7 +186,7 @@ window.IE_CHAPTERS = [
 "title": "Long-context and tiered KV systems",
 "slug": "4-7-long-context",
 "part": 4,
-"ready": false
+"ready": true
 },
 {
 "n": "5.1",

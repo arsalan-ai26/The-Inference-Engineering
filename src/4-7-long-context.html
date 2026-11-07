@@ -1,0 +1,242 @@
+<div class="kicker">Part 4 · Model optimization · Chapter 4.7</div>
+<h1>Long-context and tiered KV systems</h1>
+<p class="lede">A request becomes "long context" when its KV cache or its prefill is large enough to cause problems: running out of memory, a TTFT of minutes, or crowding out every other request. Depending on model and hardware that starts somewhere between 32K and 128K tokens, and models now advertise 1M or more. This chapter brings together everything in Part 4 for the long-context case: what long prompts cost, which techniques cut memory, prefill or decode (and which are exact), how tiered KV storage keeps long sessions alive, how to schedule long requests without hurting short ones, and how to check whether a model really uses its context.</p>
+<div class="meta">
+  <span class="chip">Level: expert</span>
+  <span class="chip">Time: 4 hours with the lab</span>
+  <span class="chip">Needs: 2.3, 2.4, 4.2, 4.4, 4.5</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>At 1M tokens, is most of a 7B model's prefill spent in the linear layers or in attention?</li>
+    <li>Name one exact and one approximate way to cut the KV memory of a long sequence.</li>
+    <li>A model passes a needle-in-a-haystack test at 128K tokens. Can it reason over 128K tokens?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Attention, by far (over 90% for Qwen2.5-7B at 1M tokens): its cost grows with the square of the length.</li>
+    <li>Exact: offloading blocks to CPU memory or SSD, or splitting the cache over GPUs. Approximate: KV quantization, eviction (StreamingLLM, H2O, SnapKV) or sparse attention.</li>
+    <li>Not necessarily. Needle tests check retrieval of one unrelated fact. Benchmarks that need multi-step reasoning over the whole context show much shorter effective lengths for most models.</li>
+  </ol></details>
+</div>
+
+<h2 id="cost">1. What a long prompt costs</h2>
+<p>Three costs grow with the context length T, and each hits a different metric:</p>
+<ul>
+  <li><strong>KV memory grows linearly.</strong> KV bytes per token × T (chapter 2.4). One 128K-token sequence of Llama 3.1 8B needs about 17 GB; one 1M-token sequence of Qwen2.5-7B-1M (4 KV heads) needs about 60 GB. This limits how many long requests fit at once.</li>
+  <li><strong>Prefill grows quadratically.</strong> Linear layers cost 2 × parameters per token, but attention costs about 2 × T × width per token per layer (chapter 4.2), so its share rises with T. This sets TTFT. The MInference authors note that an 8B model takes about 30 minutes to prefill 1M tokens on one A100 without special kernels.</li>
+  <li><strong>Decode grows linearly.</strong> Each new token reads the whole KV cache (chapter 2.4). At long contexts the KV read can be larger than the weights, so TPOT rises with T.</li>
+</ul>
+<div class="widget" id="lcW">
+  <div class="wt">Interactive: one long request</div>
+  <div class="ws">BF16 weights and KV, H100s, prefill at 50% of BF16 peak with attention FLOPs included, decode at the bandwidth floor (chapter 2.5). Memory check uses 72 GB per GPU. Idealized; real numbers are higher.</div>
+  <div class="ctrls">
+    <label>Model <select id="lcM"><option value="l8">Llama 3.1 8B (max 128K)</option><option value="q7" selected>Qwen2.5-7B-Instruct-1M (max 1M)</option><option value="l70">Llama 3.1 70B (max 128K)</option></select></label>
+    <label>GPUs <select id="lcG"><option>1</option><option>2</option><option selected>4</option><option>8</option></select></label>
+    <label>Context: <span class="mono" id="lcTv"></span><input type="range" id="lcT" min="12" max="20" step="1" value="17"></label>
+  </div>
+  <div class="stats" id="lcStats"></div>
+  <div class="svgwrap"><svg id="lcSvg" viewBox="0 0 680 90" width="680" style="max-width:100%;height:auto" role="img" aria-label="Share of prefill spent in attention"></svg></div>
+</div>
+
+<h2 id="toolbox">2. The toolbox, sorted by what it saves</h2>
+<p>Most of these were introduced earlier in Part 4. For long contexts it helps to sort them by which cost they cut and whether the output stays exact.</p>
+<div class="tbl"><table>
+<tr><th>Technique</th><th>Cuts</th><th>Exact?</th><th>Where</th></tr>
+<tr><td>Chunked prefill</td><td>Interference: long prefills no longer stall other requests' decode</td><td>Yes</td><td>3.2</td></tr>
+<tr><td>FlashAttention and its relatives</td><td>Prefill memory traffic; activation memory</td><td>Yes</td><td>4.2</td></tr>
+<tr><td>Flash-Decoding (split along keys)</td><td>Decode attention time at small batch</td><td>Yes</td><td>4.2</td></tr>
+<tr><td>Prefix caching</td><td>Repeated prefill of the same long document or history</td><td>Yes</td><td>3.5, 4.4</td></tr>
+<tr><td>KV offload to CPU or SSD</td><td>GPU memory for idle or paused long sessions</td><td>Yes</td><td>4.4</td></tr>
+<tr><td>Tensor, pipeline or context parallelism</td><td>Per-GPU memory; prefill time (CP)</td><td>Yes</td><td>4.5</td></tr>
+<tr><td>Disaggregation</td><td>Interference between long prefills and decode</td><td>Yes</td><td>4.6</td></tr>
+<tr><td>GQA, MLA (model design)</td><td>KV memory and decode bytes</td><td>Built into the model</td><td>4.2</td></tr>
+<tr><td>Sliding windows, local/global layers, hybrids</td><td>KV memory and decode cost</td><td>Built into the model</td><td>2.7, 4.2</td></tr>
+<tr><td>Trained sparse attention (DeepSeek DSA)</td><td>Core attention cost in prefill and decode</td><td>Built into the model</td><td>4.2</td></tr>
+<tr><td>KV quantization (FP8)</td><td>KV memory and decode bytes, by half</td><td>Approximate (usually small loss)</td><td>4.1</td></tr>
+<tr><td>Inference-time sparse prefill (MInference, Qwen's sparse attention)</td><td>Prefill attention cost</td><td>Approximate</td><td>Section 4</td></tr>
+<tr><td>KV eviction (StreamingLLM, H2O, SnapKV)</td><td>KV memory and decode cost</td><td>Approximate</td><td>Section 3</td></tr>
+</table></div>
+<p>A good default order: first apply every exact technique your engine supports, then choose models whose architecture is built for long context, and only then add approximate methods, with evaluation (section 6).</p>
+
+<h2 id="evict">3. Keeping fewer tokens: KV eviction and compression</h2>
+<p>Attention in long contexts is concentrated: most of a query's weight falls on a small set of tokens. Eviction methods keep those and drop the rest.</p>
+<ul>
+  <li><strong>StreamingLLM:</strong> keep a few initial "sink" tokens plus a recent window (chapter 4.2). Stable at any length, but forgets the middle.</li>
+  <li><strong>H2O (heavy hitters):</strong> track the tokens that have received the most attention so far and keep those plus recent tokens. The authors found that a small portion of tokens contributes most of the attention value, and that removing them hurts badly.</li>
+  <li><strong>SnapKV:</strong> before generation starts, look at how the last part of the prompt (an "observation window", usually where the question is) attends to the rest, and keep, per head, the clustered positions it cares about. The paper reports 3.6 times faster generation and 8.2 times better memory efficiency at 16K tokens with comparable accuracy, and up to 380K tokens on one A100 80 GB.</li>
+</ul>
+<div class="box watch">
+  <span class="lbl">Watch out</span>
+  <p>Eviction decides what to forget before knowing what the next question will be. SnapKV-style selection works well when the question is at the end of the prompt; in multi-turn use, a later question may need exactly the tokens that were dropped. Eviction also breaks prefix caching (the cache no longer matches the full prefix). Test on your real conversation patterns.</p>
+</div>
+
+<h2 id="prefill">4. Making long prefills affordable</h2>
+<h3>Spread the prefill</h3>
+<ul>
+  <li><strong>Chunked prefill</strong> processes the prompt in pieces that share steps with other requests' decodes (chapter 3.2), so one 500K-token prompt does not freeze everyone else. It does not reduce total work.</li>
+  <li><strong>Context parallelism</strong> splits the sequence over GPUs. Ring attention passes key and value blocks around a ring of devices while each computes attention for its own queries, overlapping the communication with compute, so the sequence length can grow with the number of devices without approximation. Prefill time drops roughly with the number of GPUs.</li>
+  <li><strong>Pipeline parallelism</strong> with several chunks in flight also cuts long-prefill latency; Qwen's 1M-token inference framework uses it.</li>
+</ul>
+<h3>Skip work in attention</h3>
+<p>Long-context attention maps have structure: some heads attend mostly to the start and the diagonal, others to a few columns, others to blocks. MInference detects a pattern per head offline (it names three: A-shape, vertical-slash and block-sparse), builds sparse indices at run time and computes only those parts. It reports up to 10 times faster prefill on an A100 while keeping accuracy on long-context benchmarks. Qwen2.5-1M's framework combines a similar sparse attention with chunked prefill, reporting 3 to 7 times faster prefill at 1M tokens. These are approximations; models trained with sparse attention (DSA) avoid the train/serve mismatch.</p>
+<h3>Do not prefill twice</h3>
+<p>For long documents that many requests ask about (a codebase, a contract, a manual), the biggest saving is prefix caching: prefill once, keep the KV in a tier (chapter 4.4), and route follow-up questions to it. Hosted APIs expose this as context or prompt caching.</p>
+
+<h2 id="tiers">5. Tiered KV for long sessions</h2>
+<p>Long contexts are usually long <em>sessions</em>: a coding agent over a repository, a chat over a book, a multi-hour support case. Between turns the session's KV cache sits idle in GPU memory, blocking other work. Tiered systems move it out and back:</p>
+<ol>
+  <li>When a turn finishes, the session's blocks stay in GPU memory while there is room.</li>
+  <li>Under pressure, they move to CPU memory (G2), then to SSD (G3) or a shared store (G4), in least-recently-used order.</li>
+  <li>When the user returns, the router sends the request to a replica that can reach the blocks; they are promoted back to GPU memory while the new turn's tokens are prefilled.</li>
+</ol>
+<p>Section 5 of chapter 4.4 showed that reloading from CPU memory is an order of magnitude faster than recomputing; for long contexts the gap is even larger, because recomputation would pay the quadratic attention cost again. Mooncake (Kimi's serving platform) is built around this idea: a cluster-wide KV store over spare CPU memory and SSDs, with a scheduler that places requests by where their KV lives, and early rejection of requests it cannot serve within SLO under overload.</p>
+
+<h2 id="schedule">6. Scheduling and evaluating long requests</h2>
+<h3>Do not let one request starve the rest</h3>
+<ul>
+  <li>Cap the context length per deployment (<code>--max-model-len</code>) to what you can actually serve, not the model's maximum.</li>
+  <li>Use chunked prefill with a budget, and consider separate queues or separate replicas (or disaggregated prefill pools) for very long prompts, so short interactive requests are not stuck behind them.</li>
+  <li>Reserve KV capacity: a few 500K-token sequences can take the whole pool and force preemption of everything else (chapter 3.3).</li>
+  <li>Benchmark with long inputs on purpose; most load tests use short prompts and miss these failures (chapter 6.1).</li>
+</ul>
+<h3>Does the model use its context?</h3>
+<p>Serving 1M tokens is only useful if the model reasons over them. Simple needle-in-a-haystack tests check whether the model can retrieve one unrelated fact; most long-context models pass them. RULER adds multi-needle, tracing and aggregation tasks: of 17 models claiming 32K or more, only about half held up at 32K. Later benchmarks that require reasoning over all the content (for example LongCodeEdit, LoCoDiff, Fiction.LiveBench) find effective context lengths well below the advertised windows for most models. Check your model on tasks shaped like yours before paying to serve long contexts, and remember that approximate techniques (eviction, sparse prefill, KV quantization) can shorten effective context further.</p>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">RoPE scaling at serving time</span>
+  <p>Many models reach their long context with RoPE scaling (chapter 2.3). Some engines apply static scaling for every request, which can slightly hurt short prompts; check whether the model card recommends enabling scaling only when needed, and whether your engine supports dynamic scaling. Qwen's 1M framework also uses a training-free length extrapolation method (dual chunk attention) to go beyond the trained length.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Memory for activations, not only KV</span>
+  <p>Very long prefills also need temporary activation memory proportional to the chunk size times the width (and the MLP's intermediate size). Engines reserve this at startup by profiling a maximum-size batch; a larger prefill chunk or <code>max-num-batched-tokens</code> means a smaller KV pool. Tune the chunk size together with the context cap.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Long context vs retrieval</span>
+  <p>Long context and RAG are not either/or. Retrieval cuts prefill and keeps the model's attention on relevant text; long context avoids retrieval misses. Many production systems retrieve a large, stable working set, keep it in a prefix-cached block, and add the rest per request. The cost model in section 1 is what decides the split.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Setting <code>--max-model-len</code> to the model's full window without checking how many such requests fit.</li>
+  <li>Benchmarking only short prompts and discovering long-prompt behaviour in production.</li>
+  <li>Assuming a needle-in-a-haystack pass means the model reasons over the full context.</li>
+  <li>Adding KV eviction to save memory and then seeing multi-turn quality fall and prefix caching stop working.</li>
+  <li>Recomputing long histories every turn instead of keeping them in a KV tier.</li>
+  <li>Letting very long prompts share a queue with latency-sensitive short requests.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p><strong>Goal:</strong> estimate the cost of a long request, measure how prefill time grows on a real model, and run a small needle test.</p>
+<h3>Part A: one 1M-token request, by hand</h3>
+<p>Qwen2.5-7B-Instruct-1M: 28 layers, 4 KV heads of size 128, width 3,584, about 7.6 billion parameters, BF16. For one 1M-token (1,048,576) prompt compute: KV size; prefill FLOPs (linear plus causal attention); prefill time on 8 H100s at 50% MFU; and the decode step floor on those 8 GPUs at batch 1.</p>
+<details><summary>Answer</summary><p>KV per token: 2 × 28 × 4 × 128 × 2 = 57,344 bytes; for 1M tokens 60 GB. Linear: 2 × 7.6 × 10⁹ × 1.05 × 10⁶ ≈ 1.6 × 10¹⁶. Attention: 28 × 2 × (1.05 × 10⁶)² × 3,584 ≈ 2.2 × 10¹⁷, about 93% of the total. Total about 2.36 × 10¹⁷ FLOPs; at 8 × 989 × 0.5 ≈ 3,956 TFLOP/s: about 60 s. Decode floor: (15.2 GB weights + 60 GB KV) ÷ (8 × 3.35 TB/s) ≈ 2.8 ms per token, if the weights and KV are split evenly. A minute of TTFT is why sparse prefill and caching matter at this length.</p></details>
+<h3>Part B: measure prefill growth (CPU, a few minutes)</h3>
+<pre>import torch, time
+from transformers import AutoModelForCausalLM, AutoTokenizer
+MID = "Qwen/Qwen2.5-0.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(MID)
+model = AutoModelForCausalLM.from_pretrained(MID, dtype=torch.float32).eval()
+for n in [1024, 2048, 4096, 8192]:
+    ids = torch.randint(1000, 20000, (1, n))
+    with torch.no_grad():
+        t = time.time(); model(ids, logits_to_keep=1); dt = time.time() - t
+    print(f"prefill {n} tokens: {dt:.2f} s ({n/dt:.0f} tokens/s)")</pre>
+<p>Predict first: if prefill were purely linear, tokens per second would stay constant. What do you expect, and from what length should the attention term show? (Qwen2.5-0.5B: 24 layers, width 896, about 0.5 billion parameters.)</p>
+<details><summary>What we measured, and why</summary><div id="labB47"><pre class="out">prefill 1024 tokens:  3.74 s (273 tokens/s)
+prefill 2048 tokens:  7.99 s (256 tokens/s)
+prefill 4096 tokens: 19.77 s (207 tokens/s)
+prefill 8192 tokens: 49.88 s (164 tokens/s)</pre>
+<p>Tokens per second fall as the prompt grows: doubling the length more than doubles the time. For this small model, attention is about 2 × 24 × T × 896 FLOPs per token against about 1 GFLOP for the linear layers, so at 8K it is already about a quarter of the math, and on a CPU the attention also moves a lot of memory. On a GPU the same curve appears at longer lengths. Extrapolate: at this rate, what would 128K tokens take?</p></div></details>
+<h3>Part C: a small needle test (CPU, about 10 minutes; faster on a T4)</h3>
+<pre>import random
+random.seed(0)
+filler = ["The committee reviewed the quarterly report and noted steady progress.",
+          "Weather in the region stayed mild for most of the season.",
+          "Several teams shared updates on their ongoing projects.",
+          "The library extended its opening hours during the exam period."]
+def haystack(n_tokens, depth, code):
+    sents, total = [], 0
+    while total &lt; n_tokens:
+        s = random.choice(filler); sents.append(s); total += len(tok(s).input_ids)
+    sents.insert(int(len(sents) * depth), f"The secret access code is {code}.")
+    return " ".join(sents)
+for n in [1000, 4000, 8000]:
+    for depth in [0.1, 0.5, 0.9]:
+        code = str(random.randint(10000, 99999))
+        msgs = [{"role": "user", "content": haystack(n, depth, code) +
+                 "\n\nWhat is the secret access code? Answer with the number only."}]
+        ids = tok.apply_chat_template(msgs, add_generation_prompt=True,
+                                      return_tensors="pt", return_dict=True)["input_ids"]
+        with torch.no_grad():
+            out = model.generate(ids, max_new_tokens=8, do_sample=False)
+        ans = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
+        print(n, depth, "found" if code in ans else "missed", repr(ans.strip()), code)</pre>
+<details><summary>What we measured, and why</summary><div id="labC47"><p>All nine found: 1K, 4K and 8K tokens with the code at 10%, 50% and 90% depth. Even a 0.5B model retrieves a single unrelated fact. That is the point of section 6: a pass on this test says little about reasoning over the whole context. The harder variants in "Extend it" are where small models, and many large ones, start to fail.</p></div></details>
+<p><strong>Extend it:</strong> make the task harder in the RULER style. Insert three codes for three different teams and ask for the code of the team mentioned second; or ask for the sum of two codes. Watch accuracy fall long before the context limit.</p>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Long context in production</span>
+  <ul>
+    <li><strong>Coding agents and document products</strong> keep long working sets in prefix-cached, tiered KV, and route returning sessions to where their cache lives.</li>
+    <li><strong>Providers</strong> cap context length per deployment and price long-context and cached tokens separately.</li>
+    <li><strong>Model makers</strong> increasingly build long context into the architecture (MLA, hybrids, trained sparse attention) because inference-time approximations alone cost quality.</li>
+    <li><strong>Kimi's Mooncake</strong> and similar systems make the KV cache, not the GPU, the central resource the scheduler manages.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz47"></div>
+<script type="application/json" id="qz47">[
+{"q":"Which cost of a long prompt grows quadratically with its length?","o":["KV memory","Prefill attention compute","Weight memory","Decode per token"],"a":1,"e":"Every token attends to every earlier token during prefill."},
+{"q":"Which technique keeps the output exact?","o":["SnapKV","H2O","KV offload to CPU memory","MInference"],"a":2,"e":"Offloading moves the same bytes; the others drop or skip work."},
+{"q":"What does context parallelism split?","o":["The weights","The experts","The sequence, across GPUs","The batch"],"a":2,"e":"Ring attention passes K and V blocks between GPUs holding different parts of the sequence."},
+{"q":"Why can KV eviction hurt multi-turn use?","o":["It slows prefill","Tokens dropped for one question may be needed for a later one","It increases memory","It changes the tokenizer"],"a":1,"e":"Eviction decides what to forget before knowing future questions."},
+{"q":"RULER found that of models claiming 32K+ context:","o":["All held up at 32K","Only about half held up at 32K","None worked","All worked to 1M"],"a":1,"e":"Needle tests overstate effective context."},
+{"q":"A user returns to a 200K-token session after an hour. Best path?","o":["Recompute everything","Reload the session's KV from a CPU or SSD tier on a replica that can reach it","Drop the history","Use a bigger batch"],"a":1,"e":"Reloading beats recomputing, especially with quadratic prefill."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Long contexts cost linear KV memory, quadratic prefill and linear decode growth; each hits a different metric.</li>
+  <li>Apply exact techniques first (chunked prefill, FlashAttention, prefix caching, offload, parallelism, disaggregation), then long-context architectures, then approximations with evaluation.</li>
+  <li>Eviction (StreamingLLM, H2O, SnapKV) and sparse prefill (MInference) save a lot but can lose information.</li>
+  <li>Tiered KV keeps long sessions alive cheaply; reloading beats recomputing.</li>
+  <li>Cap context per deployment, isolate very long requests, and benchmark with long inputs.</li>
+  <li>Effective context is often much shorter than advertised; test on tasks like yours.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 5.3.4</td><td>Defining long context by its effects, and the general techniques that address it.</td></tr>
+<tr><td><a href="https://nrehiew.github.io/blog/long_context/">nrehiew: Evaluating long context (reasoning) ability</a></td><td>Why retrieval benchmarks overstate usable context, and what a good long-context benchmark needs.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2404.06654">Hsieh et al., RULER</a></td><td>Synthetic tasks beyond needles; half the models fall short at 32K.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2310.01889">Liu et al., Ring Attention</a></td><td>Exact attention over sequences split across devices.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2407.02490">Jiang et al., MInference</a></td><td>Dynamic sparse prefill with per-head patterns.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2501.15383">Qwen2.5-1M technical report</a></td><td>A 1M-token model and its inference framework: sparse attention, chunked prefill, pipeline parallelism.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2306.14048">Zhang et al., H2O</a> and <a href="https://arxiv.org/abs/2404.14469">Li et al., SnapKV</a></td><td>Two KV eviction policies.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2309.17453">Xiao et al., StreamingLLM</a></td><td>Attention sinks and windowed caches.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2407.00079">Mooncake</a></td><td>A KV-cache-centric architecture with tiered storage and overload handling.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. Lab Parts B and C were run on a 2-core CPU with PyTorch 2.15 and Transformers 5.22.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+const M={l8:{n:'Llama 3.1 8B',P:8.03e9,L:32,kvh:8,w:4096,max:131072},q7:{n:'Qwen2.5-7B-1M',P:7.6e9,L:28,kvh:4,w:3584,max:1048576},l70:{n:'Llama 3.1 70B',P:70.6e9,L:80,kvh:8,w:8192,max:131072}};
+function lc(){const m=M[$('lcM').value],G=+$('lcG').value,T=2**+$('lcT').value;$('lcTv').textContent=IE.tok(T);
+  const kvt=2*m.L*m.kvh*128*2,kv=kvt*T,W=m.P*2;const lin=2*m.P*T,att=m.L*2*T*T*m.w,pre=(lin+att)/(G*989e12*0.5);
+  const dec=(W+kv)/(G*3.35e12);const fit=Math.floor((G*72e9-W)/kv);
+  const over=T>m.max?' (beyond the model’s window)':'';
+  $('lcStats').innerHTML=[['KV cache, this sequence',IE.gb(kv)+' GB'+over],['Prefill (TTFT floor)',pre<1?(pre*1e3).toFixed(0)+' ms':pre<120?pre.toFixed(1)+' s':(pre/60).toFixed(1)+' min'],['Decode step floor, batch 1',(dec*1e3).toFixed(1)+' ms'],['Such sequences that fit',fit>0?fit:'none']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');
+  const f=att/(lin+att);const svg=$('lcSvg');svg.innerHTML='';
+  el('rect',{x:0,y:10,width:680*(1-f),height:34,fill:css('--pre')},svg);el('rect',{x:680*(1-f),y:10,width:680*f,height:34,fill:css('--dec')},svg);
+  el('text',{x:0,y:66,fill:css('--ink2'),'font-size':12},svg,`Prefill FLOPs: linear layers ${Math.round((1-f)*100)}% (indigo), attention ${Math.round(f*100)}% (amber)`);}
+['lcM','lcG','lcT'].forEach(id=>$(id).addEventListener('input',lc));IE.onTheme(lc);
+})();
+</script>
