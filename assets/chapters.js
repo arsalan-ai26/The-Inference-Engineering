@@ -193,7 +193,7 @@ window.IE_CHAPTERS = [
 "title": "Compute, memory and overhead",
 "slug": "5-1-compute-memory-overhead",
 "part": 5,
-"ready": false
+"ready": true
 },
 {
 "n": "5.2",

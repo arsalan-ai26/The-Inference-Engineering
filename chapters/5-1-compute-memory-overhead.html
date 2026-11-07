@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>5.1 Compute, memory and overhead</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="5.1">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 5 · Chapter 5.1</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 5 · GPUs, hardware and kernels · Chapter 5.1</div>
+<h1>Compute, memory and overhead</h1>
+<p class="lede">Every millisecond a model spends on a GPU goes to one of three places: doing math, moving data, or waiting while the CPU decides what to do next. Knowing which one dominates tells you which optimizations can help and which are a waste of time. This chapter gives you a mental model for the three regimes, simple tests to tell them apart, and the measurements to prove it, so the rest of Part 5 (GPU architecture, kernels, profiling, compilation) has a clear purpose.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 1.4, 2.5</span>
+  <span class="chip">Compute: Colab CPU, then T4</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>An element-wise <code>x * 2</code> on a large tensor: compute-, memory- or overhead-bound?</li>
+    <li>A decode step of a 125M-parameter model at batch 1 takes ten times longer than its bytes ÷ bandwidth. What is the likely cause?</li>
+    <li><code>nvidia-smi</code> reports 100% GPU utilization. Is the GPU doing as much math as it can?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Memory-bound: one multiply per element read and written.</li>
+    <li>Overhead: Python and kernel launches. The GPU finishes each tiny kernel faster than the CPU can launch the next one.</li>
+    <li>No. That number only means some kernel was running at every sampled moment. A single small kernel using a fraction of the SMs counts as 100%.</li>
+  </ol></details>
+</div>
+
+<h2 id="three">1. Three places time goes</h2>
+<p>A useful picture: the GPU is a factory. It needs instructions (from the CPU), materials (data from memory) and machines (math units). Time is lost if any of the three cannot keep up.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Compute-bound:</strong> the math units are the bottleneck. Time ≈ FLOPs ÷ achievable FLOP/s. Faster math (more tensor cores, lower precision) helps; nothing else does.</p>
+  <p><strong>Memory-bound (bandwidth-bound):</strong> moving bytes between GPU memory (HBM) and the chip is the bottleneck. Time ≈ bytes ÷ bandwidth. Fewer bytes (fusion, quantization, batching) or more bandwidth helps.</p>
+  <p><strong>Overhead-bound:</strong> the GPU waits for work. Time goes to the Python interpreter, framework dispatch, kernel launches, or the CPU waiting for a result from the GPU. Fewer, larger kernels (fusion, CUDA graphs, compilation) and less CPU work help.</p>
+</div>
+<p>Chapter 2.5 gave the first two a precise form with the roofline. This chapter adds the third, which is invisible on a roofline but common in inference, and turns the model into a diagnostic habit.</p>
+
+<h2 id="compute">2. Compute: tensor cores do almost all the math</h2>
+<p>A GPU's headline FLOP/s come from its tensor cores, which only do matrix multiplies. Everything else (adds, activations, softmax, normalization) runs on the general CUDA cores, which are far slower:</p>
+<div class="tbl"><table>
+<tr><th>GPU</th><th class="n">Tensor core BF16/FP16 (dense)</th><th class="n">CUDA core FP32</th><th class="n">HBM bandwidth</th><th class="n">FLOPs per byte (BF16)</th></tr>
+<tr><td>T4</td><td class="n">65 TFLOP/s</td><td class="n">8.1 TFLOP/s</td><td class="n">320 GB/s</td><td class="n">about 200</td></tr>
+<tr><td>A100 SXM 80 GB</td><td class="n">312 TFLOP/s</td><td class="n">19.5 TFLOP/s</td><td class="n">2.0 TB/s</td><td class="n">about 150</td></tr>
+<tr><td>H100 SXM</td><td class="n">989 TFLOP/s</td><td class="n">67 TFLOP/s</td><td class="n">3.35 TB/s</td><td class="n">about 295</td></tr>
+<tr><td>B200</td><td class="n">about 2,250 TFLOP/s</td><td class="n">about 80 TFLOP/s</td><td class="n">about 8 TB/s</td><td class="n">about 280</td></tr>
+</table></div>
+<p class="note">Vendor dense figures; CUDA-core FP32 counts a fused multiply-add as 2 FLOPs. The last column is the ops:byte ratio of chapter 2.5.</p>
+<p>Two consequences. First, non-matmul operations are a tiny share of the FLOPs but can be a large share of the time: in one BERT analysis, normalization and element-wise ops were 0.2% of the FLOPs, yet achieved hundreds of times lower FLOP/s than the matmuls. They are memory-bound, not math-bound. Second, a workload is only truly compute-bound when its matmuls are large enough to keep the tensor cores fed (chapter 2.5: in decode, a batch of roughly 300 tokens on an H100 for BF16 weights).</p>
+
+<h2 id="memory">3. Memory: every kernel pays to read and write</h2>
+<p>Each GPU kernel reads its inputs from HBM and writes its outputs back. For an element-wise operation that is 2 bytes in and 2 bytes out per BF16 element for one FLOP: an intensity of about 0.25 FLOPs per byte, a thousand times below an H100's ops:byte ratio. Such operations run at the speed of memory, and the math is free.</p>
+<p>That gives the most important fact about memory-bound code: <strong>extra math inside a memory-bound kernel costs almost nothing</strong>. A fused kernel that computes <code>cos(cos(x))</code> takes about the same time as one that computes <code>cos(x)</code>, because both read and write the tensor once. In Horace He's measurements on an A100, a fused element-wise kernel's runtime did not rise noticeably until it did about 64 operations per element; only then did it become compute-bound. This is why fusion (chapter 5.4) is the most important optimization in deep learning compilers, and why GELU costs about the same as ReLU in practice.</p>
+
+<h2 id="overhead">4. Overhead: when the GPU waits for the CPU</h2>
+<p>The CPU runs the Python program, PyTorch's dispatcher and the engine's scheduler, and launches each kernel. Normally it runs <em>ahead</em> of the GPU: it queues kernels faster than the GPU finishes them, so the GPU always has work. When the kernels are tiny, the GPU finishes each one before the CPU has queued the next, and it sits idle between them.</p>
+<ul>
+  <li><strong>Python and framework dispatch.</strong> Python does tens of millions of simple operations per second; an A100 does hundreds of trillions of FLOPs per second. In the same measurements, PyTorch reached only about 280,000 tiny operations per second. Each operation costs microseconds of CPU time before the GPU sees it.</li>
+  <li><strong>Kernel launches.</strong> Launching a kernel costs on the order of microseconds. A decode step of an 8B model has hundreds of kernels; at batch 1 on a B200 its memory floor is about a millisecond (chapter 2.5), so a few hundred microseconds of launches is a large share.</li>
+  <li><strong>CPU-GPU synchronization.</strong> Any operation that needs a GPU value on the CPU (<code>.item()</code>, <code>print(tensor)</code>, moving a tensor to the CPU, or a shape that depends on GPU data, such as boolean indexing) makes the CPU wait for the GPU to finish everything queued. Then the GPU waits for the CPU to queue new work. Chapter 5.3 shows how to find these.</li>
+</ul>
+<div class="box watch">
+  <span class="lbl">Watch out: "GPU utilization"</span>
+  <p>The utilization shown by <code>nvidia-smi</code> is the fraction of time at least one kernel was running. It cannot tell a single tiny kernel on 2 of 132 SMs from a full-chip matmul. Low utilization proves there is overhead; high utilization proves nothing about efficiency. Use achieved FLOP/s (MFU) and achieved bandwidth (MBU) from chapter 2.5 instead, or the profiler of chapter 5.6.</p>
+</div>
+
+<h2 id="tell">5. How to tell which regime you are in</h2>
+<div class="tbl"><table>
+<tr><th>Test</th><th>Compute-bound</th><th>Memory-bound</th><th>Overhead-bound</th></tr>
+<tr><td>Achieved FLOP/s vs peak</td><td>Close to peak</td><td>Far below</td><td>Far below</td></tr>
+<tr><td>Achieved bandwidth vs peak</td><td>Below</td><td>Close to peak</td><td>Far below</td></tr>
+<tr><td>Double the work per call (batch or size)</td><td>Time doubles</td><td>Time roughly doubles</td><td>Time barely changes</td></tr>
+<tr><td>Add more math per byte (fused)</td><td>Slower</td><td>No change</td><td>No change</td></tr>
+<tr><td>Profiler timeline</td><td>Long, dense GEMM kernels</td><td>Many element-wise or attention kernels at high bandwidth</td><td>Gaps between kernels; CPU busy</td></tr>
+</table></div>
+<p>The "double the work" test is the quickest: if doubling the batch costs almost nothing, you were paying overhead (or memory reads that the extra work shares, such as weights in decode).</p>
+
+<div class="widget" id="rgW">
+  <div class="wt">Interactive: predict the regime of one operation</div>
+  <div class="ws">Time is estimated as the larger of math time and memory time, plus a fixed launch overhead of a few microseconds. Pick an operation, a size and a GPU, and see which term wins. Idealized peaks: real kernels reach less.</div>
+  <div class="ctrls">
+    <label>Operation <select id="rgO"><option value="ew">element-wise x * 2</option><option value="mm" selected>matmul [M, 4096] @ [4096, 4096]</option><option value="sm">softmax over rows of [M, 4096]</option></select></label>
+    <label>M (rows or tokens): <span class="mono" id="rgMv"></span><input type="range" id="rgM" min="0" max="16" step="1" value="0"></label>
+    <label>GPU <select id="rgG"><option value="t4">T4</option><option value="a100">A100</option><option value="h100" selected>H100</option></select></label>
+    <label>Launch overhead (µs) <input type="number" id="rgL" value="5" min="1" max="30" style="width:60px"></label>
+  </div>
+  <div class="svgwrap"><svg id="rgSvg" viewBox="0 0 680 160" width="680" style="max-width:100%;height:auto" role="img" aria-label="Math time, memory time and overhead for one operation"></svg></div>
+  <div class="ws" id="rgNote"></div>
+</div>
+<p>Slide M for the matmul. At M = 1 (decode at batch 1) it is overhead- and memory-bound; around M = 300 on an H100 the math catches up; above that it is compute-bound. The element-wise op is memory-bound at every size except tiny ones, where launch overhead dominates.</p>
+
+<h2 id="inference">6. The three regimes in LLM inference</h2>
+<div class="tbl"><table>
+<tr><th>Part of inference</th><th>Usual regime</th><th>What helps</th><th>Chapter</th></tr>
+<tr><td>Prefill of long prompts</td><td>Compute</td><td>Lower precision (FP8), efficient attention kernels, more GPUs</td><td>4.1, 4.2</td></tr>
+<tr><td>Decode at small and medium batch</td><td>Memory (weights, then KV)</td><td>Batching, quantization, GQA/MLA, speculative decoding</td><td>3.2, 4.1, 4.3</td></tr>
+<tr><td>Decode of small models, or small batches on fast GPUs</td><td>Overhead</td><td>CUDA graphs, compilation, fused kernels, an engine instead of a Python loop</td><td>5.7</td></tr>
+<tr><td>Normalization, activations, rotary embedding, sampling</td><td>Memory (and overhead)</td><td>Kernel fusion</td><td>5.4</td></tr>
+<tr><td>Scheduling, tokenization, detokenization, HTTP</td><td>CPU overhead</td><td>Overlapping CPU work with GPU work, multiple processes</td><td>3.4</td></tr>
+</table></div>
+<p>A real decode step contains all three: large matmuls (memory-bound at small batch), dozens of small element-wise kernels (memory-bound and launch-heavy), and CPU work between steps. Profiling (chapter 5.6) shows how the time splits.</p>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Why compute keeps outrunning memory</span>
+  <p>FLOP/s have grown much faster than memory bandwidth for decades, on CPUs and GPUs alike. Each generation therefore needs more math per byte to stay compute-bound: the H100's ratio is about 295 FLOPs per byte in BF16 and twice that in FP8. Inference, especially decode, sits ever more firmly in the memory-bound regime, which is why so much of Part 4 is about moving fewer bytes.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Wave quantization and tile effects</span>
+  <p>A matmul is split into tiles, and tiles are spread over the SMs in "waves". If a matmul produces 133 tiles on a 132-SM H100, the 133rd runs alone in a second wave, nearly doubling the time. Shapes that are multiples of the tile size and SM count run efficiently; odd shapes waste capacity. This is one reason engines pad batches and why kernel libraries pick different tile sizes per shape (chapter 5.4).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Memory-bound does not mean "at peak bandwidth"</span>
+  <p>A kernel can be memory-bound and still far from peak bandwidth, because of small or scattered accesses, too few threads in flight to hide latency, or poor use of caches. "Memory-bound" says what limits it; achieved bandwidth says how well it uses that limit.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Buying a GPU with more FLOP/s to speed up a memory-bound decode workload.</li>
+  <li>Reading <code>nvidia-smi</code> utilization as efficiency.</li>
+  <li>Timing GPU code without <code>torch.cuda.synchronize()</code>: you measure how fast the CPU queues kernels, not how fast they run.</li>
+  <li>Optimizing the math of an element-wise kernel instead of fusing it with its neighbours.</li>
+  <li>Benchmarking a small model in a Python loop and blaming the GPU.</li>
+  <li>Adding <code>.item()</code> or <code>print()</code> of a GPU tensor inside a decode loop.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p><strong>Goal:</strong> measure all three regimes on one device and classify each result.</p>
+<h3>Part A: one script, three regimes (CPU first, then T4)</h3>
+<pre>import torch, time
+dev = "cuda" if torch.cuda.is_available() else "cpu"
+dt = torch.float16 if dev == "cuda" else torch.float32
+def sync():
+    if dev == "cuda": torch.cuda.synchronize()       # wait for queued GPU work
+def bench(fn, reps=20):
+    fn(); sync()                                      # warm up
+    t = time.perf_counter()
+    for _ in range(reps): fn()
+    sync()
+    return (time.perf_counter() - t) / reps
+
+print("1. element-wise multiply")
+for n in [2**10, 2**14, 2**18, 2**22, 2**24]:
+    x = torch.randn(n, device=dev, dtype=dt)
+    s = bench(lambda: x * 2)
+    print(f"n={n:>10,} {s*1e6:9.1f} us  {2*n*x.element_size()/s/1e9:8.1f} GB/s")
+
+print("2. square matmul")
+for m in [16, 64, 256, 1024, 2048]:
+    a = torch.randn(m, m, device=dev, dtype=dt); b = torch.randn(m, m, device=dev, dtype=dt)
+    s = bench(lambda: a @ b)
+    print(f"{m}x{m} {s*1e6:9.1f} us  {2*m**3/s/1e12:8.3f} TFLOP/s")
+
+print("3. fifty tiny ops")
+x = torch.randn(1024, device=dev, dtype=dt)
+def many():
+    y = x
+    for _ in range(50): y = y * 1.0001
+    return y
+s = bench(many)
+print(f"{s*1e6:.1f} us total, {s/50*1e6:.2f} us per op")</pre>
+<p>Before running on the T4, predict: the peak GB/s you will see in test 1 (the T4's HBM is 320 GB/s), the size at which it is reached, the best TFLOP/s in test 2 (FP16 peak 65), and the time per tiny op in test 3.</p>
+<details><summary>What we measured on CPU, and what to expect on a T4</summary><p>On a 2-core CPU: element-wise reached about 71 GB/s at 256K elements (fitting in cache) and fell to 6 to 40 GB/s for larger tensors (main memory); matmul reached about 0.28 TFLOP/s from 256×256 up; tiny ops cost about 3.2 µs each. On a T4 expect the same shapes with different numbers: element-wise time stays flat (overhead-bound) until roughly a million elements, then approaches the HBM bandwidth; matmul TFLOP/s rise steadily with size and approach the tensor-core peak only for the largest shapes; tiny ops cost several microseconds each, set by launch and dispatch, not by the GPU's speed. Record your own numbers in a table with your classification for each row.</p></details>
+<h3>Part B: the "double the work" test on a model</h3>
+<p>On a T4, time one forward pass of GPT-2 small (chapter 2.4, Part E) at batch 1, 2, 4, 8, 16 and 32 with one token each (decode shape). Plot time against batch. Where is the curve flat, and what does that say about the regime? Then repeat with Qwen2.5-1.5B in FP16. Explain the difference with sections 3 and 4.</p>
+<details><summary>What to look for</summary><p>For GPT-2 small the time is nearly flat across all these batches: each step is dominated by launch and Python overhead, so extra rows are almost free. For the larger model the time starts flat (memory-bound: all batches share one read of the weights) and rises once the math or the KV reads catch up. The flat region is where batching is free throughput.</p></details>
+<h3>Part C: the utilization trap</h3>
+<p>Run the "fifty tiny ops" loop for ten seconds while watching <code>nvidia-smi --query-gpu=utilization.gpu --format=csv -l 1</code> in another terminal. Then run a 4096×4096 matmul loop. Compare the reported utilization with the achieved TFLOP/s of each. Write one sentence on why utilization misleads.</p>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Where teams find their time</span>
+  <ul>
+    <li><strong>Engine developers</strong> profile decode steps and routinely find host overhead; Modal reported cutting about 20 kernel launches to 3 with the PyTorch compiler, removing about 30 µs per step and 20% of mean end-to-end latency in one case.</li>
+    <li><strong>Small-model services</strong> (embeddings, classifiers, small chat models) are often overhead-bound and gain most from CUDA graphs and compilation.</li>
+    <li><strong>Large-model decode</strong> is memory-bound, which is why bandwidth-rich GPUs (H200, B200) and quantization pay off directly.</li>
+    <li><strong>Prefill-heavy services</strong> are compute-bound and gain from FP8 and FlashAttention generations.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz51"></div>
+<script type="application/json" id="qz51">[
+{"q":"A fused kernel computes three element-wise functions instead of one. Its runtime:","o":["Triples","Stays about the same: it is memory-bound","Halves","Becomes overhead-bound"],"a":1,"e":"It still reads and writes the tensor once; the extra math is hidden."},
+{"q":"Doubling the batch barely changes a step's time. The step was:","o":["Compute-bound","Overhead-bound or sharing a fixed memory read","Broken","FP8"],"a":1,"e":"Extra rows were nearly free, so the math was not the limit."},
+{"q":"Which triggers a CPU-GPU synchronization?","o":["x * 2","x.item()","x @ y","torch.relu(x)"],"a":1,"e":"The CPU must wait for the GPU to produce the value."},
+{"q":"Why can an H100 be memory-bound on a matmul?","o":["Matmuls never are","At small M the FLOPs per byte are far below about 295","Tensor cores are slow","HBM is fast"],"a":1,"e":"Decode-shaped matmuls read the whole weight matrix for a few rows."},
+{"q":"What does 100% in nvidia-smi utilization mean?","o":["All SMs fully busy","Some kernel was running at every sample","Peak FLOP/s","Peak bandwidth"],"a":1,"e":"It is a time fraction, not an efficiency measure."},
+{"q":"Fix for an overhead-bound decode loop of a small model:","o":["A GPU with more FLOP/s","CUDA graphs or compilation to cut launches and Python work","More HBM","FP32"],"a":1,"e":"The GPU is idle between kernels; remove the gaps."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Time goes to compute, memory movement or overhead; find the dominant one before optimizing.</li>
+  <li>Tensor cores provide almost all FLOP/s; everything else is slow per FLOP but usually memory-bound anyway.</li>
+  <li>In memory-bound kernels extra math is free, which is why fusion matters so much.</li>
+  <li>Overhead (Python, dispatch, launches, synchronizations) leaves the GPU idle; it dominates small models and small batches.</li>
+  <li>Diagnose with achieved FLOP/s and bandwidth, the "double the work" test and a profiler, not with nvidia-smi utilization.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://horace.io/brrr_intro.html">Horace He: Making deep learning go brrrr from first principles</a></td><td>The three regimes, the factory analogy, the fused-kernel intensity experiment and overhead measurements.</td></tr>
+<tr><td><a href="https://hackbot.dad/writing/intro-to-gpus/">hackbot.dad: An introduction to GPUs</a></td><td>A gentle introduction to how GPUs execute work.</td></tr>
+<tr><td><a href="https://modal.com/blog/host-overhead-inference-efficiency">Modal: Host overhead and inference efficiency</a></td><td>GPU kernel utilization, synchronizations and launches in production engines, with fixes.</td></tr>
+<tr><td><a href="https://jax-ml.github.io/scaling-book/gpus/">How to Scale Your Model: GPUs</a></td><td>Tensor core vs CUDA core FLOP/s and the matmul intensity of H100 and B200.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 2.4 and 3.1</td><td>Bottlenecks by phase and how to read GPU spec sheets.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em></td><td>Performance analysis across GPU, CPU and system bottlenecks.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. Part A was run on CPU with PyTorch 2.15; T4 expectations are from its specifications.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+const G={t4:{n:'T4',tc:65e12,cc:8.1e12,bw:320e9},a100:{n:'A100',tc:312e12,cc:19.5e12,bw:2.0e12},h100:{n:'H100',tc:989e12,cc:67e12,bw:3.35e12}};
+function rg(){const o=$('rgO').value,M=2**+$('rgM').value,g=G[$('rgG').value],L=+$('rgL').value*1e-6;$('rgMv').textContent=IE.int(M);
+  let fl,by,name;const K=4096;
+  if(o==='ew'){const n=M*K;fl=n;by=4*n;fl=fl/g.cc;name=`${IE.int(M*K)} elements`;}
+  else if(o==='mm'){fl=2*M*K*K/g.tc;by=2*(M*K+K*K+M*K);name=`[${IE.int(M)}, 4096] @ [4096, 4096]`;}
+  else{const n=M*K;fl=5*n/g.cc;by=4*n;name=`${IE.int(M)} rows of 4,096`;}
+  const mem=by/g.bw;const rows=[['Math',fl,'--pre'],['Memory',mem,'--kv'],['Launch overhead',L,'--dec']];
+  const svg=$('rgSvg');svg.innerHTML='';const mx=Math.max(fl,mem,L);
+  rows.forEach((r,i)=>{const y=10+i*46;el('text',{x:0,y:y+20,fill:css('--ink'),'font-size':13},svg,r[0]);
+    const w=330*r[1]/mx;el('rect',{x:130,y,width:Math.max(w,2),height:28,rx:4,fill:css(r[2])},svg);
+    el('text',{x:136+w,y:y+19,fill:css('--ink'),'font-size':12},svg,r[1]<1e-3?(r[1]*1e6).toFixed(r[1]<1e-5?2:1)+' µs':(r[1]*1e3).toFixed(2)+' ms');});
+  const reg=L>Math.max(fl,mem)?'overhead-bound':fl>mem?'compute-bound':'memory-bound';
+  $('rgNote').textContent=`${name} on ${g.n} (BF16/FP16; element-wise and softmax run on CUDA cores): ${reg}. Intensity ${(fl*(o==='mm'?g.tc:g.cc)/by).toFixed(o==='mm'?0:2)} FLOPs per byte.`;}
+['rgO','rgM','rgG','rgL'].forEach(id=>$(id).addEventListener('input',rg));IE.onTheme(rg);
+})();
+</script>
+
+</body>
+</html>
