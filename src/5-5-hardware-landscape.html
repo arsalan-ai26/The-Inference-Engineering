@@ -1,0 +1,201 @@
+<div class="kicker">Part 5 · GPUs, hardware and kernels · Chapter 5.5</div>
+<h1>Hardware landscape</h1>
+<p class="lede">Which accelerator should serve your model? The answer depends on whether your workload is limited by memory capacity, memory bandwidth, compute, or interconnect, and on price, availability and software support. This chapter compares the NVIDIA generations you will meet (Ampere, Ada, Hopper, Blackwell, and the coming Rubin), explains MIG for small models, and surveys the alternatives: AMD Instinct, Google TPUs, AWS Trainium and Inferentia, and SRAM-heavy chips like Groq and Cerebras. It ends with a calculator that turns a model and a GPU into tokens per second and dollars per million tokens.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 2.4, 2.5, 5.2</span>
+  <span class="chip">Compute: none required</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Using only bandwidth, how much faster should batch-1 decode be on a B200 than on an H100?</li>
+    <li>What does an H100 "3g.40gb" MIG slice give you?</li>
+    <li>Why can Groq and Cerebras chips decode very fast for a single user, and what is their main limitation?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>About 8 ÷ 3.35 ≈ 2.4 times, if the model fits and the kernels reach the same share of peak bandwidth.</li>
+    <li>3 of the 7 compute slices and 40 GB of the 80 GB memory, isolated in hardware from other slices.</li>
+    <li>They keep weights in on-chip SRAM with far higher bandwidth than HBM. SRAM capacity per chip is small, so large models need many chips.</li>
+  </ol></details>
+</div>
+
+<h2 id="read">1. Reading a spec sheet for inference</h2>
+<p>Map each number to the bottleneck it controls (chapters 2.5 and 5.1):</p>
+<ul>
+  <li><strong>Memory capacity</strong> decides what fits: weights plus KV cache (chapter 2.4). The Kiely book suggests leaving at least 50% headroom over the weights for KV in typical serving.</li>
+  <li><strong>Memory bandwidth</strong> sets the decode speed at small and medium batch.</li>
+  <li><strong>Dense tensor FLOP/s at your precision</strong> set prefill speed and large-batch decode. Use dense, not "with sparsity" figures, and compare at the same precision; FLOP/s roughly double with each halving of precision on hardware that supports it.</li>
+  <li><strong>Supported formats</strong> (FP8 from Ada/Hopper, FP4 and MX formats from Blackwell) decide which quantization recipes (chapter 4.1) run at full speed.</li>
+  <li><strong>Interconnect</strong> (NVLink generation, NVLink domain size, network cards) decides how well multi-GPU layouts scale (chapter 4.5).</li>
+  <li><strong>Form factor:</strong> SXM modules with NVLink vs PCIe cards. PCIe versions of the same GPU often have lower power limits, less bandwidth and no NVLink.</li>
+</ul>
+
+<h2 id="nvidia">2. NVIDIA generations</h2>
+<p>NVIDIA names architectures after scientists; the letter in a product name gives the generation (A = Ampere, L = Ada Lovelace data center cards, H = Hopper, B = Blackwell, R = Rubin), and a larger number within a generation means a larger part.</p>
+<div class="tbl"><table>
+<tr><th>GPU</th><th class="n">Memory</th><th class="n">Bandwidth</th><th class="n">BF16 dense</th><th class="n">FP8 dense</th><th class="n">FP4 dense</th><th>Notes</th></tr>
+<tr><td>T4 (Turing, 2018)</td><td class="n">16 GB</td><td class="n">0.32 TB/s</td><td class="n">65 (FP16)</td><td class="n">n/a</td><td class="n">n/a</td><td>Free tiers; no BF16; compute capability 7.5</td></tr>
+<tr><td>A100 SXM 80 GB (Ampere, 2020)</td><td class="n">80 GB</td><td class="n">2.0 TB/s</td><td class="n">312</td><td class="n">n/a</td><td class="n">n/a</td><td>NVLink 3; still common; FP8 only as weight-only</td></tr>
+<tr><td>L4 (Ada, 2023)</td><td class="n">24 GB</td><td class="n">0.3 TB/s</td><td class="n">121</td><td class="n">242</td><td class="n">n/a</td><td>Low power, cheap; small models, embeddings, vision</td></tr>
+<tr><td>L40S (Ada)</td><td class="n">48 GB</td><td class="n">0.86 TB/s</td><td class="n">362</td><td class="n">733</td><td class="n">n/a</td><td>No NVLink; good capacity per dollar</td></tr>
+<tr><td>H100 SXM (Hopper, 2022)</td><td class="n">80 GB</td><td class="n">3.35 TB/s</td><td class="n">989</td><td class="n">1,979</td><td class="n">n/a</td><td>The reference inference GPU of this book</td></tr>
+<tr><td>H200 SXM (Hopper)</td><td class="n">141 GB</td><td class="n">4.8 TB/s</td><td class="n">989</td><td class="n">1,979</td><td class="n">n/a</td><td>Same compute, more and faster memory: faster decode</td></tr>
+<tr><td>B200 (Blackwell, 2024)</td><td class="n">about 180 GB</td><td class="n">about 8 TB/s</td><td class="n">about 2,250</td><td class="n">about 4,500</td><td class="n">about 9,000</td><td>NVLink 5; NVFP4/MXFP4; TMEM</td></tr>
+<tr><td>B300 (Blackwell Ultra)</td><td class="n">288 GB</td><td class="n">about 8 TB/s</td><td class="n">see vendor</td><td class="n">see vendor</td><td class="n">about 1.5 × B200</td><td>More memory and FP4 compute</td></tr>
+<tr><td>Rubin (announced for 2026)</td><td class="n">288 GB HBM4</td><td class="n">about 22 TB/s</td><td colspan="3">Announced figures; wait for benchmarks</td><td>NVLink 6; Vera CPU; Rubin CPX for prefill</td></tr>
+</table></div>
+<p class="note">Figures in TFLOP/s from vendor material and secondary spec summaries, rounded; Blackwell and Rubin numbers vary by system and are approximate. Check the exact SKU you rent (chapter 6.5).</p>
+<p>What each generation added for inference:</p>
+<ul>
+  <li><strong>Ampere:</strong> BF16 and TF32 tensor cores, MIG, NVLink 3. Still a cost-effective choice for models that fit and do not need FP8.</li>
+  <li><strong>Ada (L4, L40S):</strong> FP8 tensor cores in a graphics-oriented, PCIe-only design. No NVLink, so poor for tensor parallelism; good for small and medium models, embeddings and vision.</li>
+  <li><strong>Hopper:</strong> FP8, the Transformer Engine, TMA and warpgroup MMAs (chapter 5.2), NVLink 4. The H200 kept the compute and raised memory to 141 GB at 4.8 TB/s, which helps decode and long context directly.</li>
+  <li><strong>Blackwell:</strong> FP4 and microscaling formats with hardware block scaling, tensor memory, about 2.4 times Hopper's bandwidth, NVLink 5 and rack-scale NVL72 systems.</li>
+  <li><strong>Rubin (announced):</strong> HBM4 at much higher bandwidth, NVLink 6, the Vera CPU, and Rubin CPX, a separate part aimed at compute-bound prefill, matching the prefill/decode split of chapter 4.6.</li>
+</ul>
+<p>New generations take roughly a year after release before kernels, engines and quantization recipes use them fully; reserve judgement until you can run your own benchmark.</p>
+
+<h3>Grace CPUs</h3>
+<p>GH200 and GB200 pair NVIDIA's Arm-based Grace CPU with the GPU over NVLink-C2C (up to 900 GB/s total), several times faster than PCIe. CPU memory becomes a practical tier for KV offload (chapter 4.4) and LoRA adapter storage.</p>
+
+<h2 id="mig">3. Splitting a GPU: MIG</h2>
+<p>Small models (a few billion parameters) cannot use an H100's full compute and memory even at large batch. Multi-Instance GPU (MIG) splits an A100, H100, H200 or B200 into up to 7 isolated instances, each with its own SMs, memory, L2 slice and memory bandwidth share. On an H100 80 GB the main profiles are 1g.10gb (up to 7 per GPU), 2g.20gb (up to 3), 3g.40gb (up to 2), 4g.40gb and 7g.80gb. Seven compute slices exist because SM counts do not divide evenly; leftover SMs stay idle.</p>
+<p>MIG gives hardware isolation (one tenant cannot slow another's memory), which time-sharing a GPU between processes does not. Use it for small models, embeddings and multi-tenant serving; do not use it for models that need the full memory or tensor parallelism.</p>
+
+<h2 id="others">4. Beyond NVIDIA</h2>
+<div class="tbl"><table>
+<tr><th>Family</th><th>What it bets on</th><th>Software</th><th>Where it fits</th></tr>
+<tr><td>AMD Instinct (MI300X, MI325X, MI355X)</td><td>More HBM per GPU: 192 GB (MI300X, 5.3 TB/s) to 288 GB (MI355X, 8 TB/s); MI355X adds FP6 and FP4</td><td>ROCm; vLLM and SGLang support; Triton kernels port well; AITER kernel library</td><td>Large models and long contexts on fewer GPUs; competitive pricing</td></tr>
+<tr><td>Google TPU</td><td>A few very large matrix units, a big software-managed on-chip memory, and large torus-connected pods</td><td>JAX and XLA; vLLM has a TPU backend</td><td>Google Cloud; very large deployments; Google's own models</td></tr>
+<tr><td>AWS Trainium and Inferentia</td><td>Cost per token on AWS for training and inference</td><td>AWS Neuron SDK; vLLM integration</td><td>Teams standardized on AWS</td></tr>
+<tr><td>Groq LPU</td><td>Weights spread over many chips' on-chip SRAM (about 230 MB per chip); deterministic, compiler-scheduled execution</td><td>Groq's own stack; offered as a cloud API</td><td>Very low latency per user</td></tr>
+<tr><td>Cerebras WSE-3</td><td>A whole wafer as one chip with about 44 GB of on-chip SRAM (vendor figure)</td><td>Cerebras stack; cloud API</td><td>Very high tokens per second per user</td></tr>
+<tr><td>Others (SambaNova, Etched, Furiosa, Qualcomm, Tenstorrent)</td><td>Dataflow designs, transformer-specific ASICs, power efficiency</td><td>Vendor stacks</td><td>Specialized deployments</td></tr>
+</table></div>
+<p>Two patterns repeat across these designs. First, <strong>minimize data movement</strong>: reading DRAM costs far more energy and time than arithmetic, so many accelerators trade compute area for on-chip memory or replace caches with large software-managed scratchpads. Second, <strong>software is the moat</strong>: without CUDA's ecosystem every alternative must rebuild kernels, engines and quantization support, and its usefulness for you depends on whether your model and engine are supported on day one.</p>
+
+<h2 id="choose">5. Choosing hardware: a worked method</h2>
+<ol>
+  <li><strong>Fit:</strong> weights at your precision plus the KV budget for your target concurrency and context (chapters 2.4 and 4.5).</li>
+  <li><strong>Phase mix:</strong> decode-heavy (chat, reasoning, agents) favours bandwidth; prefill-heavy (RAG, summarization, code context) favours FLOP/s; disaggregation lets you pick per phase (chapter 4.6).</li>
+  <li><strong>Precision:</strong> FP8 needs Ada/Hopper or newer; NVFP4 needs Blackwell.</li>
+  <li><strong>Scale-out:</strong> tensor parallelism needs NVLink; large MoE models benefit from large NVLink domains.</li>
+  <li><strong>Cost per token, not per hour:</strong> a GPU that costs twice as much per hour but serves three times the tokens is cheaper (chapter 6.5).</li>
+  <li><strong>Availability and support:</strong> can you get it in the regions you need, and does your engine support it well today?</li>
+</ol>
+<div class="widget" id="hwW">
+  <div class="wt">Interactive: one model on different GPUs</div>
+  <div class="ws">Idealized decode at the bandwidth floor (chapter 2.5) for one replica on a single GPU, at the largest batch that fits up to your cap, at 4K-token contexts, with a 0.9 memory fraction and an FP8 KV cache whenever the weights are FP8 or 4-bit. Prices are the cheapest on-demand rates from the compute guide (checked 6 November 2026; n/a where not tracked). Real throughput is lower; use this to compare, not to promise.</div>
+  <div class="ctrls">
+    <label>Model <select id="hwM"><option value="8">Llama 3.1 8B</option><option value="32">Qwen2.5-32B</option><option value="70">Llama 3.1 70B</option></select></label>
+    <label>Weights <select id="hwP"><option value="2">BF16</option><option value="1" selected>FP8</option><option value="0.5">4-bit</option></select></label>
+    <label>Max batch <select id="hwB"><option>1</option><option>16</option><option selected>64</option><option>256</option></select></label>
+  </div>
+  <div class="tbl"><table id="hwT"></table></div>
+</div>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Energy is the real constraint</span>
+  <p>At data-center scale, power and cooling limit how many accelerators can be installed. Moving a byte from DRAM costs orders of magnitude more energy than a multiply, and smaller number formats need far smaller multipliers (an FP8 multiplier needs a small fraction of the adders of an FP32 one). Both push hardware toward low precision and on-chip memory, and both make tokens per joule a metric that matters alongside tokens per dollar.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Rack-scale systems change the unit of deployment</span>
+  <p>With GB200 and GB300 NVL72, the unit is a rack of 72 GPUs in one NVLink domain, with liquid cooling and its own failure modes. Wide expert parallelism and disaggregation are designed around this unit. Renting or operating one is a different exercise from renting 8-GPU nodes (chapter 6.7).</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Local and edge hardware</span>
+  <p>Apple's M-series chips share one large memory between CPU and GPU (up to 512 GB on an M3 Ultra, at about 819 GB/s), so very large quantized models fit, at moderate speed. Consumer GPUs (an RTX 5090: 32 GB at about 1.8 TB/s) are faster but smaller. Mobile devices run small models with NPUs. Chapter 3.6 covered the runtimes.</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Comparing sparse FLOP/s of one GPU with dense FLOP/s of another.</li>
+  <li>Choosing by FLOP/s for a decode-heavy workload.</li>
+  <li>Renting PCIe H100s for tensor parallelism and expecting SXM performance.</li>
+  <li>Judging a new generation from launch-day numbers before kernels and engines catch up.</li>
+  <li>Comparing price per hour instead of price per token at your SLO.</li>
+  <li>Using a whole H100 for a 1B-parameter model instead of MIG slices or a smaller GPU.</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<p><strong>Goal:</strong> estimate performance and cost across hardware from first principles, and compare with published numbers.</p>
+<h3>Part A: the 100 Days notebooks</h3>
+<p>Run days 20 (GPU generations) and 21 (multi-GPU instances and MIG) of <em>100 Days of Inference</em>. Check their H100 FP8 figures and the Ada memory claim against the notes in References.</p>
+<h3>Part B: decode speedup from bandwidth alone</h3>
+<p>For Llama 3.1 8B in BF16 at batch 1, estimate the decode floor (weights ÷ bandwidth) on an A100, H100, H200 and B200, and the speedup of each over the A100. Then do the same at batch 64 with 4K contexts (add the KV bytes). Why does the H200's advantage over the H100 grow at batch 64?</p>
+<details><summary>Answer</summary><p>Batch 1 (16.1 GB): A100 8.0 ms, H100 4.8 ms, H200 3.3 ms, B200 2.0 ms; speedups over A100 1.0, 1.7, 2.4, 4.0. Batch 64 at 4K (KV 64 × 4,096 × 128 KiB = 34.4 GB, total 50.4 GB): A100 25 ms, H100 15 ms, H200 10.5 ms, B200 6.3 ms. The ratios stay the same in this idealized model, but the H200's larger memory lets it hold much larger batches and longer contexts than the H100, so at its best operating point it serves far more tokens per GPU.</p></details>
+<h3>Part C: cost per million tokens</h3>
+<p>Using the widget, find the cheapest GPU per million output tokens for Llama 3.1 70B in FP8 at batch 64. Then repeat for Llama 3.1 8B in FP8 at batch 256. Are the winners the same? Explain using capacity, bandwidth and price.</p>
+<h3>Part D: read a public hardware benchmark</h3>
+<p>Open a public inference hardware comparison (for example Artificial Analysis's hardware benchmarks or InferenceMAX by SemiAnalysis). For one model, compare tokens per second per GPU across two generations at the same concurrency, and check the ratio against your bandwidth estimate from Part B. List three reasons the measured ratio can differ (kernels, precision, engine version, batch, parallelism).</p>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">The current fleet</span>
+  <ul>
+    <li><strong>Most production LLM serving</strong> runs on Hopper (H100, H200) and increasingly Blackwell (B200, B300, GB200 NVL72).</li>
+    <li><strong>Small models and embeddings</strong> run on L4, L40S, A10 or MIG slices.</li>
+    <li><strong>AMD Instinct</strong> serves large models at several clouds and labs, with vLLM and SGLang support.</li>
+    <li><strong>Specialized chips</strong> are mostly offered as APIs (Groq, Cerebras, SambaNova) rather than hardware you rent.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz55"></div>
+<script type="application/json" id="qz55">[
+{"q":"For decode-heavy serving of a model that fits, which spec matters most?","o":["Sparse FP4 FLOP/s","Memory bandwidth","CPU cores","PCIe generation"],"a":1,"e":"Decode reads all weights and KV each step."},
+{"q":"H100 vs H200: what changed?","o":["Compute doubled","Memory grew to 141 GB and bandwidth to 4.8 TB/s, compute stayed the same","FP4 support","NVLink 5"],"a":1,"e":"Same Hopper compute, faster and larger memory."},
+{"q":"Why are L4 and L40S poor choices for tensor parallelism?","o":["No FP8","No NVLink","Too much memory","No CUDA"],"a":1,"e":"PCIe-only cards make per-layer all-reduces slow."},
+{"q":"What does MIG provide?","o":["More memory than the GPU has","Hardware-isolated slices of one GPU","NVLink between GPUs","FP4"],"a":1,"e":"Each instance has its own SMs, memory and bandwidth share."},
+{"q":"Groq and Cerebras get high single-user speed mainly from:","o":["More HBM","Very high on-chip SRAM bandwidth","FP64","Larger batches"],"a":1,"e":"Weights live in SRAM instead of HBM."},
+{"q":"The best way to compare two GPU offers is:","o":["Price per hour","Tokens per dollar at your latency target","Peak FLOP/s","Memory size"],"a":1,"e":"Cost per token at the SLO is what you pay for."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>Read spec sheets by bottleneck: capacity (fit), bandwidth (decode), dense FLOP/s at your precision (prefill), formats, interconnect.</li>
+  <li>Hopper is today's workhorse; H200 and Blackwell add memory and bandwidth; Blackwell adds FP4; Rubin is announced with HBM4 and a prefill-oriented companion chip.</li>
+  <li>MIG splits large GPUs into isolated slices for small models.</li>
+  <li>AMD offers more memory per GPU; TPUs and Trainium are tied to their clouds; SRAM-heavy chips trade capacity for bandwidth; software support decides practicality.</li>
+  <li>Choose by cost per token at your SLO, after checking fit, phase mix, precision, interconnect and availability.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 3.2 to 3.5</td><td>GPU generations, Grace and Vera CPUs, instances, MIG, other accelerators and local inference.</td></tr>
+<tr><td><a href="https://fleetwood.dev/posts/domain-specific-architectures">Fleetwood: Domain-specific architectures for AI inference</a></td><td>Designing inference hardware backwards from the workload: data movement, low precision, scratchpads and SRAM.</td></tr>
+<tr><td><a href="https://jax-ml.github.io/scaling-book/gpus/">How to Scale Your Model: GPUs</a></td><td>H100 and B200 compared with TPUs, and networking.</td></tr>
+<tr><td><a href="https://www.guru3d.com/story/nvidia-details-rubin-gpu-architecture-with-hbm4-nvlink-6-and-336-billion-transistors/">Guru3D: NVIDIA details Rubin</a></td><td>Announced Rubin memory and NVLink figures.</td></tr>
+<tr><td><a href="https://glennklockwood.com/garden/processors/mi355x">Glenn Lockwood: AMD MI355X</a></td><td>MI355X memory, bandwidth and FLOP/s by precision.</td></tr>
+<tr><td><a href="https://docs.nvidia.com/datacenter/tesla/mig-user-guide/">NVIDIA MIG user guide</a></td><td>MIG profiles and isolation.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em></td><td>Blackwell, NVFP4 and Grace-based systems in practice.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, days 20 and 21</td><td>GPU generations, decode projections and MIG sizing.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The day 20 README of <em>100 Days of Inference</em> quotes 3.9 PFLOP/s FP8 for the H100 (the sparse figure; dense is about 1.98) and says Ada data center GPUs top out at 24 GB. The L40 and L40S are Ada GPUs with 48 GB.</li>
+  <li>The Kiely book says Ethernet tops out at 100 Gb/s per network card. 400 Gb/s Ethernet cards are standard in AI clusters (RoCE), and 800 Gb/s cards for both Ethernet and InfiniBand have started shipping.</li>
+  <li>The Fleetwood post describes the H100's L2 cache as 80 MB. NVIDIA's H100 SXM has 50 MB of L2.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Prices from the compute guide (6 November 2026).</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$}=IE;
+const GP=[{n:'L4',m:24,bw:0.3,p:null},{n:'L40S',m:48,bw:0.864,p:0.97},{n:'A100 80 GB',m:80,bw:2.04,p:1.38},{n:'H100 SXM',m:80,bw:3.35,p:2.90},{n:'MI300X',m:192,bw:5.3,p:2.99},{n:'H200 SXM',m:141,bw:4.8,p:5.29},{n:'B200',m:180,bw:8,p:8.79}];
+const MD={'8':{P:8.03e9,kv:131072},'32':{P:32.8e9,kv:262144},'70':{P:70.6e9,kv:327680}};
+function hw(){const m=MD[$('hwM').value],wb=+$('hwP').value,cap=+$('hwB').value;const W=m.P*wb,kvseq=m.kv*(wb<2?0.5:1)*4096;
+  let rows='<tr><th>GPU</th><th class="n">Fits?</th><th class="n">Batch</th><th class="n">Step floor</th><th class="n">Tokens/s</th><th class="n">$/hour</th><th class="n">$ per M tokens</th></tr>';
+  GP.forEach(g=>{const free=g.m*0.9e9-W;let b=Math.min(cap,Math.floor(free/kvseq));if(free<=0)b=0;
+    if(b<1){rows+=`<tr><td>${g.n}</td><td class="n">no</td><td class="n">-</td><td class="n">-</td><td class="n">-</td><td class="n">${g.p?'$'+g.p.toFixed(2):'n/a'}</td><td class="n">-</td></tr>`;return;}
+    const t=(W+b*kvseq)/(g.bw*1e12),tps=b/t;const c=g.p?g.p/(tps*3600)*1e6:null;
+    rows+=`<tr><td>${g.n}</td><td class="n">yes</td><td class="n">${b}</td><td class="n">${(t*1e3).toFixed(1)} ms</td><td class="n">${IE.int(tps)}</td><td class="n">${g.p?'$'+g.p.toFixed(2):'n/a'}</td><td class="n">${c?'$'+c.toFixed(3):'n/a'}</td></tr>`;});
+  $('hwT').innerHTML=rows;}
+['hwM','hwP','hwB'].forEach(id=>$(id).addEventListener('input',hw));hw();
+})();
+</script>

@@ -221,7 +221,7 @@ window.IE_CHAPTERS = [
 "title": "Hardware landscape",
 "slug": "5-5-hardware-landscape",
 "part": 5,
-"ready": false
+"ready": true
 },
 {
 "n": "5.6",
