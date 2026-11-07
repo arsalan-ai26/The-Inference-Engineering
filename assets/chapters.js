@@ -142,175 +142,175 @@ window.IE_CHAPTERS = [
 {
 "n": "4.1",
 "title": "Quantization",
-"slug": "",
+"slug": "4-1-quantization",
 "part": 4,
-"ready": false
+"ready": true
 },
 {
 "n": "4.2",
 "title": "Efficient attention and attention kernels",
-"slug": "",
+"slug": "4-2-efficient-attention",
 "part": 4,
-"ready": false
+"ready": true
 },
 {
 "n": "4.3",
 "title": "Speculative decoding",
-"slug": "",
+"slug": "4-3-speculative-decoding",
 "part": 4,
-"ready": false
+"ready": true
 },
 {
 "n": "4.4",
 "title": "Prefix caching and KV reuse",
-"slug": "",
+"slug": "4-4-kv-reuse",
 "part": 4,
 "ready": false
 },
 {
 "n": "4.5",
 "title": "Model parallelism",
-"slug": "",
+"slug": "4-5-model-parallelism",
 "part": 4,
 "ready": false
 },
 {
 "n": "4.6",
 "title": "Prefill/decode disaggregation",
-"slug": "",
+"slug": "4-6-disaggregation",
 "part": 4,
 "ready": false
 },
 {
 "n": "4.7",
 "title": "Long-context and tiered KV systems",
-"slug": "",
+"slug": "4-7-long-context",
 "part": 4,
 "ready": false
 },
 {
 "n": "5.1",
 "title": "Compute, memory and overhead",
-"slug": "",
+"slug": "5-1-compute-memory-overhead",
 "part": 5,
 "ready": false
 },
 {
 "n": "5.2",
 "title": "GPU architecture",
-"slug": "",
+"slug": "5-2-gpu-architecture",
 "part": 5,
 "ready": false
 },
 {
 "n": "5.3",
 "title": "The CUDA execution model",
-"slug": "",
+"slug": "5-3-cuda-execution-model",
 "part": 5,
 "ready": false
 },
 {
 "n": "5.4",
 "title": "Kernels, fusion and Triton",
-"slug": "",
+"slug": "5-4-kernels-fusion-triton",
 "part": 5,
 "ready": false
 },
 {
 "n": "5.5",
 "title": "Hardware landscape",
-"slug": "",
+"slug": "5-5-hardware-landscape",
 "part": 5,
 "ready": false
 },
 {
 "n": "5.6",
 "title": "Profiling",
-"slug": "",
+"slug": "5-6-profiling",
 "part": 5,
 "ready": false
 },
 {
 "n": "5.7",
 "title": "Compilation and CUDA graphs",
-"slug": "",
+"slug": "5-7-compilation-cuda-graphs",
 "part": 5,
 "ready": false
 },
 {
 "n": "5.8",
 "title": "Expert depth: writing high-performance kernels and kernel compilers",
-"slug": "",
+"slug": "5-8-high-performance-kernels",
 "part": 5,
 "ready": false
 },
 {
 "n": "6.1",
 "title": "Benchmarking",
-"slug": "",
+"slug": "6-1-benchmarking",
 "part": 6,
 "ready": false
 },
 {
 "n": "6.2",
 "title": "Packaging, API layer, startup and shutdown",
-"slug": "",
+"slug": "6-2-packaging-startup",
 "part": 6,
 "ready": false
 },
 {
 "n": "6.3",
 "title": "Autoscaling and concurrency",
-"slug": "",
+"slug": "6-3-autoscaling",
 "part": 6,
 "ready": false
 },
 {
 "n": "6.4",
 "title": "Routing, load balancing and queueing",
-"slug": "",
+"slug": "6-4-routing-queueing",
 "part": 6,
 "ready": false
 },
 {
 "n": "6.5",
 "title": "Capacity, deployment and cost",
-"slug": "",
+"slug": "6-5-capacity-cost",
 "part": 6,
 "ready": false
 },
 {
 "n": "6.6",
 "title": "Observability and correctness",
-"slug": "",
+"slug": "6-6-observability-correctness",
 "part": 6,
 "ready": false
 },
 {
 "n": "6.7",
 "title": "Expert depth: production case studies, cluster infrastructure and confidential inference",
-"slug": "",
+"slug": "6-7-case-studies-clusters",
 "part": 6,
 "ready": false
 },
 {
 "n": "6.8",
 "title": "Expert depth: agentic workloads and tooling",
-"slug": "",
+"slug": "6-8-agentic-workloads",
 "part": 6,
 "ready": false
 },
 {
 "n": "6.9",
 "title": "Fault tolerance, security and incident response",
-"slug": "",
+"slug": "6-9-fault-tolerance-security",
 "part": 6,
 "ready": false
 },
 {
 "n": "6.10",
 "title": "Capstone: public engine teardown",
-"slug": "",
+"slug": "6-10-engine-teardown",
 "part": 6,
 "ready": false
 },

@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>4.1 Quantization</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="4.1">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 4 · Chapter 4.1</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 4 · Model optimization · Chapter 4.1</div>
+<h1>Quantization</h1>
+<p class="lede">Quantization stores a model's numbers in fewer bits. Fewer bits means less memory, fewer bytes to read each decode step, and faster math in prefill. It is usually the first optimization to try and the one with the most ways to go wrong. Chapter 1.3 covered the number formats themselves. This chapter covers how a real model is quantized: the scale and zero point, outliers, the three classic algorithms (GPTQ, AWQ, SmoothQuant), FP8 and FP4 serving, KV cache quantization, and how to prove that quality did not drop.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 5 to 6 hours with the lab</span>
+  <span class="chip">Needs: 1.3, 2.4, 2.5</span>
+  <span class="chip">Compute: Colab CPU; T4 for Part E</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What does "W4A16" mean, and which inference phase does it speed up most?</li>
+    <li>Why are activations harder to quantize than weights?</li>
+    <li>A quantized model scores 0.3 points lower on a benchmark. Is that a real loss?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>4-bit weights, 16-bit activations. The matmul still runs in 16-bit, so it mainly cuts the bytes read per decode step. Decode at small batch gains most; large-batch prefill gains little.</li>
+    <li>Weights are fixed and known before serving, so their scales can be chosen carefully once. Activations change with every input and contain rare, very large outlier channels.</li>
+    <li>Not necessarily. Run the original model several times to measure its own run-to-run noise. A loss counts only if it is clearly larger than that noise.</li>
+  </ol></details>
+</div>
+
+<h2 id="why">1. What quantization buys, phase by phase</h2>
+<p>Chapter 2.5 split inference into two regimes. Quantization helps each in a different way:</p>
+<ul>
+  <li><strong>Decode is memory-bound.</strong> Each step reads every weight once. Weights in 8 bits instead of 16 means half the bytes per step, so the step can be up to about twice as fast. This works even if the math stays in 16-bit.</li>
+  <li><strong>Prefill is compute-bound.</strong> It only gets faster if the matmul itself runs in lower precision. An H100 does about 989 TFLOP/s in BF16 and about 1,979 TFLOP/s in FP8 (dense). For that, both inputs of the matmul, the weights <em>and</em> the activations, must be in FP8.</li>
+</ul>
+<p>Quantization also frees memory. Smaller weights leave more room for the KV cache, so more requests fit in a batch (chapter 2.4), which raises throughput even when each step is no faster.</p>
+<p>In practice the gain is less than the bit ratio. Scales must be loaded and applied, and some layers stay in 16-bit. Going down one precision level (for example BF16 to FP8) typically gives about 30% to 50% better performance for LLMs, not 100%. vLLM's documentation reports up to 1.6 times higher throughput for FP8 with a 2 times memory reduction.</p>
+
+<h3>The naming scheme</h3>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>WxAy:</strong> weights stored in x bits, activations (the inputs to each matmul) in y bits. W4A16 is weight-only quantization; W8A8 quantizes both.</p>
+  <p><strong>Weight-only quantization:</strong> weights are stored in low precision and converted back (dequantized) to 16-bit inside the matmul kernel. The math runs in 16-bit.</p>
+  <p><strong>Weight-and-activation quantization:</strong> both matmul inputs are in low precision, so the tensor cores run the low-precision instruction.</p>
+  <p><strong>KV cache quantization:</strong> the stored keys and values use fewer bits (often FP8), independent of the weights.</p>
+  <p><strong>PTQ (post-training quantization):</strong> quantize a finished model, using at most a small calibration set. <strong>QAT (quantization-aware training):</strong> train with the low precision simulated, so the weights adapt to it.</p>
+</div>
+<div class="tbl"><table>
+<tr><th>Scheme</th><th>Weight bytes vs BF16</th><th>Matmul runs in</th><th>Helps most</th><th>Typical tools</th></tr>
+<tr><td>W8A8 FP8</td><td>½</td><td>FP8 tensor cores</td><td>Both phases; the production default on Hopper and newer</td><td>llm-compressor, ModelOpt, vLLM online FP8</td></tr>
+<tr><td>W8A8 INT8</td><td>½</td><td>INT8 tensor cores</td><td>Both phases on Ampere and older</td><td>SmoothQuant</td></tr>
+<tr><td>W4A16 INT4</td><td>about ¼</td><td>16-bit (after dequantizing)</td><td>Decode at small batch; fitting big models on small GPUs</td><td>GPTQ, AWQ, GGUF</td></tr>
+<tr><td>W4A4 NVFP4 / MXFP4</td><td>about ¼</td><td>FP4 tensor cores (Blackwell)</td><td>Both phases, on Blackwell only</td><td>ModelOpt, llm-compressor</td></tr>
+<tr><td>FP8 KV cache</td><td>(KV: ½)</td><td>Unchanged</td><td>Long contexts and large batches</td><td><code>--kv-cache-dtype fp8</code></td></tr>
+</table></div>
+<p class="note">Sources for this section are listed at the end of the chapter.</p>
+
+<h2 id="mapping">2. The core operation: scale and zero point</h2>
+<p>Every quantizer maps a range of real numbers onto a small set of integer codes, stores the codes, and keeps a <strong>scale</strong> (and sometimes a <strong>zero point</strong>) to map them back. There are two ways to do the mapping.</p>
+<h3>Symmetric (absmax) quantization</h3>
+<p>Map the largest absolute value to the largest code, and keep 0 at 0. For signed 4-bit integers the codes are −8 to 7, so use 7 as the top:</p>
+<div class="formula">scale = max(|w|) ÷ 7 &nbsp;&nbsp; code = round(w ÷ scale) &nbsp;&nbsp; restored = code × scale</div>
+<div class="box ex">
+  <span class="lbl">Worked example</span>
+  <p>Row w = [0.2, −1.6, 2.9]. scale = 2.9 ÷ 7 ≈ 0.414. Codes: round(0.48) = 0, round(−3.86) = −4, round(7.0) = 7. Restored: [0, −1.66, 2.90]. The 0.2 is lost entirely: it is smaller than half a step (0.207). Small weights next to a big one suffer most.</p>
+</div>
+<h3>Asymmetric (zero-point) quantization</h3>
+<p>Map the minimum to the lowest code and the maximum to the highest. This uses every code even when the values are not centered on 0, but needs a second number, the zero point z: the code that stands for real 0.</p>
+<div class="formula">scale = (max − min) ÷ (2^bits − 1) &nbsp;&nbsp; z = round(−min ÷ scale) &nbsp;&nbsp; code = round(w ÷ scale) + z &nbsp;&nbsp; restored = (code − z) × scale</div>
+<p>Symmetric is simpler and faster in kernels (no subtraction). Asymmetric is more accurate for skewed ranges, such as activations after a ReLU-like function. Many INT4 weight formats (GPTQ, AWQ) store a zero point per group.</p>
+
+<div class="widget" id="qzW">
+  <div class="wt">Interactive: quantize one row of weights</div>
+  <div class="ws">Sixteen weights from a real-looking distribution. Grey dots are the original values, coloured dots the restored values, and the faint ticks the values the codes can represent. Turn on the outlier, then try groups and clipping.</div>
+  <div class="ctrls">
+    <label>Bits <select id="qzB"><option>8</option><option selected>4</option><option>3</option><option>2</option></select></label>
+    <label>Mapping <select id="qzM"><option value="sym">symmetric (absmax)</option><option value="asym">asymmetric (zero point)</option></select></label>
+    <label>Scale per <select id="qzG"><option value="16">whole row (16)</option><option value="4">group of 4</option></select></label>
+    <label><input type="checkbox" id="qzO"> outlier (one weight = 4.0)</label>
+    <label>Clip at: <span class="mono" id="qzCv"></span><input type="range" id="qzC" min="0.3" max="1" step="0.05" value="1"></label>
+  </div>
+  <div class="svgwrap"><svg id="qzSvg" viewBox="0 0 680 210" width="680" style="max-width:100%;height:auto" role="img" aria-label="Original and quantized weights on a number line"></svg></div>
+  <div class="stats" id="qzStats"></div>
+</div>
+<p>Three things to see in the widget. With an outlier and one scale per row, the step size grows so much that most small weights collapse to 0. Smaller groups (chapter 1.3) isolate the outlier in its own group. Clipping lowers the step size for everyone else but damages the outlier itself, and outliers often matter most.</p>
+
+<h2 id="outliers">3. Outliers, calibration, and static vs dynamic scales</h2>
+<h3>Weights are easy, activations are hard</h3>
+<p>Weights are roughly bell-shaped and fixed. Their scales can be computed once, offline, with no data at all. Round-to-nearest (RTN) per channel works well at 8 bits.</p>
+<p>Activations are different. In LLMs a few hidden channels carry values far larger than the rest, and they appear in the same channels for almost every token. The lab measures this on Qwen2.5-0.5B: in the layers checked, the largest input channel is 11 to 63 times the median channel, and larger models show stronger outliers. A per-tensor INT8 scale sized for that channel leaves a step size too coarse for all the others.</p>
+<h3>Calibration</h3>
+<p>Choosing the range to map is called <strong>calibration</strong>. For activations, you run a few hundred representative prompts through the model and record the ranges. Choices include the absolute max, a percentile (which clips the rare extremes), or the range that minimizes error. Use calibration data that looks like your real traffic: chat, code or your domain.</p>
+<h3>Static and dynamic activation scales</h3>
+<ul>
+  <li><strong>Static:</strong> the activation scale is fixed after calibration. Fastest, but wrong when traffic differs from the calibration set.</li>
+  <li><strong>Dynamic:</strong> the kernel computes the scale at run time from the actual values, usually one scale per token (per row). It costs a small reduction per matmul and needs no calibration. The common FP8 recipe for vLLM is exactly this: static per-channel weight scales plus dynamic per-token activation scales (llm-compressor's <code>FP8_DYNAMIC</code> scheme).</li>
+</ul>
+
+<h2 id="algorithms">4. Three classic algorithms</h2>
+<p>Round-to-nearest treats each weight on its own. At 4 bits and below that loses too much. Three methods fix this in different ways. The aim here is the idea, not the full math.</p>
+<h3>GPTQ: fix each rounding error with the weights not yet rounded</h3>
+<p>GPTQ quantizes one layer at a time, one column of weights at a time. After rounding a column, it measures the error that rounding caused on the layer's output (using calibration inputs), and nudges the columns not yet quantized to cancel that error. Weights in a layer work together, so a small change to the remaining weights can absorb most of the error. The size of each nudge comes from second-order information about the layer's inputs (the inverse of the Hessian matrix, H = 2XXᵀ, where X is the calibration input).</p>
+<div class="box ex">
+  <span class="lbl">Intuition in two weights</span>
+  <p>A neuron computes y = w₁x₁ + w₂x₂, and x₁ and x₂ are usually similar. Round w₁ = 0.65 to 1.0: the output rises by about 0.35 × x₁. Since x₂ is close to x₁, lowering w₂ by about 0.35 before it is rounded cancels most of that. GPTQ does this for thousands of weights at once, weighting each correction by how the inputs correlate.</p>
+</div>
+<p>Results reported in the GPTQ paper: a 175B model quantized in about four GPU hours to 3 or 4 bits, with little accuracy loss and end-to-end speedups of about 3.25 times on an A100 and 4.5 times on an A6000 over FP16 (because the 4-bit model fits on fewer GPUs and reads fewer bytes).</p>
+<h3>AWQ: protect the weights that see large activations</h3>
+<p>AWQ observes that not all weights matter equally: protecting about 1% of salient weight channels greatly reduces error, and saliency is best judged by the size of the <em>activations</em> that multiply them, not by the weights themselves. Instead of keeping those channels in 16-bit (awkward for kernels), AWQ multiplies each important input channel's weights by a factor s &gt; 1 before quantizing, and divides the matching activation by s. The product w × x is unchanged, but the important weight now uses more of the code range, so its relative rounding error shrinks.</p>
+<div class="box ex">
+  <span class="lbl">Worked example</span>
+  <p>A weight 0.65 on a grid with step 1: it rounds to 1.0, error 0.35. With s = 2: 0.65 × 2 = 1.3 rounds to 1.0, which stands for 1.0 ÷ 2 = 0.5 in the original units. Error 0.15. The division by s is folded into the previous layer (for example the RMSNorm weights), so it costs nothing at run time.</p>
+</div>
+<p>AWQ needs only activation statistics, no backpropagation and no weight updates, so it overfits the calibration set less. It is the most common 4-bit format for weight-only serving on GPUs, alongside GPTQ.</p>
+<h3>SmoothQuant: move the difficulty from activations to weights</h3>
+<p>SmoothQuant targets W8A8. Activations have outlier channels; weights do not. So divide each activation channel j by a factor sⱼ and multiply the matching weight row by sⱼ. Again the product is unchanged:</p>
+<div class="formula">Y = X W = (X ÷ s) (s W) &nbsp;&nbsp; sⱼ = max|Xⱼ|^α ÷ max|Wⱼ|^(1−α)</div>
+<p>With α = 0.5 the outliers are shared evenly: activations get smaller peaks, weights get slightly larger ones, and both quantize well to INT8. The paper reports up to 1.56 times speedup and 2 times memory reduction with negligible accuracy loss. The same "rescale before quantizing" idea reappears in newer methods that rotate the hidden space (for example with Hadamard matrices) to spread outliers across all channels; vLLM supports such rotated NVFP4 checkpoints.</p>
+<div class="tbl"><table>
+<tr><th>Method</th><th>Target</th><th>Needs data?</th><th>Core trick</th></tr>
+<tr><td>RTN</td><td>Any, best at 8 bits</td><td>No</td><td>Round each weight to the nearest code</td></tr>
+<tr><td>GPTQ</td><td>W4A16, W3A16</td><td>Yes, small calibration set</td><td>Correct each rounding error using the weights not yet rounded</td></tr>
+<tr><td>AWQ</td><td>W4A16</td><td>Yes, activation statistics only</td><td>Scale up salient channels before rounding</td></tr>
+<tr><td>SmoothQuant</td><td>W8A8 INT8</td><td>Yes, activation maxima</td><td>Shift outliers from activations into weights</td></tr>
+</table></div>
+
+<h2 id="formats">5. FP8 and FP4 in serving</h2>
+<p>Chapter 1.3 explained why floating-point formats handle outliers better than integers: the exponent gives a wide range. For serving this means:</p>
+<ul>
+  <li><strong>FP8 E4M3</strong> (4 exponent bits, 3 mantissa bits) reaches ±448 and is used for weights and activations. <strong>E5M2</strong> reaches ±57,344 with less precision. FP8 matmuls need compute capability 8.9 or newer (Ada, Hopper, Blackwell). On Turing and Ampere, vLLM still runs FP8 checkpoints, as weight-only W8A16 through its Marlin kernels.</li>
+  <li><strong>MXFP8 and MXFP4</strong> add one power-of-two scale per 32 values; <strong>NVFP4</strong> one FP8 scale per 16 values plus a tensor scale. Blackwell tensor cores apply these scales in hardware.</li>
+  <li><strong>INT4 weight-only</strong> (GPTQ, AWQ) runs on almost any GPU, because the math stays in 16-bit.</li>
+</ul>
+<p>Practitioners' rule of thumb, which both the Kiely book and the vLLM docs support: FP8 (with per-channel or block scales) is the sweet spot for quality-sensitive serving on Hopper and Blackwell; 4-bit is for fitting large models on fewer or smaller GPUs, and needs careful evaluation.</p>
+
+<h3>Where the speed comes from</h3>
+<div class="widget" id="spW">
+  <div class="wt">Interactive: one decode step of Llama 3.1 8B on an H100</div>
+  <div class="ws">An idealized roofline (chapter 2.5): step time = the larger of math time and memory time. W4A16 reads the fewest bytes but does its math in BF16; FP8 halves the bytes and doubles the math rate. Real kernels reach less than these peaks, and 4-bit kernels also spend time unpacking.</div>
+  <div class="ctrls">
+    <label>Batch: <span class="mono" id="spBv"></span><input type="range" id="spB" min="0" max="10" step="1" value="0"></label>
+    <label>Context per sequence <select id="spT"><option value="1024">1K</option><option value="8192" selected>8K</option><option value="32768">32K</option></select></label>
+    <label><input type="checkbox" id="spK"> FP8 KV cache</label>
+  </div>
+  <div class="svgwrap"><svg id="spSvg" viewBox="0 0 680 220" width="680" style="max-width:100%;height:auto" role="img" aria-label="Step time per precision scheme"></svg></div>
+  <div class="ws" id="spNote"></div>
+</div>
+<p>Move the batch from 1 to 1,024. At batch 1, W4A16 wins: weights dominate the bytes. As batch and context grow, the KV cache dominates the bytes (weight-only quantization does not touch it) and eventually the math dominates the time (W4A16 still runs in BF16). That is why large-scale serving prefers W8A8 FP8 plus an FP8 KV cache, while single-user local inference prefers 4-bit weights.</p>
+
+<h2 id="what">6. What to quantize, and what to leave alone</h2>
+<p>Parts of the model differ in how much error they tolerate. From least to most sensitive:</p>
+<ol>
+  <li><strong>Linear-layer weights.</strong> The bulk of the bytes and the safest to quantize.</li>
+  <li><strong>Activations</strong> (matmul inputs). Need good scales because of outliers.</li>
+  <li><strong>KV cache.</strong> Errors in a cached key or value affect every later token that attends to it.</li>
+  <li><strong>Attention math itself</strong> (scores and softmax). Almost always kept in higher precision.</li>
+</ol>
+<p>Even within the linear layers, recipes commonly skip the output head (<code>lm_head</code>), and some skip the first and last blocks. MoE routers are usually kept in high precision. For MoE models, quantizing the experts gives most of the memory gain because they hold most of the parameters (chapter 2.6).</p>
+
+<h3>KV cache quantization</h3>
+<p>Chapter 2.4 showed that at long contexts and large batches the KV cache, not the weights, fills memory and dominates decode bytes. An FP8 KV cache halves both: twice as many tokens fit, and each decode step reads half the KV bytes. In vLLM:</p>
+<pre>vllm serve Qwen/Qwen2.5-7B-Instruct --kv-cache-dtype fp8</pre>
+<ul>
+  <li>Without calibration, vLLM uses a scale of 1.0 for keys and values. That works when the values already fit FP8's range, but calibrated scales (computed with llm-compressor and stored in the checkpoint) are the recommended path.</li>
+  <li>Scales can be per tensor or per attention head (per-head needs calibration and specific attention backends).</li>
+  <li>Some layer types are more sensitive. vLLM can leave chosen layers unquantized, for example sliding-window layers: <code>--kv-cache-dtype-skip-layers sliding_window</code>.</li>
+  <li>With some backends (FlashAttention 3), the attention math itself then runs in FP8, and the queries are quantized too.</li>
+</ul>
+
+<h2 id="quality">7. Measuring quality</h2>
+<p>The production standard is no measurable quality loss. Three checks, from cheapest to most meaningful:</p>
+<ol>
+  <li><strong>Perplexity</strong> on held-out text. Perplexity is e raised to the average loss per token: how "surprised" the model is by real text. Lower is better; compare quantized against original on the same text and window length. Cheap and sensitive, but a small perplexity change can hide a large change on hard tasks.</li>
+  <li><strong>Standard benchmarks</strong> (for example with lm-evaluation-harness): MMLU-style knowledge, GSM8K-style math, coding. Long-context and reasoning tasks are often the first to degrade.</li>
+  <li><strong>Your own evals</strong> on real prompts from your product. This is the one that decides.</li>
+</ol>
+<div class="box watch">
+  <span class="lbl">Watch out: noise</span>
+  <p>Scores vary between runs, especially with sampling. Measure the original model's spread over several seeds first. A quantized score inside that spread is not a regression; one outside it is, even if it looks small.</p>
+</div>
+<p>If quality drops, the levers, in order: a finer granularity (per-channel, then smaller groups), a better algorithm (RTN to GPTQ or AWQ), skipping sensitive layers, a better calibration set, a higher-precision format (FP4 to FP8), and finally QAT.</p>
+
+<h2 id="expert">8. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Quantization-aware training and native low-precision models</span>
+  <p>QAT simulates the low precision during training ("fake quantization": quantize then dequantize in the forward pass), so the weights settle where rounding hurts least. Some labs now release models trained or post-trained this way, for example GPT-OSS with MXFP4 expert weights and Kimi K2 Thinking with INT4 weights. For those, the low-precision checkpoint is the original, not an approximation.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">GGUF k-quants and very low bit widths</span>
+  <p>GGUF (chapter 3.6) uses two-level block scales: small sub-blocks each have a scale, and those scales are themselves quantized with a scale per super-block. Mixed "dynamic" recipes keep sensitive tensors at higher precision and push others very low, so the average can be under 2 bits per weight. BitNet b1.58 goes further with ternary weights (−1, 0, 1) trained from scratch, which turns matmuls into additions. These matter most for local and edge inference.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Accumulation precision</span>
+  <p>Low-precision inputs still need high-precision sums (chapter 1.3, section 8). The DeepSeek-V3 report measured that FP8 matmul accumulation on its H800 (Hopper) GPUs keeps only about 14 bits, with relative errors up to nearly 2%, so it promotes partial sums to FP32 on CUDA cores every 128 elements to stay accurate. Kernel libraries handle this, but it explains why "FP8 everywhere" is not free.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Packing and kernels</span>
+  <p>A 4-bit weight is not addressable on its own: kernels pack eight of them into one 32-bit word and unpack them in registers before the 16-bit matmul. AWQ's odd packing order exists so one instruction can unpack two values at once. Marlin, Machete and similar kernels fuse the unpack, scale and matmul; this fused work is why W4A16 gains shrink as the batch grows (chapter 5.4 explains kernel fusion).</p>
+</div>
+
+<h2 id="mistakes">9. Common mistakes</h2>
+<ul>
+  <li>Expecting 2 times speed from halving the bits. Expect 30% to 50% per level, and check where your workload sits on the roofline.</li>
+  <li>Using weight-only INT4 for a high-throughput, large-batch service and wondering why it is no faster than FP16.</li>
+  <li>Judging quality on perplexity alone, or on one benchmark run without measuring noise.</li>
+  <li>Calibrating on generic web text and serving code, or another language.</li>
+  <li>Turning on an FP8 KV cache without calibrated scales and without re-running long-context evals.</li>
+  <li>Quantizing <code>lm_head</code>, the MoE router or the embedding table in a first attempt.</li>
+  <li>Comparing an FP8 run on an H100 with a BF16 run on another GPU and crediting the difference to quantization.</li>
+</ul>
+
+<h2 id="lab">10. Lab</h2>
+<p><strong>Goal:</strong> measure what each quantization choice does to a real model's quality, see activation outliers with your own eyes, and serve a quantized model.</p>
+<h3>Part A: the 100 Days notebooks</h3>
+<p>Run days 13 (number formats) and 14 (GPTQ, AWQ and SmoothQuant from scratch) of <em>100 Days of Inference</em>. Day 14 implements all three algorithms on a small layer and compares them with RTN. Read its H100 FLOP figures against the note in References.</p>
+<h3>Part B: predict before you measure</h3>
+<p>For Llama 3.1 70B, fill in the weight memory for BF16, FP8, W4A16 with group 128 and one FP16 scale per group, and NVFP4. Then answer: how many H100 80 GB GPUs does each need just for weights?</p>
+<details><summary>Answer</summary><p>70.6B parameters. BF16: 141 GB, 2 GPUs. FP8: 70.6 GB, 1 GPU but with only about 9 GB left for KV cache and activations, so 2 in practice. W4A16 g128: 4.125 bits, about 36 GB, 1 GPU. NVFP4: 4.5 bits, about 40 GB, 1 GPU (needs Blackwell for FP4 math). The KV cache then decides how many requests fit (chapter 2.4).</p></details>
+
+<h3>Part C: quality vs format on Qwen2.5-0.5B (CPU, about 15 minutes)</h3>
+<p>This script fake-quantizes every linear layer (quantize, then dequantize back to FP32) and measures perplexity on WikiText-2. Fake quantization reproduces the accuracy of real quantization without needing special kernels. Predict the order of the results before running.</p>
+<pre>import torch, math, copy
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
+MID = "Qwen/Qwen2.5-0.5B"
+tok = AutoTokenizer.from_pretrained(MID)
+base = AutoModelForCausalLM.from_pretrained(MID, dtype=torch.float32).eval()
+text = "\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"])
+ids = tok(text, return_tensors="pt").input_ids[:, :512*16]
+
+@torch.no_grad()
+def ppl(model, n=16, L=512):
+    nll = sum(model(ids[:, i*L:(i+1)*L], labels=ids[:, i*L:(i+1)*L]).loss.item() for i in range(n))
+    return math.exp(nll / n)
+
+def fq_int(w, bits=4, group=None, sym=True):
+    """group=None: one scale per output row; group=-1: one per tensor; else per group."""
+    g = w.reshape(1, -1) if group == -1 else (w if group is None else w.reshape(-1, group))
+    if sym:
+        qmax = 2**(bits-1) - 1
+        scale = g.abs().amax(1, keepdim=True).clamp(min=1e-8) / qmax
+        out = torch.clamp(torch.round(g / scale), -qmax-1, qmax) * scale
+    else:
+        # TODO: asymmetric. scale = (max-min)/(2^bits-1); zero = round(-min/scale);
+        #       code = clamp(round(g/scale)+zero, 0, 2^bits-1); out = (code-zero)*scale
+        raise NotImplementedError
+    return out.reshape(w.shape)
+
+def quantized(fn):
+    m = copy.deepcopy(base)
+    for name, mod in m.named_modules():
+        if isinstance(mod, torch.nn.Linear) and "lm_head" not in name:
+            mod.weight.data = fn(mod.weight.data)
+    return m
+
+print("FP32 reference", round(ppl(base), 2))
+for label, fn in [("W8 per-channel", lambda w: fq_int(w, 8)),
+                  ("W4 per-tensor",  lambda w: fq_int(w, 4, -1)),
+                  ("W4 per-channel", lambda w: fq_int(w, 4)),
+                  ("W4 group 128",   lambda w: fq_int(w, 4, 128)),
+                  ("W4 g128 zero point", lambda w: fq_int(w, 4, 128, sym=False)),
+                  ("W3 g128 zero point", lambda w: fq_int(w, 3, 128, sym=False))]:
+    print(label, round(ppl(quantized(fn)), 2))</pre>
+<details><summary>Solution: asymmetric branch</summary>
+<pre>        qmax = 2**bits - 1
+        lo, hi = g.amin(1, keepdim=True), g.amax(1, keepdim=True)
+        scale = (hi - lo).clamp(min=1e-8) / qmax
+        zero = torch.round(-lo / scale)
+        out = (torch.clamp(torch.round(g / scale) + zero, 0, qmax) - zero) * scale</pre></details>
+<details><summary>What we measured, and why</summary><div id="labC"><div class="tbl"><table>
+<tr><th>Weights</th><th class="n">Perplexity</th></tr>
+<tr><td>FP32 reference</td><td class="n">20.29</td></tr>
+<tr><td>W8 per-channel</td><td class="n">20.34</td></tr>
+<tr><td>W4 per-tensor</td><td class="n">about 10⁸ (broken)</td></tr>
+<tr><td>W4 per-channel</td><td class="n">47.25</td></tr>
+<tr><td>W4 group 128, symmetric</td><td class="n">27.93</td></tr>
+<tr><td>W4 group 128, zero point</td><td class="n">24.23</td></tr>
+<tr><td>W4 NVFP4-style, block 16 (extension)</td><td class="n">23.01</td></tr>
+<tr><td>W3 group 128, zero point</td><td class="n">72.34</td></tr>
+</table></div>
+<p>INT8 per channel is almost free (+0.2%). At 4 bits, granularity decides everything: one scale for a whole matrix destroys the model, one per row more than doubles perplexity, and groups of 128 bring it within about 20%. A zero point helps further, and the floating-point FP4 grid with small blocks does best. 3 bits is too far for plain RTN on a model this small. Small models are more sensitive than large ones, and GPTQ or AWQ would close much of the remaining 4-bit gap. Your numbers may differ slightly with library versions.</p></div></details>
+<p><strong>Extension:</strong> write an NVFP4-style quantizer (values from the FP4 grid 0, 0.5, 1, 1.5, 2, 3, 4, 6 with one FP8 scale per 16 values: cast the scale with <code>.to(torch.float8_e4m3fn)</code>) and place it in the table.</p>
+
+<h3>Part D: activation outliers and SmoothQuant (CPU, about 15 minutes)</h3>
+<p>Record each linear layer's largest input value per channel on calibration text, then compare W8A8 with per-tensor activation scales, per-token scales, and SmoothQuant.</p>
+<pre>linears = lambda m: [(n, x) for n, x in m.named_modules()
+                     if isinstance(x, torch.nn.Linear) and "lm_head" not in n]
+cal = tok(text, return_tensors="pt").input_ids[:, 100000:100000 + 512*4]
+stats = {}
+def rec(name):
+    def h(mod, inp):
+        a = inp[0].detach().abs().reshape(-1, inp[0].shape[-1]).amax(0)
+        stats[name] = torch.maximum(stats.get(name, a), a)
+    return h
+hooks = [mod.register_forward_pre_hook(rec(n)) for n, mod in linears(base)]
+with torch.no_grad():
+    for i in range(4): base(cal[:, i*512:(i+1)*512])
+for h in hooks: h.remove()
+for n in ["model.layers.5.self_attn.q_proj", "model.layers.5.mlp.down_proj"]:
+    a = stats[n]; print(n, "max/median =", round((a.max() / a.median()).item()))
+
+def fq(x, bits, dim):                       # symmetric; dim=None means per tensor
+    qmax = 2**(bits-1) - 1
+    s = (x.abs().amax() if dim is None else x.abs().amax(dim, keepdim=True)).clamp(min=1e-8) / qmax
+    return torch.clamp(torch.round(x / s), -qmax-1, qmax) * s
+
+def w8a8(act_dim, alpha=None):
+    m = copy.deepcopy(base)
+    for n, mod in linears(m):
+        W, s = mod.weight.data, None
+        if alpha is not None:
+            # TODO: SmoothQuant factor per input channel j:
+            #   s_j = max|X_j|^alpha / max|W[:, j]|^(1-alpha)   (stats[n] holds max|X_j|)
+            # then W = W * s  (and the hook divides the input by s)
+            pass
+        mod.weight.data = fq(W, 8, 1)       # weights: one scale per output channel
+        def pre(mod, inp, s=s):
+            x = inp[0] if s is None else inp[0] / s
+            return (fq(x, 8, act_dim),)
+        mod.register_forward_pre_hook(pre)
+    return m
+
+for label, args in [("per-tensor A8", (None,)), ("per-token A8", (-1,)),
+                    ("per-tensor A8 + SmoothQuant", (None, 0.5))]:
+    print(label, round(ppl(w8a8(*args), n=8), 2))</pre>
+<details><summary>Solution: SmoothQuant factor</summary>
+<pre>            s = stats[n].clamp(min=1e-5) ** alpha / W.abs().amax(0).clamp(min=1e-5) ** (1 - alpha)
+            W = W * s</pre></details>
+<details><summary>What we measured, and why</summary><div id="labD"><p>Outlier ratios (largest ÷ median input channel): q_proj of layer 5 about 11, down_proj of layer 5 about 63, down_proj of layer 20 about 16.</p>
+<div class="tbl"><table>
+<tr><th>W8A8 variant (8 windows of 512 tokens)</th><th class="n">Perplexity</th></tr>
+<tr><td>FP32 reference</td><td class="n">18.01</td></tr>
+<tr><td>Per-tensor activation scale</td><td class="n">108.30</td></tr>
+<tr><td>Per-token activation scale</td><td class="n">18.57</td></tr>
+<tr><td>Per-tensor + SmoothQuant (α = 0.5)</td><td class="n">26.16</td></tr>
+<tr><td>Per-token + SmoothQuant (α = 0.5), add this one yourself</td><td class="n">18.25</td></tr>
+</table></div>
+<p>One shared activation scale per tensor wrecks the model: the outlier channels set the scale. Smoothing alone recovers most of the loss without any run-time cost. Dynamic per-token scales do even better here, and the two combined come within about 1% of the reference. This is why production FP8 recipes use dynamic per-token activation scales, and why INT8 W8A8 relied on smoothing.</p></div></details>
+
+<h3>Part E: serve a 4-bit model (T4)</h3>
+<p>On a Colab T4, start vLLM twice and compare the startup log lines for model memory and KV cache size, then run the same short benchmark against each (chapter 3.1, Part D):</p>
+<pre>vllm serve Qwen/Qwen2.5-1.5B-Instruct --dtype half --max-model-len 4096
+vllm serve Qwen/Qwen2.5-1.5B-Instruct-AWQ --max-model-len 4096</pre>
+<p>Predict first: how much smaller are the weights, and how many more KV tokens fit? Then measure single-request tokens per second and throughput at 32 concurrent requests. Explain with section 5 why the gap is larger at concurrency 1 than at 32. On the T4 (compute capability 7.5), FP8 checkpoints would run only as weight-only W8A16 (section 5), so this lab uses AWQ.</p>
+
+<h2 id="realworld">11. In the real world</h2>
+<div class="box real">
+  <span class="lbl">How teams use quantization</span>
+  <ul>
+    <li><strong>Hosted APIs on Hopper and Blackwell</strong> commonly serve FP8 weights and activations, often with an FP8 KV cache, after checking evals against the BF16 original.</li>
+    <li><strong>Model providers</strong> publish FP8, AWQ, GPTQ and NVFP4 checkpoints next to the BF16 ones, so most teams never run a quantizer themselves.</li>
+    <li><strong>Very large MoE models</strong> (DeepSeek, Kimi, GPT-OSS) ship in FP8, INT4 or MXFP4 so a single 8-GPU node can hold them.</li>
+    <li><strong>Local inference</strong> (llama.cpp, Ollama, LM Studio) runs almost entirely on 4-bit-class GGUF files.</li>
+    <li><strong>Quality-critical domains</strong> stay in BF16 or FP8 and get their speed from the lossless techniques in the rest of Part 4.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">12. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz41"></div>
+<script type="application/json" id="qz41">[
+{"q":"A service runs Llama 8B at batch 256 with 8K contexts. Which change most likely cuts its decode step time?","o":["W4A16 AWQ weights","W8A8 FP8 plus an FP8 KV cache","4-bit embeddings","Nothing: decode is compute-bound"],"a":1,"e":"At that batch and context the KV cache dominates bytes and the math is significant; W4A16 leaves both untouched."},
+{"q":"Why does one large activation channel ruin per-tensor INT8 activation quantization?","o":["It overflows the accumulator","The shared scale grows so large that small values collapse to a few codes","INT8 cannot store negative numbers","It changes the weights"],"a":1,"e":"One scale per tensor means the step size is set by the largest value."},
+{"q":"What does AWQ change before rounding?","o":["It prunes 1% of weights","It multiplies salient weight channels by a factor and divides their activations by it","It retrains the model","It quantizes activations to INT8"],"a":1,"e":"The product is unchanged, but important weights use more of the code range."},
+{"q":"SmoothQuant with alpha = 0.5 does what to activation outliers?","o":["Removes them","Moves part of their magnitude into the weights","Clips them to zero","Stores them in FP32"],"a":1,"e":"X/s and sW keep the product, balancing the difficulty between the two."},
+{"q":"On a T4 (compute capability 7.5), an FP8 checkpoint in vLLM runs as:","o":["Full FP8 W8A8","Weight-only W8A16","It cannot load","INT8"],"a":1,"e":"FP8 math needs compute capability 8.9 or newer; older GPUs dequantize to 16-bit."},
+{"q":"Dynamic per-token activation scales cost:","o":["A calibration dataset","A small reduction per matmul at run time","Twice the memory","Retraining"],"a":1,"e":"The kernel finds each token's max on the fly; no calibration is needed."},
+{"q":"A quantized model's MMLU score is 0.2 points lower than BF16 in one run. The next step is:","o":["Reject the quantized model","Measure the run-to-run spread of the BF16 model first","Switch to INT4","Report a 0.2 point loss"],"a":1,"e":"Only a difference larger than the noise is a real regression."}
+]</script>
+
+<h2 id="summary">13. Summary</h2>
+<ul>
+  <li>Decode gains from fewer bytes; prefill gains only when the matmul itself runs in low precision. Expect 30% to 50% per precision level, not the full bit ratio.</li>
+  <li>Quantizers map values to codes with a scale (and maybe a zero point). Granularity and clipping decide how outliers hurt.</li>
+  <li>Weights are easy and static; activations have outlier channels and need per-token dynamic scales or smoothing.</li>
+  <li>GPTQ corrects rounding errors with the remaining weights; AWQ protects channels with large activations; SmoothQuant moves outliers from activations into weights.</li>
+  <li>FP8 (W8A8 plus FP8 KV) is the production default on Hopper and newer; 4-bit weight-only suits small-batch and memory-limited serving; NVFP4 and MXFP4 need Blackwell.</li>
+  <li>Quantize weights first, then activations, then the KV cache; keep attention math, <code>lm_head</code> and routers in high precision.</li>
+  <li>Prove quality with perplexity, benchmarks and your own evals, compared against the original's noise.</li>
+</ul>
+
+<h2 id="refs">14. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 5.1</td><td>Number formats for inference, sensitivity of model components, the 30% to 50% per-level rule, and the three quality checks.</td></tr>
+<tr><td><a href="https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-quantization">Maarten Grootendorst: A Visual Guide to Quantization</a></td><td>Symmetric and asymmetric mapping, clipping, calibration, static vs dynamic, GPTQ, GGUF, QAT and BitNet with diagrams.</td></tr>
+<tr><td><a href="https://liyuan24.github.io/writings/2026_01_06_post_training_quantization.html">Liyuan: Post-training quantization</a></td><td>RTN and AWQ worked examples, and why AWQ packs 4-bit weights in an unusual order.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2210.17323">Frantar et al., GPTQ</a></td><td>Second-order error compensation; 175B in about four GPU hours.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2306.00978">Lin et al., AWQ</a></td><td>Activation-aware scaling of salient channels.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2211.10438">Xiao et al., SmoothQuant</a></td><td>Migrating activation outliers into weights for W8A8.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/features/quantization/">vLLM: Quantization</a>, <a href="https://docs.vllm.ai/en/latest/features/quantization/llm_compressor/fp8/">FP8 W8A8</a> and <a href="https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache/">Quantized KV cache</a></td><td>Supported formats and hardware, the FP8_DYNAMIC recipe, FP8 ranges, KV scale options and skipped layers.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, chapter on inference optimizations (quantization section)</td><td>Weight-only vs activation quantization, Transformer Engine scaling, and the PTQ workflow.</td></tr>
+<tr><td>Chi Wang and Peiheng Hu, <em>Hands-On LLM Serving and Optimization</em>, chapter 6</td><td>Quantization among the essential serving optimizations.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 technical report</a>, section 3.3</td><td>FP8 accumulation precision on H800 and promotion to FP32 every 128 elements.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, days 13 and 14</td><td>Notebooks implementing the formats and the three algorithms.</td></tr>
+<tr><td><a href="https://github.com/vipulSharma18/Survey-of-Quantization-Formats">Survey of Quantization Formats</a></td><td>A broader catalogue of formats, for skimming.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The day 13 README of <em>100 Days of Inference</em> quotes 3.9 PFLOP/s FP8 and 1.98 PFLOP/s FP16 for the H100. Those are the with-sparsity figures; the dense figures used in this book are about 1,979 and 989 TFLOP/s. The ratio (2 times) is the same.</li>
+  <li>The Grootendorst guide says weights with smaller values in the Hessian are more important. In GPTQ's framework it is the other way round for the Hessian itself (large diagonal entries mean the output is more sensitive to that weight); small values in the <em>inverse</em> Hessian mark important weights, which the guide also says correctly.</li>
+  <li><em>AI Systems Performance Engineering</em> calls SmoothQuant "calibration-free". It is training-free, but it uses a small calibration set to find the activation maxima that set the smoothing factors.</li>
+  <li>The Kiely book advises against integer formats for quality-sensitive production work. Many production deployments do use INT4 weight-only (AWQ, GPTQ) successfully; treat the advice as "evaluate integer formats carefully", which section 7 does.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Lab Parts C and D were run on CPU with PyTorch 2.15 and Transformers 5.22.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+/* ---------- quantize-a-row widget ---------- */
+const BASE=[0.21,-0.47,0.93,-1.32,0.05,0.64,-0.18,1.71,-0.83,0.36,-0.02,-1.05,0.48,0.12,-0.66,1.18];
+function qrow(){
+  const bits=+$('qzB').value,mode=$('qzM').value,G=+$('qzG').value,clip=+$('qzC').value;
+  $('qzCv').textContent=clip>=1?'off':Math.round(clip*100)+'% of max';
+  const w=BASE.slice();if($('qzO').checked)w[7]=4.0;
+  const out=[],grids=[];
+  for(let g0=0;g0<16;g0+=G){const g=w.slice(g0,g0+G);let lo,hi,scale,zero=0;const codes=[];
+    if(mode==='sym'){const m=Math.max(...g.map(Math.abs))*clip;const qmax=2**(bits-1)-1;scale=m/qmax||1e-8;
+      g.forEach(x=>out.push(Math.max(-qmax-1,Math.min(qmax,Math.round(x/scale)))*scale));for(let c=-qmax-1;c<=qmax;c++)codes.push(c*scale);}
+    else{lo=Math.min(...g)*clip;hi=Math.max(...g)*clip;const qmax=2**bits-1;scale=(hi-lo)/qmax||1e-8;zero=Math.round(-lo/scale);
+      g.forEach(x=>out.push((Math.max(0,Math.min(qmax,Math.round(x/scale)+zero))-zero)*scale));for(let c=0;c<=qmax;c++)codes.push((c-zero)*scale);}
+    grids.push({g0,codes});}
+  const svg=$('qzSvg');svg.innerHTML='';const W=680,x0=40,x1=650,mn=-1.6,mx=4.2;const X=v=>x0+(v-mn)/(mx-mn)*(x1-x0);
+  el('line',{x1:x0,x2:x1,y1:40,y2:40,stroke:css('--line')},svg);el('line',{x1:x0,x2:x1,y1:140,y2:140,stroke:css('--line')},svg);
+  el('text',{x:x0,y:22,fill:css('--ink2'),'font-size':12},svg,'Original weights');el('text',{x:x0,y:122,fill:css('--ink2'),'font-size':12},svg,'Restored after quantization (ticks = representable values)');
+  [-1,0,1,2,3,4].forEach(v=>{el('line',{x1:X(v),x2:X(v),y1:180,y2:186,stroke:css('--ink2')},svg);el('text',{x:X(v),y:200,'text-anchor':'middle',fill:css('--ink2'),'font-size':11},svg,v);});
+  const cols=[css('--pre'),css('--dec'),css('--kv'),css('--good')];
+  grids.forEach((gr,i)=>{const c=G<16?cols[i%4]:css('--kv');gr.codes.forEach(v=>{if(v>=mn&&v<=mx)el('line',{x1:X(v),x2:X(v),y1:150+i*0,y2:166,stroke:c,'stroke-opacity':.45},svg);});});
+  w.forEach((v,i)=>{const gi=Math.floor(i/G);const c=G<16?cols[gi%4]:css('--kv');
+    el('circle',{cx:X(v),cy:40+(i%4)*8-12,r:4.5,fill:css('--mute')},svg);
+    el('circle',{cx:X(out[i]),cy:140+(i%4)*8-12,r:4.5,fill:c},svg);});
+  const err=w.map((v,i)=>Math.abs(v-out[i]));const nonO=err.filter((e,i)=>!( $('qzO').checked&&i===7));
+  const zeros=out.filter((v,i)=>v===0&&w[i]!==0).length;
+  $('qzStats').innerHTML=[['Mean absolute error',(err.reduce((a,b)=>a+b,0)/16).toFixed(3)],['Mean error, ordinary weights',(nonO.reduce((a,b)=>a+b,0)/nonO.length).toFixed(3)],['Error on weight 8 (the outlier slot)',err[7].toFixed(3)],['Non-zero weights rounded to 0',zeros]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');
+}
+['qzB','qzM','qzG','qzO','qzC'].forEach(id=>$(id).addEventListener('input',qrow));IE.onTheme(qrow);
+
+/* ---------- precision vs batch widget ---------- */
+const P=8.03e9,L=32,HKV=8,D=128,BW=3.35e12;
+const SCH=[{n:'BF16 (W16A16)',wb:2,fl:989e12,c:'--mute'},{n:'W8A8 FP8',wb:1,fl:1979e12,c:'--kv'},{n:'W4A16 INT4 (g128)',wb:4.125/8,fl:989e12,c:'--dec'}];
+function sp(){
+  const B=2**+$('spB').value,T=+$('spT').value,kvb=$('spK').checked?1:2;$('spBv').textContent=B;
+  const kv=2*L*HKV*D*kvb*T*B;
+  const rows=SCH.map(s=>{const mem=(P*s.wb+kv)/BW,math=2*P*B/s.fl;return {...s,mem,math,t:Math.max(mem,math)};});
+  const svg=$('spSvg');svg.innerHTML='';const mx=Math.max(...rows.map(r=>r.t))*1.05;const x0=150,x1=500;
+  rows.forEach((r,i)=>{const y=20+i*62;el('text',{x:0,y:y+22,fill:css('--ink'),'font-size':13},svg,r.n);
+    el('rect',{x:x0,y:y,width:(x1-x0)*r.t/mx,height:34,rx:4,fill:css(r.c)},svg);
+    el('text',{x:x0+(x1-x0)*r.t/mx+6,y:y+15,fill:css('--ink'),'font-size':12},svg,(r.t*1e3).toFixed(2)+' ms');
+    el('text',{x:x0+(x1-x0)*r.t/mx+6,y:y+30,fill:css('--ink2'),'font-size':11},svg,(r.mem>=r.math?'memory-bound':'compute-bound')+' · '+IE.int(B/r.t)+' tok/s');});
+  const wbytes=P*2,share=kv/(wbytes+kv);
+  $('spNote').textContent=`KV cache read per step: ${IE.gb(kv)} GB, about ${Math.round(share*100)}% of the BF16 step's bytes.${kv/1e9>70?' At this batch and context the KV cache would not fit on one 80 GB GPU; the bars are for comparison only.':''}`;
+}
+['spB','spT','spK'].forEach(id=>$(id).addEventListener('input',sp));IE.onTheme(sp);
+})();
+</script>
+
+</body>
+</html>

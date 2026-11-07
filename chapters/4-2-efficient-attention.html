@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>4.2 Efficient attention and attention kernels</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="4.2">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 4 · Chapter 4.2</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 4 · Model optimization · Chapter 4.2</div>
+<h1>Efficient attention and attention kernels</h1>
+<p class="lede">Attention is the one part of a transformer whose cost grows with the context. At short contexts it is a small share of the work; at 128K tokens it is most of it. There are two kinds of fixes. Architecture fixes change what is computed or stored: fewer KV heads, compressed caches, windows, sparse selection. Kernel fixes compute exactly the same thing with far less memory traffic: FlashAttention and its decode-time relatives. This chapter covers both, and builds FlashAttention's core trick, the online softmax, with numbers you can check by hand.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 4 to 5 hours with the lab</span>
+  <span class="chip">Needs: 2.2, 2.4, 2.5</span>
+  <span class="chip">Compute: Colab CPU; T4 optional</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Does FlashAttention approximate attention?</li>
+    <li>Which shrinks the KV cache more for the same model: GQA with 8 KV heads, or MLA?</li>
+    <li>Why does standard FlashAttention leave most of the GPU idle during decode at batch 1?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>No. It gives the same result as standard attention (up to floating-point rounding). It only changes the order of work so the large score matrix never goes to HBM.</li>
+    <li>Usually MLA. DeepSeek-style MLA stores one 576-value latent per token per layer, against 2 × 8 × 128 = 2,048 values for GQA with 8 KV heads of size 128.</li>
+    <li>It splits work across query tiles and batch. In decode there is one query per sequence, so there are too few tiles to fill all SMs. Flash-Decoding also splits along the keys.</li>
+  </ol></details>
+</div>
+
+<h2 id="cost">1. Why attention cost grows with context</h2>
+<p>Chapter 2.2 counted the work. For one layer and T tokens with model width d (all heads together):</p>
+<ul>
+  <li><strong>The linear layers</strong> (QKV projection, output projection, MLP) do about 2 × parameters FLOPs per token. Their cost grows linearly with T.</li>
+  <li><strong>The attention scores and weighted sum</strong> (Q Kᵀ and P V) do about 4 × T × d FLOPs per token without a mask, about half that with a causal mask. Over a whole prompt that is proportional to T²: it grows quadratically.</li>
+</ul>
+<p>In decode, each new token attends to all T earlier tokens: it reads T keys and T values per layer (the KV cache, chapter 2.4). So decode attention cost grows linearly with context, and at long contexts and large batches that KV read dominates the step.</p>
+<div class="widget" id="shW">
+  <div class="wt">Interactive: how much of prefill is attention?</div>
+  <div class="ws">Llama 3.1 8B (32 layers, width 4,096, about 8 billion parameters). Prefill FLOPs split into linear layers (2 × parameters per token) and causal attention (about 2 × T × width per token per layer). Move the context length.</div>
+  <div class="ctrls"><label>Prompt length: <span class="mono" id="shTv"></span><input type="range" id="shT" min="9" max="20" step="1" value="13"></label></div>
+  <div class="svgwrap"><svg id="shSvg" viewBox="0 0 680 120" width="680" style="max-width:100%;height:auto" role="img" aria-label="Share of prefill FLOPs in attention"></svg></div>
+  <div class="stats" id="shStats"></div>
+</div>
+<p>At 8K tokens attention is about 12% of prefill math. At 128K it is about two thirds. This is why every long-context model changes its attention, and why attention kernels get so much engineering.</p>
+
+<h2 id="heads">2. Fewer keys and values: MQA, GQA and MLA</h2>
+<p>Chapter 2.4 introduced these as ways to shrink the KV cache. Here is the full picture in one place, for a model with 80 layers, 64 query heads of size 128, in BF16.</p>
+<div class="tbl"><table>
+<tr><th>Variant</th><th>What is cached per token per layer</th><th class="n">Values per layer</th><th class="n">KV bytes per token</th><th>Used by</th></tr>
+<tr><td>MHA</td><td>K and V for all 64 heads</td><td class="n">16,384</td><td class="n">2.62 MB</td><td>Original transformer, GPT-2, Llama 2 7B</td></tr>
+<tr><td>GQA, 8 KV heads</td><td>K and V for 8 shared heads</td><td class="n">2,048</td><td class="n">320 KiB</td><td>Llama 3, Qwen2.5, Mistral</td></tr>
+<tr><td>MQA</td><td>K and V for 1 shared head</td><td class="n">256</td><td class="n">40 KiB</td><td>PaLM, Falcon 7B</td></tr>
+<tr><td>MLA (DeepSeek style)</td><td>One compressed latent (512) plus a small position key (64)</td><td class="n">576</td><td class="n">90 KiB</td><td>DeepSeek V2, V3; Kimi K2</td></tr>
+</table></div>
+<p>The trade-offs. MQA is smallest but loses quality, because every query head must share one key and one value. GQA is the common middle ground. MLA compresses keys and values into a low-rank latent that is expanded inside attention; it caches less than GQA-8 while keeping quality close to MHA, at the cost of extra math to expand the latent and specialized kernels. Note that MLA has no factor of 2: keys and values come from the same cached latent.</p>
+<div class="box watch">
+  <span class="lbl">Watch out</span>
+  <p>Fewer KV heads cut the KV <em>bytes</em>, not the score <em>math</em>. Every query head still computes scores against every cached token. GQA and MLA mainly speed up decode (fewer bytes) and raise capacity (more tokens fit); they do little for long-prompt prefill.</p>
+</div>
+
+<h2 id="windows">3. Attending to fewer tokens: windows, sinks and sparse attention</h2>
+<h3>Sliding windows and local/global mixes</h3>
+<p>A sliding-window layer attends only to the last W tokens. Its cache stops growing at W tokens and its cost per token is constant. Models like Gemma 2 and 3 alternate many local-window layers with a few global (full) layers, so only the global layers keep a full-length cache (chapter 2.4). Engines must store a different cache length per layer type (chapter 3.3).</p>
+<h3>Attention sinks</h3>
+<p>If you simply drop the oldest tokens from a model trained with full attention, quality collapses once the text is longer than the window. The StreamingLLM paper found why: models put large attention weight on the first few tokens regardless of their meaning, using them as a "sink" for attention that has nowhere better to go. Keeping those first few tokens' KV plus a recent window restores stable output, up to millions of tokens in their tests. It does not give the model memory of the dropped middle; it only stops the collapse. Some recent models add a learned sink value per head for the same reason.</p>
+<h3>Sparse attention: pick the tokens that matter</h3>
+<p>DeepSeek Sparse Attention (DSA), introduced with DeepSeek-V3.2, keeps the full cache but lets each query attend to only k = 2,048 selected tokens. A small, cheap "lightning indexer" (few heads, can run in FP8) scores every earlier token, and the top-k are used for real attention. Core attention cost drops from O(T²) to O(T × k); the indexer is still O(T²) but much cheaper per pair. The model is trained to work this way, first by aligning the indexer with dense attention, then by training with sparse attention. Sparse attention needs its own kernels and cache handling (vLLM lists separate sparse MLA backends).</p>
+<div class="tbl"><table>
+<tr><th>Approach</th><th>Cache size</th><th>Decode cost per token</th><th>Exact over the whole context?</th></tr>
+<tr><td>Full attention</td><td>Grows with T</td><td>Grows with T</td><td>Yes</td></tr>
+<tr><td>Sliding window W</td><td>Fixed at W</td><td>Fixed</td><td>No: only the last W tokens</td></tr>
+<tr><td>Window + sinks</td><td>Fixed</td><td>Fixed</td><td>No, but stable at any length</td></tr>
+<tr><td>Local/global mix</td><td>Full only in global layers</td><td>Mostly fixed</td><td>Yes, through the global layers</td></tr>
+<tr><td>Sparse top-k (DSA)</td><td>Grows with T</td><td>Fixed k plus a cheap indexer</td><td>Selected tokens only, chosen per query</td></tr>
+<tr><td>Linear / state-space (chapter 2.7)</td><td>Fixed state</td><td>Fixed</td><td>No: compressed state</td></tr>
+</table></div>
+
+<h2 id="memory">4. The real bottleneck in standard attention: memory traffic</h2>
+<p>Before FlashAttention, attention was computed in separate steps, each a separate kernel:</p>
+<ol>
+  <li>S = Q Kᵀ ÷ √d. Write S, a T × T matrix per head, to HBM.</li>
+  <li>Read S, apply the mask and softmax, write P (another T × T matrix) to HBM.</li>
+  <li>Read P and V, compute O = P V, write O.</li>
+</ol>
+<p>At T = 8,192 one head's S is 67 million numbers: 134 MB in BF16, written and read twice, for each of 32 heads in each of 32 layers. The softmax and masking do very little math per byte, so these steps are memory-bound, while the GPU's fast on-chip memory sits mostly unused.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>HBM:</strong> the GPU's main memory. Large (80 GB on an H100) but comparatively slow (about 3.35 TB/s).</p>
+  <p><strong>SRAM (shared memory):</strong> small, fast memory inside each streaming multiprocessor (SM), up to about 228 KB per SM on an H100, which has 132 SMs. Its total bandwidth is roughly an order of magnitude higher than HBM. The FlashAttention paper quotes about 19 TB/s for the A100's SRAM against 1.5 to 2.0 TB/s for its HBM.</p>
+  <p><strong>IO-aware algorithm:</strong> one designed around the cost of moving data between memory levels, not just the number of FLOPs.</p>
+</div>
+<p>Chapter 5.2 covers the memory hierarchy in depth. For now: if the T × T matrix could stay in SRAM, the slow steps would disappear. It does not fit. The answer is to never build it whole.</p>
+
+<h2 id="online">5. The key trick: online softmax</h2>
+<p>Softmax needs the maximum and the sum over a whole row of scores before any output can be finished. That seems to force you to compute the whole row first. It does not. You can process a row in blocks and fix up the earlier result whenever a new block changes the maximum.</p>
+<p>Keep three running values per query row: the maximum seen so far m, the sum of exponentials so far l (each relative to m), and an unnormalized output acc. For each new block of scores s with values v:</p>
+<div class="formula">m_new = max(m, max(s)) &nbsp; c = e^(m − m_new) &nbsp; l = l × c + Σ e^(s − m_new) &nbsp; acc = acc × c + Σ e^(s − m_new) × v</div>
+<p>At the end, output = acc ÷ l. The factor c rescales everything computed so far to the new maximum.</p>
+<div class="box ex">
+  <span class="lbl">Worked example (one query, four keys, two blocks)</span>
+  <p>Scores [1, 2 | 4, 3], values [10, 20 | 30, 40] (one number each, to keep it short).</p>
+  <p><strong>Block 1</strong> (scores 1, 2): m = 2. l = e^(−1) + e^0 = 0.368 + 1 = 1.368. acc = 0.368 × 10 + 1 × 20 = 23.68.</p>
+  <p><strong>Block 2</strong> (scores 4, 3): m_new = 4, so c = e^(2 − 4) = 0.135. l = 1.368 × 0.135 + e^0 + e^(−1) = 0.185 + 1 + 0.368 = 1.553. acc = 23.68 × 0.135 + 1 × 30 + 0.368 × 40 = 3.20 + 30 + 14.72 = 47.92.</p>
+  <p><strong>Result:</strong> 47.92 ÷ 1.553 = 30.86. Full softmax over [1, 2, 4, 3] gives weights [0.032, 0.087, 0.644, 0.237] and output 0.32 + 1.74 + 19.32 + 9.48 = 30.86. Same answer, without ever holding all four scores at once.</p>
+</div>
+<div class="widget" id="osW">
+  <div class="wt">Interactive: online softmax, block by block</div>
+  <div class="ws">Eight scores processed in blocks. Watch the running maximum, the rescale factor and the running output. The final value always equals the full softmax result.</div>
+  <div class="ctrls">
+    <label>Block size <select id="osB"><option>1</option><option selected>2</option><option>4</option><option>8</option></select></label>
+    <button id="osR">New random scores</button>
+    <button class="pri" id="osN">Next block</button><button id="os0">Restart</button>
+  </div>
+  <div class="svgwrap"><svg id="osSvg" viewBox="0 0 680 170" width="680" style="max-width:100%;height:auto" role="img" aria-label="Online softmax state per block"></svg></div>
+  <div class="stats" id="osStats"></div>
+</div>
+
+<h2 id="flash">6. FlashAttention: tiles that never leave the chip</h2>
+<p>With online softmax, attention becomes one fused kernel:</p>
+<ol>
+  <li>Split Q into row tiles (for example 128 queries) and K, V into column tiles.</li>
+  <li>Each thread block loads one Q tile into SRAM and keeps m, l and acc for its rows in registers or SRAM.</li>
+  <li>Loop over the K and V tiles: load a tile, compute that block of scores, apply the mask, update m, l and acc. With a causal mask, skip tiles that are entirely in the future.</li>
+  <li>Write only the final output tile (and one log-sum-exp number per row, used by training) to HBM.</li>
+</ol>
+<p>The math is the same as standard attention, slightly more because of the rescaling. What changes is memory: standard attention needs on the order of T × d + T² HBM accesses, FlashAttention on the order of T² × d² ÷ M, where M is the SRAM size. With d around 64 to 128 and M around 100 KB, that is many times fewer. Memory use also drops from quadratic to linear in T, because no T × T matrix is stored.</p>
+<p>The original paper reports 3 times faster GPT-2 training at 1K tokens and 2.4 times on long-range benchmarks, plus the ability to train at 16K and 64K contexts that were previously impractical. Since the result is exact, every engine uses it (or a relative) by default; in PyTorch, <code>F.scaled_dot_product_attention</code> picks a fused kernel when one is available.</p>
+
+<h3>Four generations</h3>
+<div class="tbl"><table>
+<tr><th>Version</th><th>Main change</th><th>Reported result</th></tr>
+<tr><td>FlashAttention (2022)</td><td>Tiling plus online softmax; IO-aware</td><td>2 to 4 times faster than optimized baselines; linear memory</td></tr>
+<tr><td>FlashAttention-2 (2023)</td><td>Fewer non-matmul FLOPs; parallel over sequence length too; better split of work between warps</td><td>About 2 times FA1; 50% to 73% of peak on A100</td></tr>
+<tr><td>FlashAttention-3 (2024)</td><td>Hopper features: asynchronous tensor cores and TMA, warp specialization, overlapping softmax with matmuls, FP8 with block quantization</td><td>Up to 740 TFLOP/s in FP16 (75% of H100 peak); close to 1.2 PFLOP/s in FP8</td></tr>
+<tr><td>FlashAttention-4 (2026)</td><td>Blackwell: tensor cores doubled while exponential units and shared memory did not, so it emulates some exponentials in software, skips unneeded rescales, and uses tensor memory; written in CuTe-DSL in Python</td><td>Up to 1,613 TFLOP/s in BF16 on B200 (71% of peak); up to 1.3 times cuDNN</td></tr>
+</table></div>
+<p>The pattern across generations: as tensor cores get faster, the non-matmul parts (softmax exponentials, rescaling, data movement) become the bottleneck, and each version hides or removes more of them.</p>
+
+<h2 id="decode">7. Attention in decode: different problem, different kernels</h2>
+<p>Decode attention has one query token per sequence (or a few, with speculative decoding). Two consequences:</p>
+<ul>
+  <li><strong>It is memory-bound.</strong> Each step reads the whole KV cache of every sequence and does little math per byte (chapter 2.5). The goal is to read the cache at full bandwidth.</li>
+  <li><strong>There is too little parallelism along queries.</strong> FlashAttention gives each query tile to a thread block. With one query per sequence and a small batch, only a few blocks run while most of the 132 SMs idle.</li>
+</ul>
+<h3>Flash-Decoding: split along the keys</h3>
+<p>Flash-Decoding splits each sequence's keys and values into chunks, processes the chunks in parallel on different SMs, and has each chunk write its partial output plus one number, its log-sum-exp. A small second kernel combines the chunks, weighting each by its log-sum-exp: the same online-softmax rescaling, applied across chunks. Its authors report attention itself up to 50 times faster than FlashAttention at long context and batch 1, and up to 8 times faster end-to-end generation for very long sequences. Part C of the lab implements the combine step.</p>
+<h3>Paged, batched and specialized kernels</h3>
+<p>Serving adds more requirements: keys and values live in pages (chapter 3.3), every sequence has a different length, prefill and decode tokens share one batch (chapter 3.2), and kernels must be compatible with CUDA graphs. Libraries built for this:</p>
+<ul>
+  <li><strong>FlashInfer:</strong> an attention engine for serving with a block-sparse view of paged KV, JIT-compiled variants and load-balanced scheduling. Its paper reports 29% to 69% lower inter-token latency than compiler backends. Used by SGLang and vLLM.</li>
+  <li><strong>FlashAttention's paged variants</strong> and vLLM's Triton attention backend (which runs on older GPUs such as the T4).</li>
+  <li><strong>MLA kernels</strong> (FlashMLA, CUTLASS MLA, FlashInfer MLA) and <strong>sparse MLA</strong> kernels for DeepSeek-style models.</li>
+</ul>
+<p>vLLM picks a backend automatically by GPU generation and model type: on Ampere and Hopper it prefers FlashAttention, then FlashInfer, then Triton; on Blackwell it prefers FlashInfer. You can override it:</p>
+<pre>vllm serve Qwen/Qwen2.5-7B-Instruct --attention-backend FLASHINFER</pre>
+
+<h2 id="expert">8. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Context parallelism and ring attention</span>
+  <p>A single 1M-token prefill does not fit one GPU's memory or time budget. Context (sequence) parallelism splits the sequence across GPUs; ring attention passes K and V blocks around a ring of GPUs while each computes its queries' partial results, combined with the same log-sum-exp trick. Chapter 4.5 places this among the parallelism strategies, and chapter 4.7 uses it for long context.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">FP8 attention</span>
+  <p>With an FP8 KV cache, some backends run the attention matmuls in FP8 too. FlashAttention-3 handles FP8's outliers with block quantization and "incoherent processing" (multiplying by a random orthogonal matrix to spread outliers), reporting 2.6 times lower error than a baseline FP8 attention. Softmax still runs in higher precision.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Why exponentials became a bottleneck</span>
+  <p>For head size 128, each score needs about 256 matmul FLOPs (on fast tensor cores) but also one exponential (on a much slower special-function unit). On the H100 the gap is already large; on the B200 tensor-core throughput doubled while the exponential units did not. FlashAttention-4 computes some exponentials with polynomial approximations on ordinary FMA units, and only rescales the output when the maximum grows enough to matter.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Long context is also a quality question</span>
+  <p>Efficient attention lets a model accept 1M tokens; it does not make the model use them well. Evaluations that go beyond simple "needle in a haystack" retrieval often find that effective context is much shorter than the advertised window. Chapter 4.7 covers long-context serving and evaluation.</p>
+</div>
+
+<h2 id="mistakes">9. Common mistakes</h2>
+<ul>
+  <li>Calling FlashAttention an approximation, or expecting it to change outputs.</li>
+  <li>Expecting GQA or MLA to speed up long-prompt prefill; they cut KV bytes, not score math.</li>
+  <li>Counting MLA's cache with the factor 2 for keys and values.</li>
+  <li>Dropping old tokens without keeping sink tokens, then blaming the model.</li>
+  <li>Benchmarking attention kernels with prefill shapes and deploying them for decode, or the reverse.</li>
+  <li>Forcing an attention backend from an old blog post on a different GPU generation.</li>
+</ul>
+
+<h2 id="lab">10. Lab</h2>
+<p><strong>Goal:</strong> compute KV sizes for each attention variant, build FlashAttention's tiled loop and Flash-Decoding's combine step in plain PyTorch, and check them against PyTorch's own kernel.</p>
+<h3>Part A: KV cache for each variant</h3>
+<p>For a model with 61 layers, 128 query heads of size 128 and BF16, compute KV bytes per token and for one 128K-token sequence with MHA, GQA-8, MQA and DeepSeek-style MLA (latent 512 + 64).</p>
+<details><summary>Answer</summary><p>Per token: MHA 2 × 61 × 128 × 128 × 2 = 4.0 MB; GQA-8 250 KB (249,856 bytes); MQA 31 KB; MLA 61 × 576 × 2 = 70 KB (70,272 bytes). For 131,072 tokens: MHA 524 GB (impossible on one node), GQA-8 32.7 GB, MQA 4.1 GB, MLA 9.2 GB. This is why DeepSeek-V3 (61 layers, 128 heads) uses MLA.</p></details>
+<h3>Part B: tiled attention with online softmax (CPU, seconds)</h3>
+<pre>import torch, math
+import torch.nn.functional as F
+torch.manual_seed(0)
+T, d = 1024, 64
+q, k, v = (torch.randn(T, d) for _ in range(3))
+
+def flash(q, k, v, Br=128, Bc=128):
+    out = torch.empty_like(q)
+    for i in range(0, T, Br):
+        qi = q[i:i+Br]
+        m = torch.full((qi.shape[0], 1), float("-inf"))   # running max per row
+        l = torch.zeros(qi.shape[0], 1)                    # running sum of exp
+        acc = torch.zeros(qi.shape[0], d)                  # running unnormalized output
+        for j in range(0, i + Br, Bc):                     # causal: skip future tiles
+            kj, vj = k[j:j+Bc], v[j:j+Bc]
+            s = qi @ kj.T / math.sqrt(d)
+            rows = torch.arange(i, i + qi.shape[0])[:, None]
+            cols = torch.arange(j, j + kj.shape[0])[None]
+            s = s.masked_fill(cols > rows, float("-inf"))
+            # TODO: m_new, p = exp(s - m_new), corr = exp(m - m_new)
+            # TODO: update l and acc with corr, then m = m_new
+        out[i:i+Br] = acc / l
+    return out
+
+ref = F.scaled_dot_product_attention(q[None], k[None], v[None], is_causal=True)[0]
+print("max error", (flash(q, k, v) - ref).abs().max().item())</pre>
+<details><summary>Solution</summary>
+<pre>            m_new = torch.maximum(m, s.amax(-1, keepdim=True))
+            p = torch.exp(s - m_new)
+            corr = torch.exp(m - m_new)
+            l = l * corr + p.sum(-1, keepdim=True)
+            acc = acc * corr + p @ vj
+            m = m_new</pre></details>
+<details><summary>What we measured</summary><p>Maximum error about 3 × 10⁻⁷ against PyTorch's kernel: float32 rounding only. Try tile sizes 32 and 512: the result does not change, which is the point.</p></details>
+<h3>Part C: Flash-Decoding's combine step</h3>
+<p>Split a 32K-token KV cache into 8 chunks, compute each chunk's partial output and log-sum-exp, then combine.</p>
+<pre>L = 32768
+qd = torch.randn(1, d); K = torch.randn(L, d); V = torch.randn(L, d)
+def split_decode(qd, K, V, n_split=8):
+    outs, lses = [], []
+    for Kc, Vc in zip(K.chunk(n_split), V.chunk(n_split)):   # each chunk: its own SM
+        s = qd @ Kc.T / math.sqrt(d)
+        lse = torch.logsumexp(s, -1, keepdim=True)
+        outs.append(torch.exp(s - lse) @ Vc); lses.append(lse)
+    # TODO: weight each chunk's output by softmax over the chunk lse values, and sum
+refd = F.scaled_dot_product_attention(qd[None], K[None], V[None])[0]
+print("max error", (split_decode(qd, K, V) - refd).abs().max().item())</pre>
+<details><summary>Solution</summary>
+<pre>    w = torch.softmax(torch.cat(lses, -1), -1)
+    return sum(w[:, i:i+1] * outs[i] for i in range(n_split))</pre>
+<p>Measured maximum error: about 8 × 10⁻⁸. Each chunk's softmax is correct within the chunk; the log-sum-exp tells how much total weight that chunk deserves.</p></details>
+<h3>Part D: naive vs fused, time and memory</h3>
+<pre>import time
+for T2 in [1024, 2048, 4096]:
+    q2, k2, v2 = (torch.randn(8, T2, 64) for _ in range(3))
+    t = time.time(); torch.softmax(q2 @ k2.transpose(1, 2) / 8, -1) @ v2; tn = time.time() - t
+    t = time.time(); F.scaled_dot_product_attention(q2, k2, v2); ts = time.time() - t
+    print(f"T={T2}: naive {tn*1e3:.0f} ms  fused {ts*1e3:.0f} ms  score matrix {8*T2*T2*4/1e6:.0f} MB")</pre>
+<details><summary>What we measured, and why</summary><p>On a 2-core CPU: about 93 vs 25 ms at 1K, 354 vs 110 ms at 2K, 1,374 vs 358 ms at 4K; the naive score matrices take 34, 134 and 537 MB. Time grows about 4 times per doubling of T for both (quadratic math), but the naive version also allocates a quadratic matrix. On a T4 GPU (move tensors to <code>"cuda"</code>, use float16, and call <code>torch.cuda.synchronize()</code> before reading the clock) the gap is larger, and the naive version runs out of memory first as T grows.</p></details>
+<h3>Part E (optional, T4): attention backends in vLLM</h3>
+<p>Start vLLM on a T4 and find the log line that names the attention backend it chose. Explain from section 7 why it is not FlashAttention (the T4 is compute capability 7.5).</p>
+
+<h2 id="realworld">11. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Where these choices show up</span>
+  <ul>
+    <li><strong>Every serving engine</strong> uses fused, IO-aware attention by default: FlashAttention, FlashInfer or vendor kernels (cuDNN, TensorRT-LLM).</li>
+    <li><strong>Model designers</strong> choose GQA, MLA, windows or sparse attention largely for inference cost: DeepSeek's MLA and DSA, Gemma's local/global layers, and hybrids from chapter 2.7.</li>
+    <li><strong>New models</strong> often wait on kernel support: an attention variant without fast paged kernels serves slowly no matter how good its design.</li>
+    <li><strong>Hardware generations</strong> each get new attention kernels (FA3 for Hopper, FA4 for Blackwell), and engines select them automatically.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">12. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz42"></div>
+<script type="application/json" id="qz42">[
+{"q":"Why is standard (unfused) attention slow at long context?","o":["Too many FLOPs only","It writes and reads T × T matrices through slow HBM","It uses FP32","It cannot use the KV cache"],"a":1,"e":"The score and probability matrices are memory-bound steps; FlashAttention keeps them on chip."},
+{"q":"In online softmax, when a new block raises the running maximum, the earlier sum and output are:","o":["Discarded","Multiplied by e^(old max − new max)","Divided by the block size","Left unchanged"],"a":1,"e":"That factor re-expresses earlier terms relative to the new maximum."},
+{"q":"GQA with 8 KV heads mainly speeds up:","o":["Prefill score math","Decode, by reading fewer KV bytes","Tokenization","Sampling"],"a":1,"e":"Query heads still score every token; the cache is what shrinks."},
+{"q":"What does Flash-Decoding add to FlashAttention?","o":["Approximate attention","Parallelism along the keys, with a log-sum-exp combine","FP4 math","A smaller KV cache"],"a":1,"e":"It fills the GPU when there is one query per sequence."},
+{"q":"Attention sinks are:","o":["Extra GPUs for attention","The first few tokens, which receive large attention weight regardless of meaning","Dropped tokens","A kind of KV quantization"],"a":1,"e":"Keeping them with a recent window keeps windowed models stable."},
+{"q":"DeepSeek Sparse Attention makes core attention cost:","o":["O(T²)","O(T × k) with k selected tokens, plus a cheap O(T²) indexer","O(1)","O(log T)"],"a":1,"e":"Each query attends to its top-k tokens chosen by the lightning indexer."},
+{"q":"Why did FlashAttention-4 emulate exponentials in software?","o":["To save memory","Blackwell tensor cores doubled but exponential units did not, so softmax became a bottleneck","For accuracy","Because FP4 needs it"],"a":1,"e":"Moving some exponentials to FMA units rebalances the pipeline."}
+]</script>
+
+<h2 id="summary">13. Summary</h2>
+<ul>
+  <li>Attention math grows with T² in prefill and its KV reads grow with T in decode; at 128K tokens it dominates.</li>
+  <li>MQA, GQA and MLA shrink what is cached; windows, sinks and sparse top-k shrink what is attended to.</li>
+  <li>Standard attention is slow because T × T matrices travel through HBM. FlashAttention tiles the work and uses online softmax, so they never leave the chip: same result, far less memory traffic, linear memory.</li>
+  <li>Each FlashAttention generation adapts to new hardware: better work partitioning, Hopper asynchrony and FP8, Blackwell's exponential bottleneck.</li>
+  <li>Decode needs different kernels: Flash-Decoding splits along keys; serving libraries such as FlashInfer handle pages, ragged batches and CUDA graphs.</li>
+</ul>
+
+<h2 id="refs">14. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2205.14135">Dao et al., FlashAttention</a></td><td>IO-aware exact attention, tiling, the HBM access bound, and the A100 memory figures.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2307.08691">Dao, FlashAttention-2</a></td><td>Better parallelism and work partitioning; 50% to 73% of peak.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2407.08608">Shah et al., FlashAttention-3</a></td><td>Hopper asynchrony, warp specialization and FP8.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2603.05451">FlashAttention-4</a> and <a href="https://tridao.me/blog/2026/flash4/">Tri Dao's blog post</a></td><td>Blackwell's asymmetric scaling and the software exponential.</td></tr>
+<tr><td><a href="https://crfm.stanford.edu/2023/10/12/flashdecoding.html">Dao et al., Flash-Decoding for long-context inference</a></td><td>Splitting along keys and the log-sum-exp reduction.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2501.01005">Ye et al., FlashInfer</a></td><td>An attention engine built for serving.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2309.17453">Xiao et al., StreamingLLM (attention sinks)</a></td><td>Why windows fail without sink tokens.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2512.02556">DeepSeek-V3.2 report</a></td><td>DeepSeek Sparse Attention: the lightning indexer and top-2,048 selection.</td></tr>
+<tr><td><a href="https://youtu.be/Y-o545eYjXM">Video: GQA, MLA and DSA</a></td><td>A visual walk-through of the three designs.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/design/attention_backends/">vLLM: Attention backends</a></td><td>Backend priority per GPU generation and how to override it.</td></tr>
+<tr><td><a href="https://nrehiew.github.io/blog/long_context/">nrehiew: Evaluating long context (reasoning) ability</a></td><td>Why advertised context windows overstate usable context.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, attention and kernel chapters</td><td>FlashAttention in a GPU performance context.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. Lab code was run on CPU with PyTorch 2.15.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+/* share of prefill in attention */
+function sh(){const T=2**+$('shT').value;$('shTv').textContent=IE.tok(T);
+  const lin=2*8.03e9*T,att=32*2*T*T*4096,f=att/(lin+att);
+  const svg=$('shSvg');svg.innerHTML='';const x0=0,w=680;
+  el('rect',{x:x0,y:20,width:w*(1-f),height:40,fill:css('--pre')},svg);el('rect',{x:x0+w*(1-f),y:20,width:w*f,height:40,fill:css('--dec')},svg);
+  el('text',{x:8,y:46,fill:'#fff','font-size':13},svg,'linear layers '+Math.round((1-f)*100)+'%');
+  el('text',{x:Math.min(w-8,x0+w*(1-f)+w*f-8),y:84,'text-anchor':'end',fill:css('--dec'),'font-size':13},svg,'attention '+Math.round(f*100)+'%');
+  $('shStats').innerHTML=[['Linear FLOPs',(lin/1e12).toFixed(1)+' TFLOP'],['Attention FLOPs',(att/1e12).toFixed(1)+' TFLOP'],['Prefill time at 989 TFLOP/s (ideal)',((lin+att)/989e12*1e3).toFixed(0)+' ms']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+$('shT').addEventListener('input',sh);IE.onTheme(sh);
+/* online softmax */
+let S=[1,2,4,3,0.5,5,2.5,1.5],V=[10,20,30,40,15,25,35,5],pos=0,st=null;
+function osReset(){pos=0;st={m:-Infinity,l:0,acc:0,hist:[]};osDraw();}
+function osStep(){const B=+$('osB').value;if(pos>=8)return;const s=S.slice(pos,pos+B),v=V.slice(pos,pos+B);
+  const mn=Math.max(st.m,...s),c=Math.exp(st.m-mn);let l=st.l*c,acc=st.acc*c;s.forEach((x,i)=>{const e=Math.exp(x-mn);l+=e;acc+=e*v[i];});
+  st.hist.push({from:pos,to:pos+s.length,m:mn,c:isFinite(c)?c:0,l,acc});st.m=mn;st.l=l;st.acc=acc;pos+=s.length;osDraw();}
+function osDraw(){const svg=$('osSvg');svg.innerHTML='';
+  S.forEach((x,i)=>{const done=i<pos;const X=20+i*80;el('rect',{x:X,y:10,width:70,height:44,rx:6,fill:css(done?'--kv':'--panel2')},svg);
+    el('text',{x:X+35,y:28,'text-anchor':'middle',fill:done?'#fff':css('--ink'),'font-size':12},svg,'s='+x);
+    el('text',{x:X+35,y:46,'text-anchor':'middle',fill:done?'#fff':css('--ink2'),'font-size':11},svg,'v='+V[i]);});
+  st.hist.slice(-3).forEach((h,j)=>{el('text',{x:20,y:84+j*24,fill:css('--ink'),'font-size':12},svg,`block ${h.from+1}-${h.to}: m=${h.m.toFixed(2)}  rescale c=${h.from===0?'none (first block)':h.c.toFixed(3)}  l=${h.l.toFixed(3)}  acc=${h.acc.toFixed(2)}  acc/l=${(h.acc/h.l).toFixed(3)}`);});
+  const mx=Math.max(...S),ex=S.map(x=>Math.exp(x-mx)),sum=ex.reduce((a,b)=>a+b,0),full=ex.reduce((a,e,i)=>a+e*V[i],0)/sum;
+  $('osStats').innerHTML=[['Scores processed',pos+' of 8'],['Running output acc ÷ l',pos?(st.acc/st.l).toFixed(4):'n/a'],['Full softmax over all 8 (the target)',full.toFixed(4)]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+$('osN').onclick=osStep;$('os0').onclick=osReset;$('osB').addEventListener('input',osReset);
+$('osR').onclick=()=>{S=S.map(()=>Math.round(Math.random()*60)/10);osReset();};
+osReset();IE.onTheme(osDraw);
+})();
+</script>
+
+</body>
+</html>

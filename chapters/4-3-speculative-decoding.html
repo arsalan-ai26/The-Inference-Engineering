@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>4.3 Speculative decoding</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="4.3">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 4 · Chapter 4.3</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 4 · Model optimization · Chapter 4.3</div>
+<h1>Speculative decoding</h1>
+<p class="lede">Decode reads every weight from memory to make one token, while the math units sit mostly idle (chapter 2.5). Speculative decoding uses that idle math: a cheap method guesses several next tokens, and the big model checks all of them in one pass. When the guesses are right, one pass yields several tokens. With the right acceptance rule, the output follows exactly the same distribution as normal decoding. This chapter builds the idea step by step: the loop, the acceptance rule, the speedup formula, the main families of drafters, and when it stops helping.</p>
+<div class="meta">
+  <span class="chip">Level: core, with an expert layer</span>
+  <span class="chip">Time: 4 to 5 hours with the lab</span>
+  <span class="chip">Needs: 1.2, 2.4, 2.5</span>
+  <span class="chip">Compute: Colab CPU or T4; T4 for Part E</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Does speculative decoding change TTFT?</li>
+    <li>With acceptance rate 0.8 and 4 draft tokens, how many tokens does each target pass produce on average?</li>
+    <li>Why does speculative decoding help less at batch 256 than at batch 1?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>No. It only speeds up decode (TPOT, inter-token latency). Prefill is unchanged.</li>
+    <li>(1 − 0.8⁵) ÷ (1 − 0.8) ≈ 3.36 tokens per pass.</li>
+    <li>At large batch, decode is no longer purely memory-bound: the math units are busy, so checking extra tokens costs real time. The spare compute that speculation uses is gone.</li>
+  </ol></details>
+</div>
+
+<h2 id="idea">1. The idea: check many tokens for the price of one</h2>
+<p>Recall chapter 2.5. At batch 1, a decode step of an 8B model in BF16 reads about 16 GB of weights and does about 16 GFLOPs of math. On an H100 the reading takes about 4.8 ms; the math alone would take about 0.02 ms. The GPU spends almost all its time waiting for memory.</p>
+<p>Now suppose you already had a guess for the next 4 tokens. You could feed all 4 to the model in one forward pass, like a tiny prefill. The weights are read once, and the model produces its own prediction at all 4 positions at once. The pass costs almost the same as a single-token step, because the extra math is small next to the weight reading.</p>
+<p>Comparing the model's predictions with the guesses tells you which guesses were right. Every correct guess is a token you got without paying for its own pass. That is speculative decoding.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Target model:</strong> the model whose output you want. Its output decides everything.</p>
+  <p><strong>Drafter (speculator, proposer):</strong> anything that cheaply guesses the next tokens: a small model, extra heads, or a lookup in earlier text.</p>
+  <p><strong>Draft length k:</strong> how many tokens are guessed per round (vLLM: <code>num_speculative_tokens</code>).</p>
+  <p><strong>Verification:</strong> one target forward pass over the k draft tokens.</p>
+  <p><strong>Acceptance rate α:</strong> the probability that a draft token is accepted. <strong>Acceptance length:</strong> the average number of tokens produced per target pass.</p>
+</div>
+
+<h2 id="loop">2. One round, step by step</h2>
+<ol>
+  <li><strong>Draft.</strong> The drafter proposes k tokens: d₁, d₂, ..., dₖ.</li>
+  <li><strong>Verify.</strong> The target runs one pass over the context plus the k drafts. Because of the causal mask, position i sees only the context and d₁ to dᵢ₋₁, so the pass gives the target's prediction for each of the k positions, plus one more after dₖ.</li>
+  <li><strong>Accept a prefix.</strong> Walk left to right. Keep each draft token the target accepts. At the first rejection, stop: everything after it was built on a wrong token and is discarded.</li>
+  <li><strong>Add one target token.</strong> The target's own prediction at the first rejected position (or after dₖ if all were accepted) is always correct, so it is added for free.</li>
+</ol>
+<p>So every round produces between 1 and k + 1 tokens. In the worst case (all rejected) you get the 1 token normal decoding would have made, plus the wasted cost of drafting and of the slightly larger pass. The engine also rolls back the KV cache entries written for rejected tokens.</p>
+
+<div class="widget" id="rdW">
+  <div class="wt">Interactive: watch rounds of speculative decoding</div>
+  <div class="ws">Each round the drafter proposes k tokens. Green tokens were accepted, red was the first rejection, grey were discarded, and the indigo token is the target's free token. Acceptance is random with the chosen rate.</div>
+  <div class="ctrls">
+    <label>Draft length k <select id="rdK"><option>2</option><option>3</option><option selected>4</option><option>6</option></select></label>
+    <label>Acceptance rate: <span class="mono" id="rdAv"></span><input type="range" id="rdA" min="0.3" max="0.95" step="0.05" value="0.75"></label>
+    <button class="pri" id="rdGo">Run one round</button><button id="rdReset">Reset</button>
+  </div>
+  <div class="svgwrap"><svg id="rdSvg" viewBox="0 0 680 230" width="680" style="max-width:100%;height:auto" role="img" aria-label="Rounds of draft and verify"></svg></div>
+  <div class="stats" id="rdStats"></div>
+</div>
+
+<h2 id="exact">3. Why the output does not change</h2>
+<p>With greedy decoding the rule is simple: accept a draft token if it equals the target's top token at that position. The result is token for token what greedy decoding of the target alone would produce (up to tiny numerical differences, see the expert layer).</p>
+<p>With sampling (temperature above 0), "equal to the top token" is the wrong test, because the target itself would not always pick its top token. The original papers use a rejection-sampling rule that keeps the target's distribution exactly. Let p be the target's probabilities and q the drafter's, at one position, and let the drafter have proposed token x:</p>
+<ol>
+  <li>Accept x with probability min(1, p(x) ÷ q(x)).</li>
+  <li>If rejected, sample a replacement from the leftover distribution: max(0, p − q), renormalized to sum to 1.</li>
+</ol>
+<div class="box ex">
+  <span class="lbl">Worked example</span>
+  <p>Three tokens. Target p = [0.6, 0.3, 0.1], drafter q = [0.3, 0.6, 0.1].</p>
+  <ul>
+    <li>Drafter proposes token A (q = 0.3): p ÷ q = 2, so always accept.</li>
+    <li>Drafter proposes token B (q = 0.6): p ÷ q = 0.5, so accept half the time.</li>
+    <li>On rejection, leftover = max(0, p − q) = [0.3, 0, 0], so the replacement is always A.</li>
+  </ul>
+  <p>Probability the final token is A: 0.3 (proposed and accepted) + 0.6 × 0.5 (B proposed and rejected, replaced by A) = 0.6. Exactly p(A). The same check works for B (0.6 × 0.5 = 0.3) and C (0.1). Part C of the lab checks this by simulation.</p>
+</div>
+<p>The overall acceptance probability at a position is Σ min(p, q): the overlap of the two distributions. A drafter that imitates the target closely has a large overlap. Higher temperature flattens both distributions, which usually lowers the overlap, so acceptance drops as temperature rises.</p>
+
+<h2 id="speedup">4. How much faster? The formula</h2>
+<p>Assume each draft token is accepted with the same probability α, independently. Then the expected number of tokens per target pass, with k draft tokens, is:</p>
+<div class="formula">E[tokens per pass] = (1 − α^(k+1)) ÷ (1 − α)</div>
+<p>Each round also costs the drafting. Let c be the cost of one draft token relative to one target pass (for a small draft model, often 0.02 to 0.1; for n-gram lookup, about 0). One round then costs about k × c + 1 target-pass units, so:</p>
+<div class="formula">speedup ≈ (1 − α^(k+1)) ÷ ((1 − α) × (k × c + 1))</div>
+<div class="box ex">
+  <span class="lbl">Worked example</span>
+  <p>α = 0.8, k = 4, c = 0.05. Tokens per pass: (1 − 0.8⁵) ÷ 0.2 = 0.672 ÷ 0.2 = 3.36. Cost per round: 4 × 0.05 + 1 = 1.2. Speedup ≈ 3.36 ÷ 1.2 = 2.8 times.</p>
+  <p>Now α = 0.5: tokens per pass (1 − 0.5⁵) ÷ 0.5 = 1.94; speedup 1.94 ÷ 1.2 = 1.6. And with α = 0.5 and k = 8: 1.99 ÷ 1.4 = 1.4. Longer drafts do not help when acceptance is low.</p>
+</div>
+<div class="widget" id="suW">
+  <div class="wt">Interactive: speedup vs acceptance rate</div>
+  <div class="ws">Curves for draft lengths 1 to 8, using the formula above. The verification pass is assumed to cost the same as a normal decode step, which holds only while decode is memory-bound (section 6).</div>
+  <div class="ctrls">
+    <label>Draft cost c: <span class="mono" id="suCv"></span><input type="range" id="suC" min="0" max="0.3" step="0.01" value="0.05"></label>
+    <label>Highlight k <select id="suK"><option>1</option><option>2</option><option>3</option><option selected>4</option><option>6</option><option>8</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="suSvg" viewBox="0 0 680 300" width="680" style="max-width:100%;height:auto" role="img" aria-label="Speedup against acceptance rate for several draft lengths"></svg></div>
+  <div class="stats" id="suStats"></div>
+</div>
+<p>Two lessons from the curves. First, acceptance rate matters far more than draft length: going from α = 0.6 to 0.8 is worth more than doubling k. Second, every k has an optimum that depends on α and c; too long a draft wastes drafter time and verification work on tokens that will be thrown away. Real acceptance also falls for later draft positions, which makes long drafts worse than the formula suggests.</p>
+
+<h2 id="drafters">5. Kinds of drafters</h2>
+<h3>A separate draft model</h3>
+<p>The original method: a smaller model from the same family (same tokenizer), for example Qwen2.5-0.5B drafting for Qwen2.5-7B. A rule of thumb is a draft at least about 10 times smaller than the target. Easy to set up, no training. Costs: the draft's weights, KV cache and prefill in GPU memory, and orchestration of two models. Acceptance is moderate because the draft was trained to be a good small model, not a good imitator. Fine-tuning or distilling the draft on the target's outputs raises acceptance. vLLM can even use a draft with a different tokenizer by mapping the shared tokens between the two vocabularies.</p>
+<h3>Extra heads: Medusa</h3>
+<p>Medusa adds 2 to 4 extra output heads to the target. Head i predicts the token i + 1 positions ahead from the target's last hidden state. No second model is needed. Medusa builds several candidate continuations as a tree and verifies them together with tree attention. Medusa-1 trains only the heads on a frozen target (lossless); Medusa-2 trains the target too for higher acceptance. It is less used today, but its ideas carried into EAGLE.</p>
+<h3>Feature-level drafters: EAGLE</h3>
+<p>EAGLE trains a very small drafter (often one transformer layer) that takes the target's own hidden states as input, so it sees what the target already "knows" about the context. EAGLE-1 and 2 predicted the next hidden feature from the top layer. EAGLE-3 predicts tokens directly and fuses hidden states from low, middle and high layers, and keeps improving as it gets more training data. The EAGLE-3 paper reports speedups up to 6.5 times and a 1.38 times throughput gain in SGLang even at batch 64. EAGLE drafters must be trained per target model; many are published (for example by the model makers, the EAGLE authors and Red Hat's <code>speculators</code> project).</p>
+<h3>Built-in multi-token prediction (MTP)</h3>
+<p>Some models are trained with extra modules that predict further tokens (DeepSeek-V3, and later several other open models). At inference these modules act as a ready-made drafter. DeepSeek reports that its second-token prediction is accepted 85% to 90% of the time, giving about 1.8 times more tokens per second. When a model ships MTP weights, they are usually the first thing to try.</p>
+<h3>No model at all: n-gram and suffix lookup</h3>
+<p>Take the last few generated tokens, search for the same sequence earlier in the prompt or output, and propose whatever followed it there. This is n-gram (prompt-lookup) speculation. It costs almost nothing and can propose long drafts, but it only works when the output repeats the input: code edits, rewriting a document, extracting quotes, RAG answers that copy passages. Suffix decoding extends the idea with a suffix tree over the prompt and earlier outputs (across requests), and adapts the draft length to how confident the match is. Its paper reports up to 5.3 times speedup on agentic workloads such as SWE-Bench, where agents repeat similar text often. Lookahead decoding generates its own n-grams in parallel instead of finding them in the context, at extra compute cost.</p>
+<div class="tbl"><table>
+<tr><th>Drafter</th><th>Training needed</th><th>Typical acceptance</th><th>Extra memory</th><th>Best for</th></tr>
+<tr><td>Draft model</td><td>None (better if distilled)</td><td>Moderate</td><td>Draft weights and KV</td><td>Quick setup</td></tr>
+<tr><td>Medusa heads</td><td>Heads per target</td><td>Moderate</td><td>Small</td><td>Historical; tree verification</td></tr>
+<tr><td>EAGLE-3</td><td>Drafter per target</td><td>High</td><td>Small</td><td>General chat and reasoning</td></tr>
+<tr><td>MTP modules</td><td>Done by the model maker</td><td>High</td><td>Small</td><td>Models that ship them</td></tr>
+<tr><td>N-gram / suffix</td><td>None</td><td>High only on repetitive text, else near 0</td><td>None</td><td>Code edits, RAG, agents</td></tr>
+</table></div>
+
+<h2 id="when">6. When speculative decoding stops helping</h2>
+<p>Speculation spends compute to save memory reads. It helps only while compute is spare:</p>
+<ul>
+  <li><strong>Large batches.</strong> At batch 256 each decode step already does a lot of math (chapter 2.5). Verifying k extra tokens for every sequence multiplies that math, so the step gets slower, and wrongly guessed tokens waste capacity that other requests could use. Engines therefore cut the draft length or turn speculation off as load rises (vLLM calls this dynamic speculative decoding).</li>
+  <li><strong>Low acceptance.</strong> High temperature, creative writing, or a domain the drafter was not trained on. Measure acceptance on real traffic, not on a demo prompt.</li>
+  <li><strong>Prefill-heavy workloads.</strong> Speculation does nothing for TTFT. Long prompts with short answers barely benefit.</li>
+  <li><strong>Memory pressure.</strong> A draft model's weights and KV cache take space that would otherwise hold more requests.</li>
+</ul>
+<p>vLLM's own guidance: model-based methods (EAGLE, MTP, draft models) give the best latency gains at low query rates; simple methods (n-gram, suffix) give smaller gains but add no extra work during peak traffic.</p>
+<div class="box ex">
+  <span class="lbl">Worked example: when the verification pass is no longer free</span>
+  <p>Llama 3.1 8B on an H100 at batch 64 and 8K context: the step reads about 16 GB of weights plus about 69 GB of KV cache (chapter 2.4), roughly 25 ms. The math for 64 tokens is about 1 TFLOP, about 1 ms at BF16 peak. Verifying k = 4 drafts makes it 5 tokens per sequence: about 5 ms of math, still under the 25 ms of memory time, so speculation still pays. At batch 512 with 1K contexts, the math for 5 tokens per sequence (about 41 TFLOP, about 42 ms) is far above the memory time (16 GB of weights plus about 69 GB of KV cache, about 25 ms): every rejected token now costs real time.</p>
+</div>
+
+<h2 id="engines">7. Using it in an engine</h2>
+<p>In vLLM, speculative decoding is one JSON option. Three examples (check your version's docs, since method names and defaults change):</p>
+<pre># n-gram lookup: no extra model
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --speculative-config '{"method": "ngram", "num_speculative_tokens": 4,
+                         "prompt_lookup_min": 2, "prompt_lookup_max": 5}'
+
+# a separate draft model from the same family
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --speculative-config '{"method": "draft_model", "model": "Qwen/Qwen2.5-0.5B-Instruct",
+                         "num_speculative_tokens": 4}'
+
+# an EAGLE-3 drafter trained for the target
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --speculative-config '{"method": "eagle3",
+                         "model": "RedHatAI/Llama-3.1-8B-Instruct-speculator.eagle3",
+                         "num_speculative_tokens": 3}'</pre>
+<p>What to watch: the engine's acceptance metrics (vLLM reports draft and accepted token counts, and per-request acceptance), inter-token latency at your real concurrency, and total throughput. A setting that halves latency at concurrency 1 can lower throughput at concurrency 64. SGLang and TensorRT-LLM support the same families (EAGLE, MTP, draft models, n-gram).</p>
+
+<h2 id="expert">8. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Trees instead of chains</span>
+  <p>A chain drafts one sequence; if token 2 is wrong, tokens 3 to k are lost. A tree drafts several alternatives at each position (for example the top 2 or 3 tokens) and verifies the whole tree in one pass with a tree-shaped attention mask, where each node sees only its ancestors. The accepted path is the longest branch that matches. Medusa and EAGLE-2 use trees; EAGLE-2 grows the tree dynamically from the drafter's confidence. Trees raise acceptance length at the cost of more verification tokens, which is fine at small batch and costly at large batch.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">"Lossless" and numerics</span>
+  <p>Mathematically the output distribution is unchanged. Numerically, verifying k tokens in one pass runs different kernel shapes from decoding one token at a time, and floating-point sums in a different order can differ in the last bits. Occasionally that flips a near-tie, so greedy output can differ from non-speculative greedy output after some tokens. Part D of the lab may show this. Chapter 6.6 covers batch invariance and nondeterminism in general.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Lossy variants</span>
+  <p>Some methods accept "close enough" tokens (relaxed acceptance, or accepting a rejected draft when the target's distribution is flat) for more speed at a small quality cost. vLLM marks such options as lossy. Treat them like quantization: evaluate before use.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Training a drafter</span>
+  <p>EAGLE-style drafters are trained on the target's own hidden states and outputs, ideally on data like your traffic. Distilling a draft model on target outputs is the simpler version. The payoff is acceptance on your domain: a drafter trained on chat can do poorly on code, and the other way round.</p>
+</div>
+
+<h2 id="mistakes">9. Common mistakes</h2>
+<ul>
+  <li>Measuring speedup at concurrency 1 only and turning speculation on for a high-throughput service.</li>
+  <li>Choosing a long draft length "to be safe". Short, high-acceptance drafts win.</li>
+  <li>Evaluating acceptance at temperature 0 and serving at temperature 1.</li>
+  <li>Using n-gram speculation for open-ended chat, where nothing in the prompt repeats.</li>
+  <li>Expecting a lower TTFT.</li>
+  <li>Forgetting that a draft model's KV cache and weights reduce the memory left for requests.</li>
+  <li>Treating a lossy acceptance option as free.</li>
+</ul>
+
+<h2 id="lab">10. Lab</h2>
+<p><strong>Goal:</strong> predict speedups with the formula, prove that the acceptance rule keeps the distribution, and build a working draft-and-verify loop with two real models.</p>
+<h3>Part A: the 100 Days notebook</h3>
+<p>Run day 15 (speculative decoding) of <em>100 Days of Inference</em>. It implements the three-step loop with rejection sampling, sweeps acceptance rates and draft lengths, and builds an n-gram proposer. Read its engine-support statement against the note in References.</p>
+<h3>Part B: predict</h3>
+<p>Using section 4 with k = 4 and c = 0.05, predict the speedup for α = 0.6, 0.75 and 0.9. Then find the best k for α = 0.6 and for α = 0.9 (use the widget).</p>
+<details><summary>Answer</summary><p>Tokens per pass: 2.31, 3.05 and 4.10; divided by 1.2: about 1.9, 2.5 and 3.4 times. For α = 0.6 the best k is 4 (about 1.92 times), and k = 3 or 5 are almost as good. For α = 0.9 the speedup keeps growing with k: about 4.4 times at k = 8 and a peak of about 4.7 times near k = 12. High acceptance justifies long drafts; low acceptance does not.</p></details>
+<h3>Part C: prove the acceptance rule (CPU, seconds)</h3>
+<pre>import torch
+torch.manual_seed(0)
+V = 6
+p = torch.softmax(torch.randn(V) * 1.5, 0)     # target distribution
+q = torch.softmax(torch.randn(V) * 1.5, 0)     # draft distribution (different)
+
+def spec_sample():
+    x = torch.multinomial(q, 1).item()          # draft proposes x ~ q
+    # TODO: accept x with probability min(1, p[x]/q[x]); return (x, True)
+    # TODO: otherwise sample from r = max(0, p - q), normalized; return (y, False)
+
+n = 200_000
+counts = torch.zeros(V); acc = 0
+for _ in range(n):
+    x, a = spec_sample(); counts[x] += 1; acc += a
+print("target p      ", [round(v, 3) for v in p.tolist()])
+print("spec sampling ", [round(v, 3) for v in (counts / n).tolist()])
+print("draft q       ", [round(v, 3) for v in q.tolist()])
+print("acceptance", round(acc / n, 3), " predicted sum(min(p,q)) =", round(torch.minimum(p, q).sum().item(), 3))</pre>
+<details><summary>Solution</summary>
+<pre>    if torch.rand(1).item() &lt; min(1.0, (p[x] / q[x]).item()):
+        return x, True
+    r = torch.clamp(p - q, min=0)
+    return torch.multinomial(r / r.sum(), 1).item(), False</pre></details>
+<details><summary>What we measured</summary><div id="labC43"><pre class="out">target p       [0.751, 0.048, 0.003, 0.175, 0.015, 0.009]
+spec sampling  [0.75, 0.048, 0.003, 0.175, 0.015, 0.009]
+draft q        [0.23, 0.442, 0.043, 0.069, 0.051, 0.165]
+acceptance 0.372  predicted sum(min(p,q)) = 0.373</pre>
+<p>The samples follow the target p, not the draft q, even though only about 37% of draft tokens were accepted. The measured acceptance matches the overlap Σ min(p, q).</p></div></details>
+<p><strong>Try:</strong> replace the rule with "accept if x is the target's top token" and run again. The output distribution is now wrong: it over-produces the target's favourite token.</p>
+
+<h3>Part D: draft and verify with two real models (CPU about 10 minutes, T4 about 1 minute)</h3>
+<p>Qwen2.5-0.5B-Instruct drafts for Qwen2.5-1.5B-Instruct; they share a tokenizer. This is greedy speculation without a KV cache, to keep the code short: it shows acceptance and the number of target passes, not real speed. (Without a cache every pass re-reads the whole context, so wall-clock time is not meaningful here.)</p>
+<pre>import torch, time
+from transformers import AutoModelForCausalLM, AutoTokenizer
+TGT, DRF = "Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-0.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(TGT)
+target = AutoModelForCausalLM.from_pretrained(TGT, dtype=torch.bfloat16).eval()
+draft  = AutoModelForCausalLM.from_pretrained(DRF, dtype=torch.bfloat16).eval()
+msgs = [{"role": "user", "content": "Explain in three sentences why the sky is blue."}]
+prompt = tok.apply_chat_template(msgs, add_generation_prompt=True,
+                                 return_tensors="pt", return_dict=True)["input_ids"]
+
+@torch.no_grad()
+def greedy(model, ids, n):
+    for _ in range(n):
+        ids = torch.cat([ids, model(ids).logits[0, -1].argmax().view(1, 1)], 1)
+    return ids
+
+@torch.no_grad()
+def speculative_greedy(ids, n, k=4):
+    passes = accepted = proposed = 0
+    start = ids.shape[1]
+    while ids.shape[1] - start &lt; n:
+        d = ids
+        for _ in range(k):                                    # 1. draft k tokens
+            d = torch.cat([d, draft(d).logits[0, -1].argmax().view(1, 1)], 1)
+        guess = d[0, ids.shape[1]:]
+        logits = target(d).logits[0, ids.shape[1]-1:]         # 2. one target pass: k+1 predictions
+        passes += 1
+        pred = logits.argmax(-1)
+        # TODO 3: m = length of the longest prefix where pred[i] == guess[i]
+        # TODO 4: new = accepted drafts + the target's token at position m
+        accepted += m; proposed += k
+        ids = torch.cat([ids, new.view(1, -1)], 1)
+    return ids[:, :start + n], passes, accepted / proposed
+
+N = 60
+ref = greedy(target, prompt, N)
+for k in [2, 4, 6]:
+    out, passes, acc = speculative_greedy(prompt, N, k)
+    print(f"k={k}: identical={torch.equal(out, ref)} target passes={passes} (vs {N}) "
+          f"acceptance={acc:.2f} tokens/pass={N/passes:.2f}")</pre>
+<details><summary>Solution</summary>
+<pre>        m = 0
+        while m &lt; k and pred[m] == guess[m]:
+            m += 1
+        new = torch.cat([guess[:m], pred[m:m+1]])</pre></details>
+<details><summary>What we measured, and why</summary><div id="labD43"><pre class="out">k=2: identical=True  target passes=25 (vs 60) acceptance=0.74 tokens/pass=2.40
+k=4: identical=False target passes=20 (vs 60) acceptance=0.53 tokens/pass=3.00
+k=6: identical=False target passes=18 (vs 60) acceptance=0.42 tokens/pass=3.33</pre>
+<p>The target ran 18 to 25 passes instead of 60. Acceptance per draft token falls as k grows (later guesses are less reliable), while tokens per pass still rise slowly: the shape of section 4.</p>
+<p>Why "identical=False" for k = 4 and 6? We traced it: the outputs first differ at generated token 42, where the target's top two logits were 34.0 and 33.75. In BF16 near 34 the spacing between representable numbers is 0.25, so these two are one step apart. Verifying 5 tokens in one pass runs different matrix shapes than decoding one token, the sums round slightly differently, and the near-tie flips ("wavelength than other colors" vs "wavelength, is scattered"). Both continuations are valid greedy choices within rounding. In float32 the tie would almost never flip. This is the numerics caveat from the expert layer, seen live.</p></div></details>
+
+<h3>Part E: speculation in vLLM (T4)</h3>
+<p>Serve Qwen2.5-1.5B-Instruct three ways: plain, with n-gram speculation, and with Qwen2.5-0.5B-Instruct as a draft model (section 7). For each, measure inter-token latency at concurrency 1 and 16 with two prompt sets: open-ended questions, and "rewrite this paragraph with one word changed" prompts that include a long paragraph. Record the acceptance counters from the <code>/metrics</code> endpoint. Explain which method wins where, using sections 5 and 6.</p>
+
+<h2 id="realworld">11. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Speculation in production</span>
+  <ul>
+    <li><strong>Latency-sensitive APIs</strong> run EAGLE or MTP drafters to raise tokens per second per user, and lower the draft length or disable speculation when load rises.</li>
+    <li><strong>Coding tools</strong> lean on n-gram and suffix methods: edits repeat most of the original file, so acceptance is high and drafts can be long.</li>
+    <li><strong>Model releases</strong> increasingly ship MTP modules or companion EAGLE drafters, so speculation works on day one.</li>
+    <li><strong>Agent platforms</strong> see repeated text across calls (tool outputs, file contents, plans), which suits suffix-tree methods.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">12. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz43"></div>
+<script type="application/json" id="qz43">[
+{"q":"What does speculative decoding trade?","o":["Memory for accuracy","Spare compute for fewer memory-bound passes","Prefill time for decode time","Quality for speed, always"],"a":1,"e":"One target pass checks several tokens; it uses idle math units."},
+{"q":"A draft of 4 tokens: the target rejects the 2nd. How many tokens does the round produce?","o":["1","2","4","5"],"a":1,"e":"The 1st accepted draft plus the target's own token at the rejected position."},
+{"q":"With sampling, a draft token x is accepted with probability:","o":["1 if it is the target's top token","min(1, p(x)/q(x))","q(x)","p(x)"],"a":1,"e":"This rule, plus resampling from max(0, p − q), keeps the target's distribution exactly."},
+{"q":"Acceptance rate 0.9, k = 4, free drafting. Expected tokens per pass:","o":["4.1","3.6","5","0.9"],"a":0,"e":"(1 − 0.9⁵)/(1 − 0.9) = 0.41/0.1 = 4.1."},
+{"q":"Which drafter fits a code-editing assistant best?","o":["A random small model","N-gram or suffix lookup","None: speculation fails on code","Medusa only"],"a":1,"e":"Edits copy most of the input, so lookup drafts are long and usually right."},
+{"q":"Why do engines disable speculation under heavy load?","o":["It breaks the KV cache","Verification math and wasted tokens now compete with other requests for busy compute","It raises TTFT","It changes the output"],"a":1,"e":"The spare compute speculation relies on is gone at large batch."},
+{"q":"What does EAGLE use that a plain draft model does not?","o":["A bigger vocabulary","The target model's hidden states","Lower precision","Prompt n-grams"],"a":1,"e":"Feeding the target's features makes the drafter a much better imitator."}
+]</script>
+
+<h2 id="summary">13. Summary</h2>
+<ul>
+  <li>Decode is memory-bound, so checking k guessed tokens costs about one pass. Each accepted guess is a token without its own pass.</li>
+  <li>A round drafts k tokens, verifies them in one target pass, keeps the accepted prefix and adds one target token: 1 to k + 1 tokens per pass.</li>
+  <li>The rejection rule min(1, p/q) with resampling from max(0, p − q) keeps the target's output distribution exactly.</li>
+  <li>Expected tokens per pass = (1 − α^(k+1)) ÷ (1 − α); divide by the round's cost for the speedup. Acceptance matters more than draft length.</li>
+  <li>Drafters: draft models (easy), EAGLE and MTP (best general acceptance), n-gram and suffix lookup (free, great on repetitive text).</li>
+  <li>Gains shrink at large batch, at high temperature, and for prefill-heavy workloads; speculation never helps TTFT.</li>
+</ul>
+
+<h2 id="refs">14. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 5.2</td><td>The draft, verify, accept loop; draft-target, Medusa, EAGLE, n-gram and lookahead; the 10 times draft-size rule; disabling at large batch.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2211.17192">Leviathan, Kalman and Matias, Fast Inference from Transformers via Speculative Decoding</a></td><td>The acceptance rule, the expected-tokens formula, and 2 to 3 times speedups with identical outputs.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2401.10774">Cai et al., Medusa</a></td><td>Extra decoding heads and tree verification.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2503.01840">Li et al., EAGLE-3</a></td><td>Token-level drafting from fused multi-layer features; up to 6.5 times speedup.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2411.04975">Oliaro et al., SuffixDecoding</a></td><td>Suffix trees over prompts and past outputs for agentic workloads.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 technical report</a></td><td>Multi-token prediction modules and their 85% to 90% second-token acceptance.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/features/speculative_decoding/">vLLM: Speculative decoding</a></td><td>Supported methods, the selection table, configuration keys and examples.</td></tr>
+<tr><td><a href="https://developers.redhat.com/articles/2025/11/19/speculators-standardized-production-ready-speculative-decoding">Red Hat: Speculators</a> and <a href="https://github.com/vllm-project/speculators">vllm-project/speculators</a></td><td>A standard format and training library for production drafters.</td></tr>
+<tr><td>Chi Wang and Peiheng Hu, <em>Hands-On LLM Serving and Optimization</em>, chapter 7</td><td>Speculative decoding among the advanced optimizations.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, inference chapters</td><td>Speculative decoding in a performance-engineering workflow, including draft precision choices.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 15</td><td>A notebook with the full loop, sweeps and an n-gram proposer.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The day 15 README of <em>100 Days of Inference</em> says vLLM V1 supports only n-gram and EAGLE, with draft models and others deprecated. That is outdated: current vLLM documentation lists EAGLE, MTP, draft models, parallel draft models, n-gram, suffix decoding and custom speculators.</li>
+  <li>The Kiely book describes EAGLE as trained on hidden states from an early, a middle and a late layer. That describes EAGLE-3; EAGLE-1 and 2 used top-layer features.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Lab Parts C and D were run on CPU with PyTorch 2.15 and Transformers 5.22.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+/* rounds widget */
+let rounds=[],tot=0,pass=0;
+function rdDraw(){const a=+$('rdA').value;$('rdAv').textContent=a.toFixed(2);
+  const svg=$('rdSvg');svg.innerHTML='';const show=rounds.slice(-5);
+  el('text',{x:0,y:16,fill:css('--ink2'),'font-size':12},svg,show.length?'Last rounds (newest at the bottom)':'Press "Run one round".');
+  show.forEach((r,i)=>{const y=30+i*40;el('text',{x:0,y:y+20,fill:css('--ink2'),'font-size':12},svg,'Round '+r.n);
+    r.cells.forEach((c,j)=>{const x=80+j*58;const col={acc:'--good',rej:'--bad',drop:'--mute',tgt:'--pre'}[c];
+      el('rect',{x,y,width:50,height:28,rx:5,fill:css(col),'fill-opacity':c==='drop'?.35:.9},svg);
+      el('text',{x:x+25,y:y+18,'text-anchor':'middle',fill:c==='drop'?css('--ink2'):'#fff','font-size':11},svg,c==='tgt'?'target':c==='acc'?'d'+(j+1)+' ✓':c==='rej'?'d'+(j+1)+' ✗':'d'+(j+1));});
+    el('text',{x:80+(r.cells.length)*58+6,y:y+19,fill:css('--ink'),'font-size':12},svg,'+'+r.got+' tokens');});
+  $('rdStats').innerHTML=[['Target passes',pass],['Tokens produced',tot],['Tokens per pass',pass?(tot/pass).toFixed(2):'n/a'],['Formula predicts',((1-a**(+$('rdK').value+1))/(1-a)).toFixed(2)]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+function rdRun(){const k=+$('rdK').value,a=+$('rdA').value;const cells=[];let m=0,rej=false;
+  for(let j=0;j<k;j++){if(rej){cells.push('drop');continue;}if(Math.random()<a){cells.push('acc');m++;}else{cells.push('rej');rej=true;}}
+  cells.push('tgt');pass++;tot+=m+1;rounds.push({n:pass,cells,got:m+1});rdDraw();}
+$('rdGo').onclick=rdRun;$('rdReset').onclick=()=>{rounds=[];tot=0;pass=0;rdDraw();};
+['rdK','rdA'].forEach(id=>$(id).addEventListener('input',rdDraw));IE.onTheme(rdDraw);
+/* speedup curves */
+const KS=[1,2,3,4,6,8];
+function su(){const c=+$('suC').value,kh=+$('suK').value;$('suCv').textContent=c.toFixed(2);
+  const svg=$('suSvg');svg.innerHTML='';const x0=50,x1=560,y0=260,y1=20,ymax=6;
+  const X=a=>x0+(a-0.3)/(0.95-0.3)*(x1-x0),Y=s=>y0-(s/ymax)*(y0-y1);
+  for(let s=0;s<=ymax;s++){el('line',{x1:x0,x2:x1,y1:Y(s),y2:Y(s),stroke:css('--line')},svg);el('text',{x:x0-8,y:Y(s)+4,'text-anchor':'end',fill:css('--ink2'),'font-size':11},svg,s+'×');}
+  [0.3,0.4,0.5,0.6,0.7,0.8,0.9].forEach(a=>el('text',{x:X(a),y:y0+18,'text-anchor':'middle',fill:css('--ink2'),'font-size':11},svg,a.toFixed(1)));
+  el('text',{x:(x0+x1)/2,y:y0+36,'text-anchor':'middle',fill:css('--ink2'),'font-size':12},svg,'acceptance rate α');
+  el('line',{x1:x0,x2:x1,y1:Y(1),y2:Y(1),stroke:css('--bad'),'stroke-dasharray':'4 4'},svg);
+  const f=(a,k)=>(1-a**(k+1))/((1-a)*(k*c+1));
+  KS.forEach(k=>{let d='';for(let a=0.3;a<=0.951;a+=0.01)d+=(d?'L':'M')+X(a).toFixed(1)+','+Y(Math.min(ymax,f(a,k))).toFixed(1);
+    const on=k===kh;el('path',{d,fill:'none',stroke:on?css('--kv'):css('--mute'),'stroke-width':on?3:1.3},svg);
+    el('text',{x:x1+6,y:Y(Math.min(ymax,f(0.95,k)))+4,fill:on?css('--kv'):css('--ink2'),'font-size':11},svg,'k='+k);});
+  const best=KS.map(k=>[k,f(0.7,k)]).sort((a,b)=>b[1]-a[1])[0];
+  $('suStats').innerHTML=[['Speedup at α = 0.6, k = '+kh,f(0.6,kh).toFixed(2)+'×'],['Speedup at α = 0.8, k = '+kh,f(0.8,kh).toFixed(2)+'×'],['Best k at α = 0.7',best[0]+' ('+best[1].toFixed(2)+'×)']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['suC','suK'].forEach(id=>$(id).addEventListener('input',su));IE.onTheme(su);
+})();
+</script>
+
+</body>
+</html>
