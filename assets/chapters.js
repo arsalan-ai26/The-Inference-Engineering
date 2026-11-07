@@ -396,6 +396,6 @@ window.IE_CHAPTERS = [
 "title": "Final capstone: defend a complete inference system",
 "slug": "8-5-final-capstone",
 "part": 8,
-"ready": false
+"ready": true
 }
 ];

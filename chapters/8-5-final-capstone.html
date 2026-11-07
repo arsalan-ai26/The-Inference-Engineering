@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>8.5 Final capstone: defend a complete inference system</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="8.5">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 8 · Chapter 8.5</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 8 · Specialized workloads, engine internals and research · Chapter 8.5</div>
+<h1>Final capstone: defend a complete inference system</h1>
+<p class="lede">The last project brings the whole book together under one workload, one SLO and one budget. You design, build, measure and defend an inference system end to end: workload and quality target, model and hardware, a reproducible baseline, profiling, memory, scheduling and caching, precision and kernels, parallelism or disaggregation, routing, autoscaling and observability, failure testing and cost, and one engine-level change with ablations. Every claim carries an evidence label, negative results stay in, and someone else should be able to reproduce your numbers. This chapter gives the ten stages, the evidence rules, a defense template and the questions you should expect.</p>
+<div class="meta">
+  <span class="chip">Level: capstone</span>
+  <span class="chip">Time: 2 to 3 weeks</span>
+  <span class="chip">Needs: the whole book</span>
+  <span class="chip">Compute: rented GPUs for focused sessions</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: readiness check</span>
+  <ol>
+    <li>Can you size a deployment for a traffic profile and SLO, and price it (chapters 6.3 and 6.5)?</li>
+    <li>Can you read a profiler trace and name the bottleneck (chapter 5.6)?</li>
+    <li>Can you trace a request through an engine's source (chapter 8.2) and change one component behind a flag?</li>
+  </ol>
+  <details><summary>If not</summary><p>Revisit those chapters first. The capstone assumes each of these skills and spends its time combining them.</p></details>
+</div>
+
+<h2 id="evidence">1. Evidence rules</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Evidence label:</strong> a tag on every number: <strong>measured</strong> (you ran it, with the config and raw data), <strong>simulated</strong> (from a model or simulator you built, with its assumptions), <strong>estimated</strong> (arithmetic from specifications), or <strong>quoted</strong> (from a source, with the reference).</p>
+  <p><strong>Strong baseline:</strong> the best reasonable configuration of a standard system (for example a current engine with sensible flags), not a deliberately weak one.</p>
+  <p><strong>Ablation:</strong> removing or changing one component to measure its contribution.</p>
+  <p><strong>Negative result:</strong> a change that did not help, or helped in one regime and hurt in another; it is reported, not dropped.</p>
+</div>
+<p>The book has followed these rules: chapters mark CPU measurements as measured and GPU expectations as expectations, and notes call out sources that conflict. Hold your capstone to the same standard. A reviewer should be able to tell, for each number, whether to rerun it, check the arithmetic or look up the source.</p>
+
+<h2 id="stages">2. The ten stages</h2>
+<div class="tbl"><table>
+<tr><th>Stage</th><th>Deliverable</th><th>Chapters</th></tr>
+<tr><td>1. Workload, quality, SLO</td><td>Five-part workload definition (shape, arrival, SLO, quality target, cost target), a workload manifest and a quality evaluation</td><td>6.1, 7.6, 8.1</td></tr>
+<tr><td>2. Model, hardware, engine</td><td>A decision table with alternatives and the reason for each choice</td><td>2.6, 3.6, 5.5</td></tr>
+<tr><td>3. Reproducible baseline</td><td>Pinned versions and configs, warm-up, repeated runs, Pareto curve and SLO point</td><td>6.1, 6.10</td></tr>
+<tr><td>4. Profile and find the bottleneck</td><td>Traces for prefill and decode, a one-page bottleneck report</td><td>5.1, 5.6</td></tr>
+<tr><td>5. Memory, scheduling, caching</td><td>KV budget, scheduler settings, prefix caching, with before and after measurements</td><td>3.2, 3.3, 3.5, 4.4</td></tr>
+<tr><td>6. Precision, kernels, runtime</td><td>Quantization with quality checks, attention backend, CUDA graphs and compilation</td><td>4.1, 4.2, 5.7</td></tr>
+<tr><td>7. Multi-GPU or disaggregation</td><td>The decision with numbers: break-even analysis or measurements</td><td>4.5, 4.6</td></tr>
+<tr><td>8. Routing, autoscaling, observability</td><td>Router policy, autoscaling parameters, dashboards and alerts</td><td>6.3, 6.4, 6.6</td></tr>
+<tr><td>9. Failure testing, cost, capacity</td><td>Fault-injection results, cost per million tokens, capacity plan with headroom</td><td>6.5, 6.9</td></tr>
+<tr><td>10. One engine-level change</td><td>A change behind a fallback flag, three ablations across three workload regions, results including negative ones</td><td>8.2, 8.3, 8.4</td></tr>
+</table></div>
+<div class="widget" id="cpW">
+  <div class="wt">Interactive: capstone progress</div>
+  <div class="ws">Tick each deliverable as you finish it. Nothing is stored; it resets when you reload the page.</div>
+  <div id="cpList"></div>
+  <div class="stats" id="cpStats"></div>
+</div>
+
+<h2 id="example">3. A worked example of the first stages</h2>
+<div class="box ex">
+  <span class="lbl">Example: a support assistant for a bank</span>
+  <ul>
+    <li><strong>Workload:</strong> chat with a 1,500-token system prompt and retrieved context (shared across users), user turns of about 100 tokens, answers of about 250 tokens; 20 requests per second at peak, half that at night; open-loop, bursty arrivals.</li>
+    <li><strong>SLO:</strong> p95 TTFT under 800 ms, p95 TPOT under 40 ms, 99.9% availability.</li>
+    <li><strong>Quality:</strong> 500 held-out conversations scored for answer correctness and policy compliance; no more than 1 point of regression from the BF16 baseline (chapter 7.6's interval says 500 items detect about 3.5 points at 80%, so add a paired comparison).</li>
+    <li><strong>Cost:</strong> under $0.50 per million output tokens at peak.</li>
+    <li><strong>Choices to defend:</strong> an 8B instruct model (fine-tuned with LoRA on 3,000 conversations, merged in FP32), FP8 weights and KV cache on H100s, vLLM with prefix caching and session-aware routing, no disaggregation (prompts are mostly cached, so prefill interference is small; show it with the chapter 4.6 break-even model).</li>
+    <li><strong>Engine change for stage 10:</strong> cache-aware admission that delays requests whose prefix is about to be cached by an in-flight request, measured at low, medium and high load.</li>
+  </ul>
+  <p>Every number in such a plan starts as estimated or quoted, and must become measured or be labelled as not measured by the end.</p>
+</div>
+
+<h2 id="defense">4. The written defense</h2>
+<ol>
+  <li><strong>Summary:</strong> workload, SLO, result (measured), cost (measured or estimated, labelled).</li>
+  <li><strong>System diagram:</strong> request path from client to GPU and back, with the components you chose.</li>
+  <li><strong>Decision log:</strong> for each choice, the alternatives considered, the evidence, and what result would change your mind.</li>
+  <li><strong>Results:</strong> baseline against final, Pareto curves, SLO compliance, quality, cost per million tokens.</li>
+  <li><strong>Engine change:</strong> what, why, the three ablations across three workload regions, and where it does not help.</li>
+  <li><strong>Failure tests:</strong> what you injected, what happened, recovery time.</li>
+  <li><strong>Limitations and negative results.</strong></li>
+  <li><strong>Reproduction package:</strong> repository with configs, manifests, scripts, raw results, analysis notebooks and a README that reproduces the headline numbers.</li>
+</ol>
+<h3>Questions to expect</h3>
+<ul>
+  <li>What was the bottleneck at each stage, and what evidence showed it?</li>
+  <li>Why this model size and precision, and what quality did you give up?</li>
+  <li>At what traffic level does your design stop meeting the SLO, and what scales next?</li>
+  <li>What happens to in-flight requests when a GPU fails, and how long until full capacity?</li>
+  <li>Which of your gains came from configuration and which from your code change?</li>
+  <li>What would you do with twice the budget, or half?</li>
+  <li>Which result surprised you, and what did you learn from it?</li>
+</ul>
+
+<h2 id="independent">5. Independent reproduction</h2>
+<p>The strongest test of the package is someone else running it. Ask a colleague (or a fresh rented machine and an AI assistant following only your README) to reproduce one headline number. Record what they had to ask or fix; each question is a gap in the package. Report the reproduced number next to yours with its spread.</p>
+
+<h2 id="mistakes">6. Common mistakes</h2>
+<ul>
+  <li>A weak baseline that makes every change look good.</li>
+  <li>Numbers without labels, or simulated numbers presented as measured.</li>
+  <li>Optimizing before profiling.</li>
+  <li>Reporting only the regime where the change helps.</li>
+  <li>No quality evaluation after precision or kernel changes.</li>
+  <li>A reproduction package that only works on the author's machine.</li>
+</ul>
+
+<h2 id="lab">7. The project</h2>
+<p>Complete the ten stages for a workload you care about (a client system, a product idea or the bank example). Budget GPU time by stage: most work (workload definition, simulation, analysis, writing) needs no GPU; rent GPUs for the baseline, the optimization runs, failure testing and the engine-change ablations, a few hours each, with scripts tested on CPU or a small GPU first (chapter 6.10's method). Deliver the written defense and the reproduction package, then present it in 20 minutes and answer the questions in section 4.</p>
+
+<h2 id="summary">8. Summary</h2>
+<ul>
+  <li>One workload, one SLO, one budget; ten stages from definition to an engine change.</li>
+  <li>Every number labelled measured, simulated, estimated or quoted; strong baselines; negative results kept.</li>
+  <li>A written defense with a decision log, and a reproduction package someone else can run.</li>
+</ul>
+
+<h2 id="refs">9. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>All earlier chapters of this book</td><td>The techniques, methods and labs each stage uses.</td></tr>
+<tr><td><a href="http://ccr.sigcomm.org/online/files/p83-keshavA.pdf">S. Keshav, How to Read a Paper</a></td><td>The three-pass method, also a good structure for reviewing your own defense.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {$}=IE;
+const items=['Workload definition and manifest','Quality evaluation','Model, hardware and engine decision table','Reproducible baseline with Pareto curve','Prefill and decode profiles, bottleneck report','Memory, scheduling and caching changes measured','Precision, kernels and runtime changes measured, quality checked','Multi-GPU or disaggregation decision with numbers','Routing, autoscaling, dashboards and alerts','Failure tests and recovery times','Cost per million tokens and capacity plan','Engine change behind a flag','Three ablations across three workload regions','Written defense','Reproduction package, reproduced by someone else'];
+$('cpList').innerHTML=items.map((t,i)=>`<label style="display:block;margin:4px 0"><input type="checkbox" id="cp${i}"> ${t}</label>`).join('');
+function cp(){const n=items.filter((_,i)=>$('cp'+i).checked).length;$('cpStats').innerHTML=`<div class="stat"><div class="k">Done</div><div class="v">${n} of ${items.length}</div></div><div class="stat"><div class="k">Progress</div><div class="v">${Math.round(n/items.length*100)}%</div></div>`;}
+items.forEach((_,i)=>$('cp'+i).addEventListener('input',cp));cp();
+})();
+</script>
+
+</body>
+</html>
