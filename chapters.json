@@ -275,37 +275,37 @@
     [
      "7.1",
      "The post-training landscape",
-     ""
+     "7-1-post-training-landscape"
     ],
     [
      "7.2",
      "Supervised fine-tuning and data",
-     ""
+     "7-2-sft-data"
     ],
     [
      "7.3",
      "LoRA and QLoRA",
-     ""
+     "7-3-lora-qlora"
     ],
     [
      "7.4",
      "Preference tuning and RL",
-     ""
+     "7-4-preference-rl"
     ],
     [
      "7.5",
      "Distillation",
-     ""
+     "7-5-distillation"
     ],
     [
      "7.6",
      "Evaluating and serving fine-tuned models",
-     ""
+     "7-6-evaluating-serving-finetuned"
     ],
     [
      "7.7",
      "Expert depth: training systems",
-     ""
+     "7-7-training-systems"
     ]
    ]
   },
@@ -317,27 +317,27 @@
     [
      "8.1",
      "Specialized inference workloads",
-     ""
+     "8-1-specialized-workloads"
     ],
     [
      "8.2",
      "Read an inference engine",
-     ""
+     "8-2-read-an-engine"
     ],
     [
      "8.3",
      "Build a mini inference engine",
-     ""
+     "8-3-mini-engine"
     ],
     [
      "8.4",
      "Reproduce an inference systems paper",
-     ""
+     "8-4-reproduce-a-paper"
     ],
     [
      "8.5",
      "Final capstone: defend a complete inference system",
-     ""
+     "8-5-final-capstone"
     ]
    ]
   }

@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>7.1 The post-training landscape</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="7.1">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 7 · Chapter 7.1</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 7 · Fine-tuning and post-training · Chapter 7.1</div>
+<h1>The post-training landscape</h1>
+<p class="lede">A pretrained model has read trillions of tokens but does not yet behave like an assistant. Post-training turns it into one: supervised fine-tuning teaches the format and style of good answers, preference tuning teaches which of two answers is better, and reinforcement learning teaches behaviour that can be checked, such as correct maths or passing code. This chapter maps the stages, what each one changes inside the model, how much each costs, and the decision you will face most often as an engineer: prompt, retrieve, or fine-tune.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 2 hours with the lab</span>
+  <span class="chip">Needs: 1.2, 1.5, 2.4</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>What does supervised fine-tuning change that pretraining did not?</li>
+    <li>A client wants the model to answer from its 5,000-page product manual, which changes monthly. Fine-tune or retrieve?</li>
+    <li>Why does almost every post-training pipeline start with supervised fine-tuning, even when the goal is RL?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Mostly behaviour: the chat format, when to stop, the tone and structure of answers, following instructions. Base and tuned models agree on most tokens; the differences concentrate in style and format tokens (section 3).</li>
+    <li>Retrieve (RAG). The facts change monthly and must be citable; fine-tuning teaches behaviour much more reliably than it stores facts, and every update would need a new training run.</li>
+    <li>It is cheap, stable and gives most of the gains. RL works best from a model that already follows the format and sometimes succeeds, because RL can only reinforce behaviour the model already produces.</li>
+  </ol></details>
+</div>
+
+<h2 id="stages">1. The stages</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Pretraining:</strong> training on a very large text corpus to predict the next token. Produces a <strong>base model</strong> with knowledge and skills but no assistant behaviour.</p>
+  <p><strong>Mid-training (continued pretraining):</strong> more next-token training on a targeted corpus, such as code, long documents or a company's documents, to add knowledge or context length.</p>
+  <p><strong>SFT (supervised fine-tuning):</strong> training on example conversations so the model imitates the assistant's replies.</p>
+  <p><strong>Preference optimization:</strong> training on pairs of answers labelled better and worse, so the model shifts probability toward the better kind (DPO and relatives, chapter 7.4).</p>
+  <p><strong>RL (reinforcement learning):</strong> the model generates answers, a reward scores them, and training raises the probability of high-reward answers. <strong>RLHF</strong> uses a reward model trained on human preferences; <strong>RLVR</strong> uses verifiable rewards such as unit tests or checked maths answers.</p>
+  <p><strong>Distillation:</strong> training a smaller student to imitate a larger teacher (chapter 7.5).</p>
+</div>
+<div class="svgwrap"><svg id="stSvg" viewBox="0 0 680 190" width="680" style="max-width:100%;height:auto" role="img" aria-label="Post-training stages from base model to deployed model"></svg></div>
+<p class="cap">The usual order. Each stage starts from the previous checkpoint; most products need only SFT, and many need no training at all.</p>
+<div class="tbl"><table>
+<tr><th>Stage</th><th>Training signal</th><th>What it changes</th><th>Relative cost and risk</th></tr>
+<tr><td>Mid-training</td><td>Next token on raw domain text</td><td>Knowledge, vocabulary, context length</td><td>Medium to high compute; can erode instruction following</td></tr>
+<tr><td>SFT</td><td>Imitate example replies (dense: every answer token)</td><td>Format, style, task behaviour</td><td>Cheap and stable; the baseline for everything after</td></tr>
+<tr><td>Preference (DPO)</td><td>Better vs worse answer pairs, offline</td><td>Quality judgements: helpfulness, tone, instruction following</td><td>Cheap; overfits after about an epoch</td></tr>
+<tr><td>RL (RLHF, RLVR)</td><td>Reward on the model's own samples (sparse: one score per answer)</td><td>Reasoning, multi-step success, verifiable skills</td><td>Expensive (needs generation in the loop), unstable, prone to reward hacking</td></tr>
+<tr><td>Distillation</td><td>Teacher's tokens or probabilities</td><td>Transfers a larger model's behaviour to a smaller one</td><td>Cheap per unit of quality when a good teacher exists</td></tr>
+</table></div>
+
+<h2 id="sft-first">2. Why pipelines start with SFT</h2>
+<p>Hugging Face's account of post-training SmolLM3 gives three reasons almost every pipeline starts with SFT: it is cheap, it is stable ("it just works"), and a good SFT checkpoint gives most of the gains and makes DPO or RL far more effective afterwards. RL can only reinforce behaviour the model already sometimes produces; a base model that never follows the answer format gets no reward to learn from. The exception is the frontier, where no stronger teacher exists: DeepSeek trained R1-Zero with RL directly from a base model to discover reasoning behaviour that supervision could not provide.</p>
+<p>Two useful observations from the same work: preference optimization (they used APO, a DPO variant) raised instruction following on IFEval by 15 to 20 percentage points over their SFT checkpoint; and RL with verifiable maths rewards, applied naively, made the model's "no thinking" mode write long chains of thought to raise its reward, until a length penalty was added. Every stage optimizes exactly what you measure.</p>
+
+<h2 id="what">3. What post-training changes inside the model</h2>
+<p>Lin et al. compared base models with their aligned versions token by token: on most positions both models would pick the same token, and the shifts concentrate on stylistic tokens (discourse markers, formatting, the start of a reply, stop tokens). This supports the "superficial alignment" idea from LIMA, where 1,000 good examples gave strong alignment. Our lab repeats the measurement on Qwen2.5-0.5B and its instruct version: the base model ranks the instruct model's token first 78% of the time.</p>
+<p>The practical reading: post-training is excellent at changing <em>how</em> a model answers and weaker at adding <em>what</em> it knows. New facts need mid-training on lots of text, or retrieval.</p>
+
+<h2 id="decide">4. Prompt, retrieve or fine-tune?</h2>
+<p>A simple test from the Smol playbook: spend a few days building on a current strong open model. If prompting, examples and retrieval reach your target, you do not need to train. Fine-tuning makes sense when you have good domain data <em>and</em> a way to measure success.</p>
+<div class="tbl"><table>
+<tr><th>Need</th><th>First choice</th><th>Why</th></tr>
+<tr><td>Answers from documents that change, with citations</td><td>RAG</td><td>Facts stay current and traceable; no retraining</td></tr>
+<tr><td>A fixed output format, tone or schema</td><td>Prompt and constrained decoding (chapter 3.5); SFT if prompts are long or unreliable</td><td>SFT moves long instructions into the weights, shortening every request</td></tr>
+<tr><td>A narrow task at high volume and low cost</td><td>SFT or distillation into a small model</td><td>A small tuned model can match a large general one on one task at a fraction of the serving cost (chapter 6.5)</td></tr>
+<tr><td>A skill that can be checked automatically (code, maths, SQL)</td><td>SFT, then RLVR</td><td>Verifiers give a reward signal without labels</td></tr>
+<tr><td>Data that cannot leave your infrastructure</td><td>An open model, self-hosted; fine-tune if needed</td><td>Control over data and weights</td></tr>
+<tr><td>New domain knowledge (internal jargon, a new language)</td><td>RAG first; mid-training if retrieval is not enough</td><td>SFT alone stores facts poorly (lab Part B of chapter 7.3)</td></tr>
+</table></div>
+<div class="widget" id="dcW">
+  <div class="wt">Interactive: prompt, RAG or fine-tune</div>
+  <div class="ws">Answer five questions about a use case. The recommendation follows the table above; it is a starting point, not a rule.</div>
+  <div class="ctrls" id="dcQ"></div>
+  <div class="stats" id="dcStats"></div>
+</div>
+
+<h2 id="cost">5. What it costs, in inference terms</h2>
+<ul>
+  <li><strong>SFT and LoRA</strong> on a 7B to 8B model fit on one GPU for hours (chapter 7.3). The output can be served as merged weights or as a LoRA adapter on a shared base model (chapter 7.6).</li>
+  <li><strong>Preference tuning</strong> needs a forward pass of a frozen reference model as well as the trained model, about twice the compute of SFT per example.</li>
+  <li><strong>RL</strong> generates samples inside the training loop, so it is largely an inference problem: rollouts often dominate the time, and engines such as vLLM and SGLang serve them (chapter 8.1). Chapter 6.6 showed why the sampler and trainer must agree numerically.</li>
+  <li><strong>On-policy distillation</strong> reached a higher maths score than RL at about one tenth of the GPU hours in the Qwen3 report (chapter 7.5).</li>
+</ul>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Dense and sparse training signals</span>
+  <p>SFT gives a target for every token (dense) but only on someone else's text (off-policy). RL trains on the model's own samples (on-policy) but gives one number per answer (sparse), so it learns few bits per episode. On-policy distillation combines both: the student samples, and the teacher grades every token. That framing, from Thinking Machines, explains why each method costs what it does.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Hybrid reasoning models</span>
+  <p>Models with a thinking and a non-thinking mode need each mode's length distribution kept separate during RL. Hugging Face found joint RL on both modes unstable, one reason labs such as Qwen moved to releasing instruct and reasoning variants separately.</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Fine-tuning to add facts that change, instead of retrieving them.</li>
+  <li>Starting with RL before a working SFT baseline.</li>
+  <li>Training without an evaluation that measures the target behaviour (chapter 7.6).</li>
+  <li>Comparing a fine-tuned small model with an unprompted large one, instead of with the best prompt.</li>
+  <li>Forgetting that a tuned model must be served: adapters, versions, templates and quantization all apply (chapters 7.6 and 6.5).</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<h3>Part A: what did post-training change?</h3>
+<p>Generate answers with Qwen2.5-0.5B-Instruct, then ask the base model Qwen2.5-0.5B how it ranks each token the instruct model chose. Predict first: on what share of positions does the base model already rank the same token first?</p>
+<pre>import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+inst = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct").eval()
+base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B").eval()
+prompts = ["Give me three tips for writing clear emails.", "What is the boiling point of water at sea level?",
+           "Explain what a hash table is.", "Write a haiku about the monsoon.", "How do I reverse a list in Python?"]
+tot = top1 = top3 = 0; shifted = []
+for p in prompts:
+    ids = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, return_tensors="pt")
+    with torch.no_grad():
+        out = inst.generate(ids, max_new_tokens=80, do_sample=False)
+        lb = base(out).logits[0, ids.shape[1]-1:-1]        # base model's prediction at each answer position
+    for i, t in enumerate(out[0, ids.shape[1]:].tolist()):
+        rank = (lb[i] > lb[i, t]).sum().item()              # 0 means the base model also ranks it first
+        tot += 1; top1 += rank == 0; top3 += 0 < rank < 3
+        if rank >= 3 and len(shifted) < 12: shifted.append(tok.decode([t]))
+print(f"{tot} tokens: base top-1 {top1/tot:.0%}, top-2 or 3 {top3/tot:.0%}, shifted {1-(top1+top3)/tot:.0%}")
+print(shifted)</pre>
+<details><summary>What we measured (CPU)</summary><pre class="out">answer tokens 337: base top-1 78%, base top-2/3 14%, shifted (rank>=4) 8%
+examples of shifted tokens: [' conveying', 'Keep', ' but', ' email', ' This', ' and', ' under', ' on', ' At', ' gain', '&lt;|im_end|&gt;', ' allows']</pre>
+<p>Only 8% of positions shifted strongly, and they are mostly reply openers, connectives and the end-of-turn token: style and format, as Lin et al. found for larger models. (Depending on your Transformers version, <code>apply_chat_template</code> may return a dict; then use its <code>input_ids</code>.)</p></details>
+<h3>Part B: three decisions</h3>
+<p>For three real use cases you have built or been asked for, fill in the widget's five questions, decide prompt, RAG, fine-tune or a combination, and write one paragraph each: what you would measure to prove the choice, and what result would make you change it.</p>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Post-training in practice</span>
+  <ul>
+    <li><strong>Open model releases</strong> ship a base and an instruct (and often a reasoning) checkpoint; the instruct one went through SFT, preference tuning and usually RL.</li>
+    <li><strong>Product teams</strong> mostly use prompting and RAG, and fine-tune small models for high-volume narrow tasks, structured extraction or latency.</li>
+    <li><strong>Reasoning models</strong> rely on RL with verifiable rewards, which makes rollout generation a large inference workload.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz71"></div>
+<script type="application/json" id="qz71">[
+{"q":"Which stage gives a target for every token but on someone else's text?","o":["RL","SFT","RLVR","On-policy distillation"],"a":1,"e":"SFT is dense and off-policy."},
+{"q":"Why does RL usually start from an SFT checkpoint?","o":["RL needs no data","RL can only reinforce behaviour the model already sometimes produces","SFT is more expensive","RL cannot change weights"],"a":1,"e":"No successes means no reward to learn from."},
+{"q":"Base and aligned models mostly differ on:","o":["Every token","Stylistic and format tokens","Numbers only","Nothing"],"a":1,"e":"Lin et al.: most positions decode identically; shifts concentrate on style."},
+{"q":"Answers from a monthly-changing manual with citations call for:","o":["Full fine-tuning","RAG","RLHF","Distillation"],"a":1,"e":"Keep facts in retrieval."},
+{"q":"RLVR uses rewards that are:","o":["Human ratings","Checked automatically, like unit tests or maths answers","Random","From the base model"],"a":1,"e":"Verifiable rewards."},
+{"q":"What did naive RL on maths do to SmolLM3's non-thinking mode?","o":["Nothing","It wrote long chains of thought to raise reward, until a length penalty was added","It forgot maths","It stopped answering"],"a":1,"e":"A form of reward hacking."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>Post-training stages: mid-training (knowledge), SFT (format and behaviour), preference tuning (quality judgements), RL (checkable skills), distillation (transfer to smaller models).</li>
+  <li>Start with SFT; add DPO or RL only with an evaluation that shows the need.</li>
+  <li>Post-training mainly changes style and behaviour; use retrieval or mid-training for knowledge.</li>
+  <li>Prompt and retrieve first; fine-tune when you have good data, a metric, and a cost, latency or control reason.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook">Hugging Face, The Smol Training Playbook</a> (post-training chapter)</td><td>The post-training compass, why SFT comes first, preference optimization and RLVR results on SmolLM3, and choosing among online DPO, on-policy distillation and RL.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2312.01552">Lin et al., The Unlocking Spell on Base LLMs (URIAL)</a></td><td>Token distribution shift between base and aligned models; alignment by in-context learning.</td></tr>
+<tr><td><a href="https://thinkingmachines.ai/blog/on-policy-distillation/">Thinking Machines, On-Policy Distillation</a></td><td>On-policy vs off-policy and dense vs sparse signals; cost comparison with RL.</td></tr>
+<tr><td><a href="https://rlhfbook.com/">Nathan Lambert, RLHF Book</a></td><td>A free, detailed reference on RLHF, reward models and policy optimization.</td></tr>
+</table></div>
+<h3>Sources considered and not used</h3>
+<ul><li>The "Post-training 101" Notion page listed for this chapter could not be retrieved (it loads only in a browser). The Smol playbook and the RLHF book cover the same ground.</li></ul>
+<p class="note">Facts checked on 7 November 2026. Part A measured on CPU with PyTorch 2.15 and Transformers 5.22.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {$,el,css}=IE;
+function st(){const s=$('stSvg');s.innerHTML='';
+  const B=[['Base model','pretraining','--mute'],['Mid-training','knowledge','--kv'],['SFT','format, style','--pre'],['Preference','DPO, APO','--dec'],['RL','RLHF, RLVR','--bad'],['Deploy','merge or adapter','--good']];
+  const w=100,g=12,x0=10;
+  const d=el('defs',{},s),m=el('marker',{id:'stA',viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto'},d);el('path',{d:'M0,0 L10,5 L0,10 z',fill:css('--ink2')},m);
+  B.forEach((b,i)=>{const x=x0+i*(w+g);el('rect',{x,y:40,width:w,height:62,rx:6,fill:css(b[2]==='--mute'?'--panel2':b[2]+'-s')||css('--panel2'),stroke:css(b[2])},s);
+    el('text',{x:x+w/2,y:66,'text-anchor':'middle','font-size':12,'font-weight':600,fill:css('--ink')},s,b[0]);
+    el('text',{x:x+w/2,y:84,'text-anchor':'middle','font-size':9.5,fill:css('--ink2')},s,b[1]);
+    if(i<B.length-1)el('line',{x1:x+w,x2:x+w+g-1,y1:71,y2:71,stroke:css('--ink2'),'stroke-width':1.5,'marker-end':'url(#stA)'},s);});
+  el('text',{x:x0+2*(w+g),y:128,'font-size':10.5,fill:css('--ink2')},s,'dense, off-policy');
+  el('text',{x:x0+4*(w+g),y:128,'font-size':10.5,fill:css('--ink2')},s,'sparse, on-policy');
+  el('path',{d:`M ${x0+2*(w+g)+w/2} 140 C ${x0+2*(w+g)+w/2} 170, ${x0+5*(w+g)+w/2} 170, ${x0+5*(w+g)+w/2} 106`,fill:'none',stroke:css('--good'),'stroke-dasharray':'4 3','marker-end':'url(#stA)'},s);
+  el('text',{x:x0+3*(w+g)+w/2+40,y:178,'text-anchor':'middle','font-size':10.5,fill:css('--good')},s,'Most products stop after SFT (or never train)');}
+IE.onTheme(st);
+const Q=[['facts','Does the model need facts that change or must be cited?'],['fmt','Is the main gap format, tone or a fixed task behaviour?'],['vol','Is the task narrow and high volume, where serving cost or latency matters?'],['check','Can success be checked automatically (tests, exact answers)?'],['data','Do you have a few hundred or more good examples and an evaluation?']];
+$('dcQ').innerHTML=Q.map(q=>`<label>${q[1]} <select id="dc_${q[0]}"><option value="0">No</option><option value="1">Yes</option></select></label>`).join('');
+function dc(){const v={};Q.forEach(q=>v[q[0]]=+$('dc_'+q[0]).value);const rec=[];
+  if(v.facts)rec.push('RAG for the changing facts');
+  if(!v.data){rec.push(v.fmt?'Prompting with examples and constrained decoding':'Prompting first');rec.push('Collect data and build an evaluation before any training');}
+  else{if(v.fmt||v.vol)rec.push(v.vol?'SFT (LoRA) or distillation into a small model':'SFT with LoRA');if(v.check)rec.push('Then RL with verifiable rewards, from the SFT checkpoint');if(!v.fmt&&!v.vol&&!v.check)rec.push('Prompting may be enough; fine-tune only if the evaluation shows a gap');}
+  $('dcStats').innerHTML=rec.map((r,i)=>`<div class="stat"><div class="k">Step ${i+1}</div><div class="v" style="font-size:1rem">${r}</div></div>`).join('');}
+Q.forEach(q=>$('dc_'+q[0]).addEventListener('input',dc));dc();
+})();
+</script>
+
+</body>
+</html>

@@ -317,84 +317,84 @@ window.IE_CHAPTERS = [
 {
 "n": "7.1",
 "title": "The post-training landscape",
-"slug": "",
+"slug": "7-1-post-training-landscape",
 "part": 7,
-"ready": false
+"ready": true
 },
 {
 "n": "7.2",
 "title": "Supervised fine-tuning and data",
-"slug": "",
+"slug": "7-2-sft-data",
 "part": 7,
 "ready": false
 },
 {
 "n": "7.3",
 "title": "LoRA and QLoRA",
-"slug": "",
+"slug": "7-3-lora-qlora",
 "part": 7,
 "ready": false
 },
 {
 "n": "7.4",
 "title": "Preference tuning and RL",
-"slug": "",
+"slug": "7-4-preference-rl",
 "part": 7,
 "ready": false
 },
 {
 "n": "7.5",
 "title": "Distillation",
-"slug": "",
+"slug": "7-5-distillation",
 "part": 7,
 "ready": false
 },
 {
 "n": "7.6",
 "title": "Evaluating and serving fine-tuned models",
-"slug": "",
+"slug": "7-6-evaluating-serving-finetuned",
 "part": 7,
 "ready": false
 },
 {
 "n": "7.7",
 "title": "Expert depth: training systems",
-"slug": "",
+"slug": "7-7-training-systems",
 "part": 7,
 "ready": false
 },
 {
 "n": "8.1",
 "title": "Specialized inference workloads",
-"slug": "",
+"slug": "8-1-specialized-workloads",
 "part": 8,
 "ready": false
 },
 {
 "n": "8.2",
 "title": "Read an inference engine",
-"slug": "",
+"slug": "8-2-read-an-engine",
 "part": 8,
 "ready": false
 },
 {
 "n": "8.3",
 "title": "Build a mini inference engine",
-"slug": "",
+"slug": "8-3-mini-engine",
 "part": 8,
 "ready": false
 },
 {
 "n": "8.4",
 "title": "Reproduce an inference systems paper",
-"slug": "",
+"slug": "8-4-reproduce-a-paper",
 "part": 8,
 "ready": false
 },
 {
 "n": "8.5",
 "title": "Final capstone: defend a complete inference system",
-"slug": "",
+"slug": "8-5-final-capstone",
 "part": 8,
 "ready": false
 }
