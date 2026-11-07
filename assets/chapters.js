@@ -312,7 +312,7 @@ window.IE_CHAPTERS = [
 "title": "Capstone: public engine teardown",
 "slug": "6-10-engine-teardown",
 "part": 6,
-"ready": false
+"ready": true
 },
 {
 "n": "7.1",

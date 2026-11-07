@@ -1,0 +1,302 @@
+<div class="kicker">Part 6 · Production inference infrastructure · Chapter 6.10</div>
+<h1>Capstone: public engine teardown</h1>
+<p class="lede">The capstone puts Parts 2 to 6 to work on one question: on one model and one GPU, how do vLLM, SGLang and TensorRT-LLM compare, and why? You design the test matrix, run a reproducible benchmark on a rented GPU for a few hours, plot throughput against interactivity and cost per million tokens, explain every difference from first principles, and publish the configs and raw results so anyone can check them. This chapter gives the method, a tested harness, the analysis, a checklist for explaining differences and a report template.</p>
+<div class="meta">
+  <span class="chip">Level: capstone</span>
+  <span class="chip">Time: 1 to 2 days, including 3 to 5 GPU-hours</span>
+  <span class="chip">Needs: 3.4, 4.1, 5.6, 6.1, 6.6</span>
+  <span class="chip">Compute: one rented GPU (H100, L40S or similar)</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Engine X has higher peak throughput than engine Y. Is X better?</li>
+    <li>Why must every engine use the same weights, precision and chat template?</li>
+    <li>Why run a correctness check before any speed measurement?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Not necessarily. Peak throughput is reached at a concurrency where each user may get too few tokens per second. Compare full curves, and compare at your SLO (chapter 6.1).</li>
+    <li>Otherwise you measure the difference between models or quantization recipes, not between engines. FP8 against BF16 alone changes throughput substantially (chapter 4.1).</li>
+    <li>A fast engine that produces wrong output (broken template, bad kernel, wrong sampling defaults) is not a result. Chapter 6.6 showed that silent quality differences between providers of the same model are real.</li>
+  </ol></details>
+</div>
+
+<h2 id="rules">1. Rules for a fair comparison</h2>
+<ol>
+  <li><strong>Same model files and precision</strong> for every engine (for example Llama-3.1-8B-Instruct in BF16, then a second pass with the same FP8 checkpoint). If one engine needs its own conversion, record it.</li>
+  <li><strong>Same hardware and software base:</strong> one GPU type, same driver and CUDA version, the engines' official container images, pinned by version and digest. Record <code>nvidia-smi -q</code> (clocks, power limit, ECC, MIG off).</li>
+  <li><strong>Same workload:</strong> same prompts, same input and output lengths, same tokenizer and chat template, a fixed output length so each engine generates the same number of tokens, same sampling settings.</li>
+  <li><strong>Defaults first, then tuned.</strong> Report "out of the box" and "tuned" separately, and list every non-default flag. A tuned engine against a default one says nothing.</li>
+  <li><strong>Warm up, repeat, report spread.</strong> Discard warm-up requests (CUDA graph capture, JIT compilation, cache warm-up), run each point at least three times and report the spread.</li>
+  <li><strong>One client for all engines.</strong> Use one benchmark client against each engine's OpenAI-compatible API, so client-side metric definitions are identical (chapter 6.1 showed tools define ITL and throughput differently).</li>
+  <li><strong>Check correctness first.</strong> Golden outputs and a short task evaluation on each engine before any timing (section 4).</li>
+</ol>
+
+<h2 id="matrix">2. Design the test matrix</h2>
+<p>A few hours of GPU time allows a focused matrix. A good default:</p>
+<div class="tbl"><table>
+<tr><th>Dimension</th><th>Values</th><th>Why</th></tr>
+<tr><td>Model and precision</td><td>One 7B to 8B instruct model; BF16, then FP8 if the GPU supports it</td><td>Fits one GPU with room for KV cache; FP8 shows quantized kernel quality</td></tr>
+<tr><td>Workloads (input / output tokens)</td><td>Chat 1,000 / 200; long input 8,000 / 200; long output 200 / 1,000</td><td>Prefill-heavy and decode-heavy shapes favour different engines (chapter 2.5)</td></tr>
+<tr><td>Load</td><td>Closed-loop concurrency 1, 2, 4, ... 128 (or 256); plus one open-loop rate sweep near the knee</td><td>Concurrency traces the full curve; open loop reveals overload a closed loop hides (chapter 6.1)</td></tr>
+<tr><td>Prefix reuse</td><td>One run with a shared 2,000-token system prompt</td><td>Prefix caching designs differ (radix tree, hashed blocks; chapter 4.4)</td></tr>
+<tr><td>Repeats</td><td>3 per point</td><td>Run-to-run variation</td></tr>
+</table></div>
+<p>Write down predictions before running: which engine wins at concurrency 1, which at 128, and on which workload. The predictions are what make the explanations in section 6 worth reading.</p>
+
+<h2 id="launch">3. Launch the engines</h2>
+<p>Each engine provides an OpenAI-compatible server. Run one at a time on the same GPU, with comparable memory settings. Exact flags change between versions; check each <code>--help</code> for the version you pin, and record the full command.</p>
+<pre># vLLM
+vllm serve meta-llama/Llama-3.1-8B-Instruct --port 8000 \
+  --max-model-len 16384 --gpu-memory-utilization 0.90
+
+# SGLang
+python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --port 8000 \
+  --context-length 16384 --mem-fraction-static 0.90
+
+# TensorRT-LLM (PyTorch backend by default); extra settings go in a YAML file via --config
+trtllm-serve meta-llama/Llama-3.1-8B-Instruct --port 8000 \
+  --max_seq_len 16384 --kv_cache_free_gpu_memory_fraction 0.90</pre>
+<p>Note that "0.90" does not mean the same thing in each engine: vLLM's value is the share of total GPU memory the engine may use, SGLang's is the share for weights and KV pool, and TensorRT-LLM's is the share of <em>free memory after loading</em> given to the KV cache. Record the resulting KV cache capacity each engine logs at start-up, and compare it: KV capacity is often the real difference at high concurrency (chapter 3.3).</p>
+
+<h2 id="correct">4. Correctness gate</h2>
+<ul>
+  <li><strong>Golden outputs:</strong> 20 fixed prompts at temperature 0 and 64 tokens on each engine. Expect identical text for most prompts and early splits for a few (chapter 6.6 explains why near-ties flip). Many prompts diverging in the first few tokens means a template, tokenizer or kernel problem.</li>
+  <li><strong>Task evaluation:</strong> a short run of a standard benchmark through each engine's API (for example GSM8K with lm-evaluation-harness's <code>local-completions</code> model type). Scores should agree within run-to-run noise.</li>
+  <li><strong>Chat template check:</strong> render one conversation through each engine's chat endpoint and compare the token IDs it actually processed, when the engine can show them.</li>
+</ul>
+
+<h2 id="harness">5. The benchmark harness</h2>
+<p>One small client measures every engine the same way: a closed-loop sweep over concurrency, one JSON line per request. The analysis turns those lines into throughput, interactivity, latency percentiles and cost. We tested the full pipeline here on three mock engines (section 7 and the widget); on a GPU, point it at the real servers.</p>
+<pre># sweep.py: engine-agnostic closed-loop concurrency sweep; one JSON line per request
+import asyncio, json, sys, time, httpx
+async def one(client, url, prompt, out):
+    t0 = time.perf_counter(); first = None; n = 0
+    async with client.stream("POST", url, json={"model": "m", "prompt": prompt, "max_tokens": out,
+                                                "stream": True, "ignore_eos": True}) as r:
+        async for line in r.aiter_lines():
+            if line.startswith("data: {"):
+                n += 1
+                if first is None: first = time.perf_counter()
+    end = time.perf_counter()
+    return {"ttft": first - t0, "tpot": (end - first) / max(1, n - 1), "e2e": end - t0, "out": n, "t0": t0, "end": end}
+
+async def level(url, conc, n_req, prompt, out):
+    q = asyncio.Queue(); [q.put_nowait(i) for i in range(n_req)]; res = []
+    async with httpx.AsyncClient(timeout=120) as client:
+        async def worker():
+            while not q.empty():
+                q.get_nowait(); res.append(await one(client, url, prompt, out))
+        await asyncio.gather(*[worker() for _ in range(conc)])
+    return res
+
+async def main(engine, url, out_path, isl=1000, osl=100):
+    prompt = " ".join(["w"] * isl)     # on real engines use real text: see the note below
+    with open(out_path, "a") as f:
+        for conc in [1, 2, 4, 8, 16, 32, 64]:
+            await level(url, conc, conc, prompt, osl)                    # warm-up at this level
+            res = await level(url, conc, max(4 * conc, 16), prompt, osl)
+            for r in res: f.write(json.dumps({"engine": engine, "conc": conc, **r}) + "\n")
+asyncio.run(main(sys.argv[1], sys.argv[2], sys.argv[3]))</pre>
+<pre># analyze.py: per engine and concurrency, the numbers a teardown reports
+import json, sys, collections, statistics
+GPU_PRICE = float(sys.argv[2]) if len(sys.argv) > 2 else 2.90      # $ per GPU-hour
+rows = [json.loads(l) for l in open(sys.argv[1])]
+groups = collections.defaultdict(list)
+for r in rows: groups[(r["engine"], r["conc"])].append(r)
+q = lambda xs, p: sorted(xs)[min(len(xs) - 1, int(p * len(xs)))]
+print("engine conc  out tok/s  tok/s/user  TTFT p95  TPOT p95   $/M out")
+for (eng, conc), rs in sorted(groups.items()):
+    span = max(r["end"] for r in rs) - min(r["t0"] for r in rs)
+    tput = sum(r["out"] for r in rs) / span                   # output tokens per second on this GPU
+    user = statistics.median(1 / r["tpot"] for r in rs)      # interactivity: tokens/s each user sees
+    cost = GPU_PRICE / 3600 / tput * 1e6
+    print(f"{eng:6s} {conc:4d} {tput:10.0f} {user:11.1f} {q([r['ttft'] for r in rs], .95):8.2f} s "
+          f"{q([r['tpot'] for r in rs], .95)*1e3:6.1f} ms  {cost:8.2f}")</pre>
+<p>Notes for real engines: use real text prompts with an exact token count (tokenize with the model's tokenizer and trim), not repeated words, because repeated tokens can trigger prefix caching or unusual attention patterns. <code>ignore_eos</code> is an extra parameter some servers accept; if one rejects it, remove it and rely on the counted output tokens. As a cross-check, also run <code>vllm bench serve --backend openai --endpoint /v1/completions --host ... --port ...</code> against each server with <code>--save-result</code>: two independent clients agreeing is strong evidence the numbers are right.</p>
+
+<h2 id="explain">6. Explain every difference from first principles</h2>
+<p>A teardown is only as good as its explanations. For each gap larger than the run-to-run spread, find the mechanism and, where possible, confirm it with a profile (chapter 5.6) or by changing one flag.</p>
+<div class="tbl"><table>
+<tr><th>Where the gap appears</th><th>Likely causes to check</th><th>How to confirm</th></tr>
+<tr><td>Concurrency 1 to 4 (latency regime)</td><td>CPU overhead per step, CUDA graph coverage, sampling and detokenization cost, attention kernel for small batches</td><td>Nsight Systems trace: gaps between kernels (chapters 5.3, 5.7); engine flags that disable CUDA graphs</td></tr>
+<tr><td>Middle of the curve</td><td>Scheduler policy: chunked-prefill token budget, how prefills and decodes mix (chapter 3.2)</td><td>Inter-token latency spikes when prefills arrive; change the token budget</td></tr>
+<tr><td>High concurrency (throughput regime)</td><td>KV cache capacity (memory settings, block size), maximum batch size, preemptions, matmul and attention kernel efficiency at large batch</td><td>Engine logs and metrics: running vs waiting requests, KV usage, preemptions (chapter 3.1)</td></tr>
+<tr><td>TTFT at high load</td><td>Queueing once the batch limit is reached; prefill speed; HTTP front-end limits</td><td>Server-side queue time vs client TTFT (chapter 6.6)</td></tr>
+<tr><td>Long-input workload</td><td>Prefill kernels (FlashAttention or FlashInfer versions, chapter 4.2), chunk size</td><td>Prefill time per token at concurrency 1</td></tr>
+<tr><td>Prefix-reuse workload</td><td>Prefix cache design, hit rate, eviction</td><td>Hit-rate metrics; TTFT with caching on and off</td></tr>
+<tr><td>FP8 run</td><td>Quantized GEMM kernels and which layers stay in higher precision (chapter 4.1)</td><td>Kernel names and times in a profile</td></tr>
+</table></div>
+<p>An example of a mechanism you may meet: at high concurrency a single Python serving process can become host-bound, with one event loop parsing every request and writing every streamed chunk. TensorRT-LLM's server documentation says this is why <code>trtllm-serve</code> now runs 8 HTTP front-end processes by default. If one engine's TTFT climbs while its GPU shows idle gaps, check the front end before the kernels.</p>
+
+<h2 id="read">7. Reading the results</h2>
+<p>Plot each engine as a curve: x-axis tokens per second per user (interactivity, 1 ÷ TPOT), y-axis output tokens per second per GPU (throughput). Moving right along an engine's curve means fewer concurrent users; the curve that lies above and to the right of the others is better at every operating point. Curves often cross. Then apply your SLO: a minimum tokens per second per user (and a TTFT limit) picks one point on each curve, and the engine with the highest throughput there wins <em>for that SLO</em>, at a cost per million tokens of GPU price ÷ throughput.</p>
+<div class="widget" id="tdW">
+  <div class="wt">Interactive: Pareto curves and an SLO</div>
+  <div class="ws">These curves come from the pipeline test on three <strong>mock engines</strong> on a CPU (A: fast steps that slow down quickly with batch size; B: slower steps that scale better; C: like A but limited to 16 running requests). They are not vLLM, SGLang or TensorRT-LLM results. They show how to read a real teardown.</div>
+  <div class="ctrls">
+    <label>SLO: minimum tokens/s per user <input type="range" id="tdS" min="30" max="100" step="5" value="60"> <span id="tdSv"></span></label>
+    <label>Also require TTFT p95 under 1 s <input type="checkbox" id="tdT" checked></label>
+  </div>
+  <div class="svgwrap"><svg id="tdSvg" viewBox="0 0 680 270" width="680" style="max-width:100%;height:auto" role="img" aria-label="Throughput against tokens per second per user for three mock engines"></svg></div>
+  <div class="stats" id="tdStats"></div>
+</div>
+<p>In the mock test, A wins at low concurrency (fastest per-user speed), B wins at high concurrency (highest throughput), and C stops scaling at 16 running requests: its throughput stays flat while TTFT grows to 3.7 s at concurrency 64, because extra requests just queue. A real teardown shows the same kinds of pattern, for real reasons from the table in section 6.</p>
+
+<h2 id="publish">8. Publish it</h2>
+<p>A teardown others can trust includes:</p>
+<ul>
+  <li>Hardware (GPU, host CPU, memory, cloud and region), driver, CUDA, engine versions and container digests.</li>
+  <li>The exact launch commands and config files, and the KV capacity each engine reported.</li>
+  <li>The workload generator, prompts (or the seed and dataset), the client and its version.</li>
+  <li>Raw per-request results (the JSON lines), the analysis script and the plotting script.</li>
+  <li>Correctness gate results.</li>
+  <li>Plots: Pareto curves per workload, TTFT and TPOT percentiles against concurrency, cost per million tokens at your SLO.</li>
+  <li>Explanations for each difference, with the evidence (profiles, metrics, flag changes), and a list of what you did <em>not</em> test.</li>
+</ul>
+<p>Budget: at the H100 price in chapter 6.5 ($2.90 per hour), four hours costs about $12. Script everything before renting, test the scripts on a mock or a small GPU, and shut the instance down as soon as the raw results are copied off.</p>
+
+<h2 id="mistakes">9. Common mistakes</h2>
+<ul>
+  <li>Different precisions or model files across engines.</li>
+  <li>Comparing one engine's tuned config with another's defaults.</li>
+  <li>Reporting a single peak-throughput number.</li>
+  <li>No warm-up, so CUDA graph capture and compilation land in the measurements.</li>
+  <li>Prompts made of repeated tokens, or identical prompts that hit the prefix cache.</li>
+  <li>Different output lengths because one engine stops at end-of-sequence earlier.</li>
+  <li>Explaining differences by reputation ("engine X is optimized") instead of evidence.</li>
+</ul>
+
+<h2 id="lab">10. Lab: the capstone</h2>
+<h3>Part A: run the pipeline on mock engines</h3>
+<p>Before renting a GPU, run the whole pipeline on a CPU with mock engines. The mock engine streams tokens with a decode step time that grows with the number of running requests, a prefill time per prompt token, and a maximum batch size:</p>
+<pre># mock_engine.py: a stand-in "engine" for testing the harness without a GPU
+import asyncio, os
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+STEP = float(os.environ["STEP_MS"]) / 1000          # decode step time at batch 1
+SLOW = float(os.environ["SLOW"])                    # slowdown per extra running request
+PRE = float(os.environ["PREFILL_US_PER_TOK"]) / 1e6 # prefill time per prompt token
+MAXB = int(os.environ["MAX_BATCH"])                 # requests that can run at once; the rest queue
+app = FastAPI(); sem = asyncio.Semaphore(MAXB); running = 0
+@app.post("/v1/completions")
+async def completions(req: Request):
+    body = await req.json(); n_in = len(body["prompt"].split()); n_out = body["max_tokens"]
+    async def gen():
+        global running
+        async with sem:
+            running += 1
+            try:
+                await asyncio.sleep(n_in * PRE * (1 + running * SLOW))
+                for _ in range(n_out):
+                    await asyncio.sleep(STEP * (1 + running * SLOW))
+                    yield 'data: {"choices": [{"text": " t"}]}\n\n'
+                yield "data: [DONE]\n\n"
+            finally:
+                running -= 1
+    return StreamingResponse(gen(), media_type="text/event-stream")</pre>
+<pre># run_mock.sh
+declare -A CFG=( [A]="STEP_MS=8 SLOW=0.03 PREFILL_US_PER_TOK=40 MAX_BATCH=64"
+                 [B]="STEP_MS=12 SLOW=0.012 PREFILL_US_PER_TOK=25 MAX_BATCH=64"
+                 [C]="STEP_MS=8 SLOW=0.02 PREFILL_US_PER_TOK=40 MAX_BATCH=16" )
+port=8301
+for e in A B C; do
+  env ${CFG[$e]} python3 -m uvicorn mock_engine:app --port $port --log-level error & pid=$!
+  sleep 2
+  python3 sweep.py $e http://127.0.0.1:$port/v1/completions results.jsonl
+  kill $pid; port=$((port+1))
+done
+python3 analyze.py results.jsonl 2.90</pre>
+<details><summary>What we measured (CPU, about 4 minutes)</summary><pre class="out">engine conc  out tok/s  tok/s/user  TTFT p95  TPOT p95   $/M out
+A         1         94        97.8     0.06 s   10.3 ms      8.60
+A         4        384       100.9     0.06 s   10.1 ms      2.10
+A        16       1201        79.0     0.09 s   12.7 ms      0.67
+A        64       2505        41.3     0.18 s   24.3 ms      0.32
+B         1         68        69.5     0.04 s   14.4 ms     11.82
+B         4        276        70.1     0.05 s   14.3 ms      2.92
+B        16       1033        66.2     0.07 s   15.2 ms      0.78
+B        64       2770        45.2     0.12 s   22.3 ms      0.29
+C         1         94        98.2     0.06 s   10.2 ms      8.55
+C        16       1333        88.0     0.08 s   11.5 ms      0.60
+C        32       1344        88.0     1.28 s   11.4 ms      0.60
+C        64       1338        87.7     3.68 s   11.6 ms      0.60</pre>
+<p>(Rows for concurrency 2, 8 and 32 of A and B omitted here; the widget uses all of them.) The pipeline reproduces the behaviour each mock was built with, which is the point of the test: if the harness had a bug, the curves would not match the known settings. "$/M out" is per million output tokens at $2.90 per GPU-hour and only means something on a real GPU.</p></details>
+<h3>Part B: the real run</h3>
+<ol>
+  <li>Design your matrix (section 2) and write your predictions.</li>
+  <li>Rent one GPU. Pull the three engines' official images at pinned versions.</li>
+  <li>For each engine: launch, record the start-up log (KV capacity, CUDA graph sizes), run the correctness gate, run the sweep for each workload three times, copy the results off, stop the engine.</li>
+  <li>Profile one point where engines differ most (Nsight Systems, a few seconds of steady state).</li>
+  <li>Analyze: Pareto plots, percentile plots, cost at your SLO. Explain each difference with evidence.</li>
+  <li>Publish the repository and report.</li>
+</ol>
+<h3>Part C: the report</h3>
+<p>Structure: question and predictions; setup and versions; correctness gate; results per workload (plots and table); explanations; what surprised you and what your predictions got wrong; limitations; how to reproduce. Keep the conclusion conditional: "for this model, GPU, workload and SLO, engine X gave the lowest cost per million tokens, because ...".</p>
+
+<h2 id="realworld">11. In the real world</h2>
+<div class="box real">
+  <span class="lbl">How teams use engine comparisons</span>
+  <ul>
+    <li><strong>Platform teams</strong> rerun a teardown like this whenever a major engine version, model family or GPU arrives, because rankings change often.</li>
+    <li><strong>Engine projects</strong> publish their own benchmarks; independent ones with published configs are the ones to trust.</li>
+    <li><strong>Public benchmark sites</strong> (chapter 6.1) compare providers end to end; a teardown explains the engine-level reasons behind such differences.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">12. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz610"></div>
+<script type="application/json" id="qz610">[
+{"q":"On a Pareto plot of throughput against tokens/s per user, which engine is better?","o":["The one with the highest single point","The one whose curve is above and to the right at your operating point","The one with the lowest TTFT at concurrency 1","The newest one"],"a":1,"e":"Curves can cross; the SLO picks the operating point."},
+{"q":"Why record each engine's reported KV cache capacity?","o":["It is required by the license","Memory settings mean different things per engine, and KV capacity often explains high-concurrency differences","It changes the model","It sets the price"],"a":1,"e":"vLLM, SGLang and TensorRT-LLM interpret their memory fractions differently."},
+{"q":"Why discard warm-up requests?","o":["They are too short","CUDA graph capture, compilation and cache warm-up would distort the measurements","They are always errors","To save money"],"a":1,"e":"Measure steady state."},
+{"q":"Mock engine C's throughput stays flat above concurrency 16 while TTFT rises. Why?","o":["Its decode is slow","Its batch limit is 16; extra requests queue","It ran out of memory","The client is broken"],"a":1,"e":"Queueing adds to TTFT, not to throughput."},
+{"q":"An engine's TTFT climbs at high concurrency while the GPU shows idle gaps. What should you check first?","o":["The attention kernel","Whether the HTTP front end or CPU is the bottleneck","The model weights","The GPU price"],"a":1,"e":"A single Python serving process can become host-bound; TensorRT-LLM runs 8 front ends by default for this reason."},
+{"q":"Why publish raw per-request results?","o":["To make the report longer","So others can recompute every metric and check the analysis","Because plots are not allowed","For licensing"],"a":1,"e":"Reproducibility is what makes a benchmark trustworthy."}
+]</script>
+
+<h2 id="summary">13. Summary</h2>
+<ul>
+  <li>Same weights, precision, hardware, workload and client for every engine; defaults and tuned configs reported separately; warm-up and repeats.</li>
+  <li>Correctness first, then curves across concurrency for several workload shapes.</li>
+  <li>Read Pareto curves at your SLO, convert to cost per million tokens, and explain each gap with evidence: CPU overhead, CUDA graphs, scheduler, KV capacity, kernels, prefix caching, front ends.</li>
+  <li>Publish everything needed to reproduce the result.</li>
+</ul>
+
+<h2 id="refs">14. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/benchmarking/cli.html">vLLM: Benchmark CLI</a></td><td><code>vllm bench serve</code> against OpenAI-compatible servers, saved results and server-side metrics.</td></tr>
+<tr><td><a href="https://docs.sglang.io/basic_usage/send_request.html">SGLang documentation: sending requests</a></td><td>Launching the SGLang server and its OpenAI-compatible API.</td></tr>
+<tr><td><a href="https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve/trtllm-serve.html">TensorRT-LLM: trtllm-serve</a> and <a href="https://nvidia.github.io/TensorRT-LLM/developer-guide/perf-benchmarking.html">performance benchmarking</a></td><td>The OpenAI-compatible server, its configuration file, multiple HTTP front ends, and <code>trtllm-bench</code>.</td></tr>
+<tr><td>Chapter 6.1 sources: <a href="https://developer.nvidia.com/blog/llm-benchmarking-fundamental-concepts/">NVIDIA, LLM benchmarking fundamental concepts</a></td><td>Metric definitions and why tools differ.</td></tr>
+<tr><td><a href="https://github.com/EleutherAI/lm-evaluation-harness">EleutherAI lm-evaluation-harness</a></td><td>Running standard evaluations against an API endpoint for the correctness gate.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. The pipeline test ran on CPU with Python 3.13, FastAPI, uvicorn and httpx against mock engines; no real engine was measured in this chapter.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$,el,css}=IE;
+const D={A:[[1,94,97.8,0.06],[2,191,97.9,0.06],[4,384,100.9,0.06],[8,710,93.2,0.07],[16,1201,79.0,0.09],[32,1834,60.5,0.11],[64,2505,41.3,0.18]],
+B:[[1,68,69.5,0.04],[2,136,69.3,0.05],[4,276,70.1,0.05],[8,555,71.5,0.05],[16,1033,66.2,0.07],[32,1775,57.3,0.09],[64,2770,45.2,0.12]],
+C:[[1,94,98.2,0.06],[2,186,97.0,0.06],[4,394,103.7,0.06],[8,759,99.8,0.07],[16,1333,88.0,0.08],[32,1344,88.0,1.28],[64,1338,87.7,3.68]]};
+const COL={A:'--pre',B:'--dec',C:'--kv'};
+function td(){const S=+$('tdS').value,T=$('tdT').checked;$('tdSv').textContent=S;
+  const s=$('tdSvg');s.innerHTML='';const x0=60,x1=660,y0=230,y1=28;const X=v=>x0+(v-30)/(110-30)*(x1-x0),Y=v=>y0-v/3000*(y0-y1);
+  for(let v=0;v<=3000;v+=500){el('line',{x1:x0,x2:x1,y1:Y(v),y2:Y(v),stroke:css('--line')},s);el('text',{x:x0-6,y:Y(v)+4,'text-anchor':'end','font-size':10,fill:css('--ink2')},s,IE.int(v));}
+  for(let v=30;v<=110;v+=10){el('text',{x:X(v),y:y0+16,'text-anchor':'middle','font-size':10,fill:css('--ink2')},s,v);}
+  el('text',{x:(x0+x1)/2,y:y0+32,'text-anchor':'middle','font-size':10.5,fill:css('--ink2')},s,'tokens/s per user (interactivity) →');
+  el('text',{x:x0-50,y:12,'font-size':10.5,fill:css('--ink2')},s,'output tokens/s per GPU ↑');
+  el('rect',{x:x0,y:y1,width:Math.max(0,X(S)-x0),height:y0-y1,fill:css('--bad-s'),opacity:0.5},s);
+  el('line',{x1:X(S),x2:X(S),y1:y1,y2:y0,stroke:css('--bad'),'stroke-width':1.5,'stroke-dasharray':'4 3'},s);
+  const best=[];
+  Object.keys(D).forEach(e=>{const pts=D[e];let d='';pts.forEach((p,i)=>{d+=(i?'L':'M')+X(p[2]).toFixed(1)+','+Y(p[1]).toFixed(1);});
+    el('path',{d,fill:'none',stroke:css(COL[e]),'stroke-width':2},s);
+    pts.forEach(p=>{const ok=p[2]>=S&&(!T||p[3]<1);el('circle',{cx:X(p[2]),cy:Y(p[1]),r:ok?4.5:3,fill:ok?css(COL[e]):css('--panel'),stroke:css(COL[e]),'stroke-width':1.5},s);});
+    const li=Object.keys(D).indexOf(e);el('rect',{x:x1-200+li*68,y:4,width:12,height:12,rx:2,fill:css(COL[e])},s);el('text',{x:x1-184+li*68,y:14,'font-size':11,'font-weight':600,fill:css(COL[e])},s,'Mock '+e);
+    const okp=pts.filter(p=>p[2]>=S&&(!T||p[3]<1));const b=okp.sort((a,c)=>c[1]-a[1])[0];best.push([e,b]);});
+  best.sort((a,b)=>(b[1]?b[1][1]:0)-(a[1]?a[1][1]:0));
+  $('tdStats').innerHTML=best.map(([e,b])=>`<div class="stat"><div class="k">Mock ${e}: best point meeting the SLO</div><div class="v">${b?IE.int(b[1])+' tok/s at concurrency '+b[0]:'none'}</div></div>`).join('');}
+['tdS','tdT'].forEach(id=>$(id).addEventListener('input',td));IE.onTheme(td);
+})();
+</script>
