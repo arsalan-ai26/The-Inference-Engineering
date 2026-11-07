@@ -106,6 +106,10 @@
   <p>With many models and GPU types, capacity planning becomes bin packing: which model runs on which GPU type, at what parallelism, in which region, so that every SLO holds at minimum cost. Platforms solve this continuously as traffic and availability change; small models on MIG slices (chapter 5.5) and spare capacity used for batch jobs raise overall utilization.</p>
 </div>
 <div class="box expert">
+  <span class="lbl">Many small models: pool instead of reserving</span>
+  <p>For a fleet of many rarely used models, reserving a replica per model wastes most of the GPUs. Aegaeon (chapter 6.3) reports serving tens of models on 213 GPUs instead of 1,192 by sharing GPUs between models at token granularity. If your plan has many models below about one request per second each, model the pooled option before buying per-model capacity.</p>
+</div>
+<div class="box expert">
   <span class="lbl">Batch and offline traffic as a utilization tool</span>
   <p>Requests that can wait hours (evaluations, embedding a corpus, synthetic data) fill the troughs of interactive traffic. Async and batch APIs with low priority (chapters 6.2 and 6.4) turn idle GPU-hours into useful work, raising average utilization and lowering the effective cost of the interactive service.</p>
 </div>
@@ -184,6 +188,7 @@ print(in_flight, replicas, cost_day, cost_day / (rate * osl * 86400 / 1e6))</pre
 <h2 id="refs">12. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://ennanzhai.github.io/pub/sosp25-aegaeon.pdf">Aegaeon (SOSP 2025)</a></td><td>The GPU saving from pooling many low-traffic models.</td></tr>
 <tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 7.3 and 7.4</td><td>Multi-cloud capacity, procurement, geo-aware load balancing, reliability, security and compliance, testing, zero-downtime deployment and cost estimation.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2407.21783">Grattafiori et al., The Llama 3 Herd of Models</a></td><td>Measured interruption rates and root causes on a 16,000-GPU cluster.</td></tr>
 <tr><td><a href="https://sre.google/workbook/canarying-releases/">Google SRE workbook: Canarying releases</a></td><td>How to run canaries, choose metrics and decide on rollback.</td></tr>

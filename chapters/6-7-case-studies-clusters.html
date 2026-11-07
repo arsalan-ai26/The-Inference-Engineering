@@ -60,6 +60,12 @@
 <tr><td>Theoretical revenue if all tokens were billed at R1 prices</td><td>$562,027 (cost profit margin 545%)</td></tr>
 </table></div>
 <p>Three lessons. First, <strong>expert parallelism trades latency for throughput deliberately</strong>: 20 to 22 tokens per second per user is modest, but each decode node produces about 14,800 tokens per second. Second, <strong>prefix caching changes the economics</strong>: over half of all input tokens were cache hits, billed at a quarter of the price. Third, <strong>fleets follow the day</strong>: DeepSeek runs inference on all nodes at peak and moves nodes to research and training at night, which is how the average stays 18% below the peak. Actual revenue is much lower than the theoretical figure (free web and app use, cheaper V3 pricing, night discounts), so read the margin as an upper bound.</p>
+<p>These numbers describe the V3/R1 service on H800s in February 2025. DeepSeek's V4.1-Flash service (October 2026) runs on NVIDIA SM100 GPUs and Huawei Ascend 950 NPUs with a different layout: a separate vision encoder pool, prefill on 8-GPU machines with EP2 to EP8, decode on 64- to 128-GPU supernodes, a KV cache on SSD kept for at least 72 hours, 155 trillion tokens a day per cluster and reported revenue of $38 per GPU-hour at off-peak prices. Chapter 4.8 covers it with its open-source engine, DeepInfer.</p>
+<h3>Two more published MoE services</h3>
+<ul>
+  <li><strong>ByteDance's MegaScale-Infer</strong> (arXiv 2504.02263) splits attention and experts onto separate GPU pools inside each layer, with ping-pong micro-batches between them, and reports up to 1.90 times higher per-GPU throughput (chapter 4.5).</li>
+  <li><strong>Huawei's CloudMatrix384</strong> (arXiv 2506.12708 and 2508.02520) serves DeepSeek-R1 and other open models on 384-NPU supernodes with prefill, decode and caching as separate pools, reporting 1,943 decode tokens per second per NPU under 50 ms TPOT in the research paper and 2,400 per Ascend 910C at about 50 ms in production (chapters 4.5 and 5.5).</li>
+</ul>
 
 <h2 id="cursor">2. Case study: Cursor on Together AI</h2>
 <p>Cursor's in-editor agents must answer while the developer is still looking at the same code; a late suggestion no longer matches the file. That makes worst-case latency under concurrency the main requirement. Together AI's published account of the work:</p>
@@ -194,6 +200,8 @@ share of node-time: prefill 42%, decode 58%</pre>
 <h2 id="refs">11. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://github.com/deepseek-ai/DeepInfer">DeepInfer deployment Q&amp;A</a></td><td>DeepSeek's V4.1-Flash service layout and production figures.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2504.02263">MegaScale-Infer</a> and <a href="https://arxiv.org/abs/2508.02520">Huawei Cloud MaaS on CloudMatrix384</a></td><td>Two more production MoE services with published layouts and throughput.</td></tr>
 <tr><td><a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">DeepSeek, Day 6: DeepSeek-V3/R1 Inference System Overview</a></td><td>Deployment layout, overlap and load balancing, and 24 hours of production statistics.</td></tr>
 <tr><td><a href="https://www.together.ai/blog/learn-how-cursor-partnered-with-together-ai-to-deliver-real-time-low-latency-inference-at-scale">Together AI, How Cursor partnered with Together AI for real-time inference</a></td><td>Blackwell deployment, ARM hosts, custom kernels and an NVFP4 release pipeline.</td></tr>
 <tr><td>Philip Kiely, <em>Inference Engineering</em>, chapter 0 and section 7.2</td><td>How infrastructure problems change with scale, and Kubernetes' control and worker planes.</td></tr>

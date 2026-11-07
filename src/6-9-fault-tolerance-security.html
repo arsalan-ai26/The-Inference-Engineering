@@ -327,7 +327,7 @@ resume  requests 122  failed   0  retried  12  tokens wasted     0  p50 2.74 s  
 </table></div>
 <h3>Notes on sources</h3>
 <ul>
-  <li>The Llama 3 paper's root-cause table lists faulty GPUs as 148 interruptions and 30.1%; 148 is 35% of the 419 unexpected interruptions, so one of the two figures is inconsistent. This chapter quotes the counts.</li>
+  <li>The Llama 3 paper's root-cause table (Table 5 in arXiv 2407.21783v3, checked on 7 November 2026) lists faulty GPUs as 148 interruptions and 30.1%. The other rows match their counts divided by the 419 unexpected interruptions (for example HBM3 memory, 72, is 17.2%), so the 30.1% is the inconsistent figure: 148 ÷ 419 is 35.3%. This chapter quotes the counts.</li>
 </ul>
 <p class="note">Facts checked on 7 November 2026. Part A run on CPU with Python 3.13, FastAPI, uvicorn and httpx; Parts B to D are exercises with expected behaviour.</p>
 <!--SCRIPT-->

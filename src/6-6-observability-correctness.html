@@ -116,6 +116,8 @@
 <p>Engines have since built on this. SGLang's deterministic mode keeps chunked prefill, CUDA graphs and its radix prefix cache working, adds a per-request seed so sampling above temperature 0 is also repeatable, and reports an average slowdown of about 34% (most cases 25% to 45%) with its FlashInfer and FlashAttention 3 backends, against the 61.5% of the original integration (26 s to 42 s). vLLM has a beta batch-invariant mode (<code>VLLM_BATCH_INVARIANT=1</code>) for supported GPUs and models.</p>
 <p>Do you need it? For most chat traffic, no: users sample at temperature above 0 anyway. It matters for debugging and regression tests (a diff then means a real change), for evaluations you want to repeat exactly, and for reinforcement learning, where differences between the sampler and the trainer quietly turn on-policy training into off-policy training.</p>
 
+<p>Batch invariance has since become a production feature rather than a research fix. DeepSeek's V4 report describes end-to-end batch-invariant and deterministic kernels (for example a dual-kernel decode attention whose two paths add in the same order, and GEMMs without split-K), and its open-source engine DeepInfer ships batch-invariant inference (<code>DEEPINFER_BATCH_INVARIANT=1</code>) and deterministic sampling with a fixed per-request seed, on NVIDIA GPUs (chapter 4.8).</p>
+
 <h2 id="correct">6. Silent failures and correctness testing</h2>
 <p>Infrastructure changes can lower output quality while every latency and error metric stays green. Two public examples:</p>
 <ul>
@@ -271,6 +273,7 @@ p99 replica 1 0.40, replica 2 3.81, average of the two 2.10, true fleet p99 2.39
 <h2 id="refs">14. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2606.19348">DeepSeek-V4 report</a>, section 3.3, and <a href="https://github.com/deepseek-ai/DeepInfer">DeepInfer</a></td><td>Batch-invariant and deterministic kernels and inference in a production stack.</td></tr>
 <tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 7.4.3 and 7.5</td><td>What to monitor for inference, integration with existing tooling, client latency, async inference and streaming protocols.</td></tr>
 <tr><td><a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">Horace He and Thinking Machines Lab, Defeating Nondeterminism in LLM Inference</a></td><td>Why inference is nondeterministic, batch-invariant RMSNorm, matmul and attention, the 1,000-completion experiment and the performance cost.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/features/batch_invariance.html">vLLM: Batch invariance</a></td><td>How to enable batch-invariant mode and which hardware and models are supported.</td></tr>

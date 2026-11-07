@@ -15,7 +15,7 @@
 <main><article>
 <div class="kicker">Part 6 · Production inference infrastructure · Chapter 6.10</div>
 <h1>Capstone: public engine teardown</h1>
-<p class="lede">The capstone puts Parts 2 to 6 to work on one question: on one model and one GPU, how do vLLM, SGLang and TensorRT-LLM compare, and why? You design the test matrix, run a reproducible benchmark on a rented GPU for a few hours, plot throughput against interactivity and cost per million tokens, explain every difference from first principles, and publish the configs and raw results so anyone can check them. This chapter gives the method, a tested harness, the analysis, a checklist for explaining differences and a report template.</p>
+<p class="lede">The capstone puts Parts 2 to 6 to work on one question: on one model and one GPU, how do vLLM, SGLang and TensorRT-LLM compare, and why? You design the test matrix, run a reproducible benchmark on a rented GPU for a few hours, plot throughput against interactivity and cost per million tokens, explain every difference from first principles, and publish the configs and raw results so anyone can check them. This chapter gives the method, a tested harness, the analysis, a checklist for explaining differences and a report template. The harness was tested against mock engines on CPU, so every number measured in this chapter comes from those mocks; the real comparison is yours to run on a GPU.</p>
 <div class="meta">
   <span class="chip">Level: capstone</span>
   <span class="chip">Time: 1 to 2 days, including 3 to 5 GPU-hours</span>

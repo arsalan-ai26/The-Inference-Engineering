@@ -114,6 +114,10 @@
   <p>With a 100 : 1 input ratio and mostly cached prefixes, the work per call is a modest prefill of new tokens plus a short decode, but the KV that must be kept is large and lives for minutes. That combination favours separate prefill capacity, large KV pools spread across GPU, CPU and disk, and routing by cache location: exactly the llm-d and Dynamo designs of chapters 4.4 and 4.6.</p>
 </div>
 <div class="box expert">
+  <span class="lbl">Models designed for agent traffic</span>
+  <p>Model builders now design for this workload. The DeepSeek-V4.1-Flash report starts from it: long-horizon agents make traffic input-heavy, every tool call is another prefill, and with sparse attention already cheap, prefill compute on cache misses and the storage of large KV caches bound the cost, not decode. Its answers are at the model level: a causal encoder-decoder that halves the parameters active in prefill (8B against 16B in decode), a global KV of 890 bytes per token, and SWA bounded replay, which lets the service keep only global KV on SSD (for 3 days for agent traffic, a TTL chosen to span a weekend) and rebuild short-lived sliding window state cheaply. DeepSeek's API bills a cache-hit input token at 2% of a miss. Chapter 4.8 has the details; the lesson for agent builders is that the cache-friendly practices of section 2 are worth even more on such models.</p>
+</div>
+<div class="box expert">
   <span class="lbl">Masking tools without breaking the cache</span>
   <p>Response prefill does the masking without touching the prefix. In the Hermes format: prefill <code>&lt;|im_start|&gt;assistant</code> to let the model choose; add <code>&lt;tool_call&gt;</code> to force a tool call; add <code>{"name": "browser_</code> to force a tool from one group. The tool definitions never change, so the cache survives.</p>
 </div>
@@ -212,6 +216,7 @@ tool list changes each step  input 1,757,500 (cached  8.4%)  output 5,000  in:ou
 <h2 id="refs">12. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2609.19969">DeepSeek-V4.1-Flash report</a> and <a href="https://github.com/deepseek-ai/DeepInfer">DeepInfer deployment Q&amp;A</a></td><td>A model and service designed around input-heavy agent traffic: prefill cost, KV size and cache retention.</td></tr>
 <tr><td><a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus">Yichao Ji, Context Engineering for AI Agents: Lessons from Building Manus</a></td><td>KV cache hit rate as the key metric, the 100 : 1 ratio, tool masking, file system as memory, recitation and error handling.</td></tr>
 <tr><td><a href="https://www.philschmid.de/agent-harness-2026">Phil Schmid, The Importance of Agent Harness in 2026</a></td><td>What a harness is, durability over long tasks, and building to delete.</td></tr>
 <tr><td><a href="https://benanderson.work/blog/async-coding-agents/">Ben Anderson, Async Coding Agents "From Scratch"</a></td><td>A design for background coding agents in serverless containers with scoped credentials.</td></tr>

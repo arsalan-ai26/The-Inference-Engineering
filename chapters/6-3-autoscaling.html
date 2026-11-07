@@ -91,6 +91,10 @@
 <h2 id="components">5. Scaling compound systems</h2>
 <p>Real products chain several models and CPU stages: speech-to-text, an LLM, text-to-speech; or retrieval, reranking and generation; plus CPU-heavy pre- and post-processing. Packaging them as one unit forces them to scale together, which leaves expensive GPUs idle while CPU stages run. Anyscale reports that production AI workloads often run well below 50% sustained GPU utilization for this reason. Scale each component on its own signal and hardware (a small GPU or MIG slice for a classifier, a full node for the LLM, CPUs for preprocessing), but keep them in the same cluster to avoid extra network hops.</p>
 
+<h3>Serving the long tail of models: token-level GPU pooling</h3>
+<p>A platform that hosts thousands of models (fine-tunes, older versions, niche languages) faces the opposite of the usual problem: most models get a request every few minutes. Alibaba Cloud Model Studio measured that more than 90% of its models are in this long tail, and that reserving GPUs for them put 17.7% of its GPUs on 1.35% of requests. Scale-to-zero does not fix this, because cold starts are far too slow for each request (section 4), and earlier multi-model systems fit only two or three models per GPU.</p>
+<p><strong>Aegaeon</strong> (Peking University and Alibaba, SOSP 2025) autoscales at the granularity of <em>tokens</em>: a GPU can switch which model it runs between scheduling steps, so many models share one pool. It splits the pool into prefill and decode partitions (chapter 4.6), and cuts the cost of each switch by 97% by reusing engine components, managing GPU memory explicitly and synchronizing KV caches at a fine grain. It supports up to seven models per GPU and 2 to 2.5 times higher request rates (or 1.5 to 9 times more goodput) than earlier systems. In a beta deployment of over three months serving tens of models from 1.8B to 72B parameters, the number of GPUs needed fell from 1,192 to 213, an 82% saving (authors-reported). The lesson for the five parameters of section 3: with enough models, the unit you autoscale is not a replica but a time slice of a shared GPU.</p>
+
 <h2 id="expert">6. Expert layer</h2>
 <div class="box expert">
   <span class="lbl">Predictive and scheduled scaling</span>
@@ -198,6 +202,7 @@ for cfg in [dict(), dict(headroom=1.0), dict(window=1), dict(window=15),
 <h2 id="refs">12. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://ennanzhai.github.io/pub/sosp25-aegaeon.pdf">Xiang et al., Aegaeon: Effective GPU Pooling for Concurrent LLM Serving on the Market</a> (SOSP 2025)</td><td>Token-level autoscaling across many models; 1,192 to 213 GPUs in Alibaba Cloud Model Studio.</td></tr>
 <tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 7.2 to 7.2.5</td><td>Traffic vs utilization signals, the autoscaling parameters, batching and concurrency, cold starts, scale to zero, independent component scaling.</td></tr>
 <tr><td><a href="https://www.anyscale.com/blog/gpu-in-efficiency-in-ai-workloads">Anyscale: GPU (in)efficiency in AI workloads</a></td><td>Why monolithic containers leave GPUs underused, and disaggregated multi-stage execution.</td></tr>
 <tr><td><a href="https://keda.sh/">KEDA</a> and <a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">Kubernetes HPA</a></td><td>Event-driven and metric-driven autoscaling in Kubernetes.</td></tr>
