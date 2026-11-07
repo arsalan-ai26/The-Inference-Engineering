@@ -99,13 +99,13 @@
   <div class="wt">Interactive: per-token API vs dedicated GPUs</div>
   <div class="ws">Monthly cost of the same traffic on a per-token API and on dedicated GPUs. Throughput per GPU must come from your own load test at your SLO; the default is an idealized estimate for an 8B model in FP8 on an H100. Dedicated cost includes headroom and an engineering cost you set.</div>
   <div class="ctrls">
-    <label>Requests per second (average) <input type="number" id="ctR" value="5" step="0.5" min="0.1" style="width:70px"></label>
-    <label>Peak ÷ average <input type="number" id="ctPk" value="2.5" step="0.5" min="1" style="width:60px"></label>
-    <label>Input tokens <input type="number" id="ctI" value="2000" step="100" style="width:70px"></label>
-    <label>Output tokens <input type="number" id="ctO" value="300" step="50" style="width:70px"></label>
-    <label>API $/M input <input type="number" id="ctAi" value="0.20" step="0.05" style="width:60px"></label>
-    <label>API $/M output <input type="number" id="ctAo" value="0.60" step="0.05" style="width:60px"></label>
-    <label>GPU $/hour <input type="number" id="ctG" value="2.90" step="0.1" style="width:60px"></label>
+    <label>Requests per second (average) <input type="number" id="ctR" value="5" step="0.5" min="0.1" style="width:84px"></label>
+    <label>Peak ÷ average <input type="number" id="ctPk" value="2.5" step="0.5" min="1" style="width:84px"></label>
+    <label>Input tokens <input type="number" id="ctI" value="2000" step="100" style="width:84px"></label>
+    <label>Output tokens <input type="number" id="ctO" value="300" step="50" style="width:84px"></label>
+    <label>API $/M input <input type="number" id="ctAi" value="0.20" step="0.05" style="width:84px"></label>
+    <label>API $/M output <input type="number" id="ctAo" value="0.60" step="0.05" style="width:84px"></label>
+    <label>GPU $/hour <input type="number" id="ctG" value="2.90" step="0.1" style="width:84px"></label>
     <label>Output tok/s per GPU at SLO <input type="number" id="ctT" value="8500" step="500" style="width:80px"></label>
     <label>Engineering $/month <input type="number" id="ctE" value="5000" step="1000" style="width:80px"></label>
   </div>

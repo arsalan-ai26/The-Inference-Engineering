@@ -284,7 +284,7 @@ window.IE_CHAPTERS = [
 "title": "Observability and correctness",
 "slug": "6-6-observability-correctness",
 "part": 6,
-"ready": false
+"ready": true
 },
 {
 "n": "6.7",

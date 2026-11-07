@@ -1,0 +1,328 @@
+<div class="kicker">Part 6 · Production inference infrastructure · Chapter 6.6</div>
+<h1>Observability and correctness</h1>
+<p class="lede">A production inference service fails in two ways. Loud failures show up as errors, timeouts and slow responses; good metrics, traces and alerts catch them. Silent failures return fast, successful responses that are subtly wrong: a misrouted request, a broken sampling kernel, a quantized checkpoint that lost a skill. This chapter covers both: what to measure at each layer, how Prometheus histograms and traces work (and how they mislead), how to alert on SLOs, why the same prompt at temperature 0 gives different answers, and how to test that the model you serve is still the model you evaluated.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 1.2, 3.1, 6.1</span>
+  <span class="chip">Compute: Colab CPU (Part D: any GPU)</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>You have p99 TTFT for each of 10 replicas. Can you average them to get the fleet p99?</li>
+    <li>nvidia-smi shows 100% GPU utilization. Is the GPU busy?</li>
+    <li>Why can the same prompt at temperature 0 give different answers on a busy server, even though each kernel is deterministic?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>No. Percentiles do not average. Merge the underlying histograms (sum the bucket counts) and compute the percentile from the merged histogram.</li>
+    <li>Not necessarily. That number is the share of time at least one kernel was running. Use SM activity, tensor activity and memory bandwidth counters to see how much work is being done.</li>
+    <li>The kernels are not batch-invariant: their reduction order depends on the batch size, and the batch size depends on what other traffic is on the server. Tiny floating-point differences flip a near-tie and the outputs diverge from there.</li>
+  </ol></details>
+</div>
+
+<h2 id="signals">1. Metrics, logs and traces</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Metric:</strong> a number sampled over time, such as requests per second or KV cache usage. Cheap to store and aggregate; shows <em>that</em> something changed.</p>
+  <p><strong>Log:</strong> a timestamped record of one event, such as a request finishing or a configuration change. Shows <em>what</em> happened in detail.</p>
+  <p><strong>Trace:</strong> the path of one request through the system, as a tree of timed steps called <strong>spans</strong> (gateway, queue, prefill, decode). Shows <em>where</em> the time went.</p>
+  <p><strong>SLI (service level indicator):</strong> a measured quantity users care about, such as the share of requests with TTFT under 1 s. <strong>SLO (service level objective):</strong> the target for it, such as 99% over 30 days. <strong>Error budget:</strong> the failures the SLO allows (here 1% of requests).</p>
+</div>
+<p>All three are needed, and they must sit in the same tools as the rest of the application (Grafana, Datadog, PagerDuty, Sentry and similar), so a slow product page can be traced to a slow model call.</p>
+
+<h2 id="what">2. What to measure, layer by layer</h2>
+<div class="tbl"><table>
+<tr><th>Layer</th><th>Measure</th><th>Why</th></tr>
+<tr><td>Requests</td><td>Volume; input and output lengths; response codes (2xx, 4xx, 5xx); TTFT, TPOT and end-to-end latency at p50, p90, p99; cancellations</td><td>What users experience, and the inputs that explain it: a latency spike may come from volume or from longer prompts</td></tr>
+<tr><td>Engine</td><td>Requests running and waiting; KV cache usage; preemptions; prefix cache hit rate; queue time; speculative acceptance rate</td><td>Saturation and efficiency inside the replica (chapter 3.1 lists the vLLM names)</td></tr>
+<tr><td>GPU</td><td>Memory used; SM activity, tensor activity and DRAM activity; power and clock throttling; Xid errors; NVLink and PCIe traffic</td><td>Whether the hardware is used well, and whether it is healthy</td></tr>
+<tr><td>Fleet</td><td>Replicas serving and starting; queue depth for async traffic; autoscaler decisions; routing distribution</td><td>Capacity and scaling behaviour (chapters 6.3 and 6.4)</td></tr>
+<tr><td>Business</td><td>Tokens and cost per customer, model and feature; quality signals such as user feedback</td><td>Cost attribution and silent quality changes</td></tr>
+</table></div>
+<p>The metrics depend on each other. Seeing them side by side on one dashboard tells you not just what changed but why.</p>
+<h3>GPU utilization, measured properly</h3>
+<p>NVIDIA's Data Center GPU Manager (DCGM) exports GPU metrics to Prometheus through <code>dcgm-exporter</code>. The common ones:</p>
+<div class="tbl"><table>
+<tr><th>DCGM field</th><th>Meaning</th></tr>
+<tr><td><code>DCGM_FI_DEV_GPU_UTIL</code></td><td>Same as nvidia-smi's GPU-Util: share of time at least one kernel was running. Says nothing about how much of the GPU the kernels used.</td></tr>
+<tr><td><code>DCGM_FI_PROF_SM_ACTIVE</code></td><td>Share of time at least one warp was resident on an SM, averaged over all SMs. NVIDIA: 0.8 or more is necessary but not sufficient for good use; below 0.5 likely means poor use. Warps waiting on memory count as active.</td></tr>
+<tr><td><code>DCGM_FI_PROF_PIPE_TENSOR_ACTIVE</code></td><td>Share of cycles the tensor core pipe was busy: high during prefill and large batches.</td></tr>
+<tr><td><code>DCGM_FI_PROF_DRAM_ACTIVE</code></td><td>Share of cycles moving data to or from HBM. About 0.8 is the practical maximum. High during decode, which is memory-bound.</td></tr>
+<tr><td><code>DCGM_FI_DEV_FB_USED</code>, <code>DCGM_FI_DEV_POWER_USAGE</code>, <code>DCGM_FI_DEV_CLOCK_THROTTLE_REASONS</code>, <code>DCGM_FI_DEV_XID_ERRORS</code></td><td>Memory used (engines reserve most of it at start, so this is not load), power, why clocks were lowered, and driver-reported hardware errors</td></tr>
+</table></div>
+<p>A decode-heavy replica should show high DRAM activity and modest tensor activity; a prefill-heavy one the reverse (chapter 5.1). A GPU at 100% GPU-Util with low SM activity is launching small kernels with gaps: the overhead regime.</p>
+
+<h2 id="prom">3. Prometheus and Grafana</h2>
+<p>Prometheus <strong>scrapes</strong> each replica's <code>/metrics</code> endpoint every few seconds and stores the values as time series, labelled with the model, replica and other attributes. Grafana draws dashboards from Prometheus queries (PromQL). Three metric types matter:</p>
+<ul>
+  <li><strong>Counter:</strong> only goes up (tokens generated, requests finished). You chart its rate: <code>rate(vllm:generation_tokens_total[1m])</code> is output tokens per second.</li>
+  <li><strong>Gauge:</strong> goes up and down (requests waiting, KV usage).</li>
+  <li><strong>Histogram:</strong> counts observations into fixed buckets, each counting values less than or equal to its upper bound <code>le</code>. Latency metrics such as TTFT are histograms.</li>
+</ul>
+<p>Percentiles come from histograms with <code>histogram_quantile</code>, which finds the bucket that holds the requested rank and interpolates linearly inside it:</p>
+<pre>histogram_quantile(0.99,
+  sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{model="llama-8b"}[5m])))</pre>
+<p>Two consequences that catch people out:</p>
+<ul>
+  <li><strong>The estimate is only as good as the buckets.</strong> If p99 falls in a bucket from 1 s to 2.5 s, the answer is a straight-line guess within that range. Choose bucket bounds near your SLO thresholds.</li>
+  <li><strong>Aggregate buckets, never percentiles.</strong> The <code>sum by (le)</code> merges all replicas' bucket counts first. Averaging per-replica p99s is wrong, because a slow replica serving a small share of traffic affects the fleet p99 differently from how it affects the average.</li>
+</ul>
+<div class="widget" id="hqW">
+  <div class="wt">Interactive: what histogram_quantile sees</div>
+  <div class="ws">10,000 simulated TTFTs: most requests fast, a share slow. Bars are the histogram buckets Prometheus stores. Compare the true percentiles with what histogram_quantile estimates from the buckets.</div>
+  <div class="ctrls">
+    <label>Buckets <select id="hqB"><option value="d">Prometheus client default</option><option value="f">Every 0.05 s up to 3 s</option><option value="s">Bounds at 0.25, 0.5, 1, 2 s</option></select></label>
+    <label>Share of slow requests <input type="range" id="hqS" min="0" max="30" step="1" value="10"> <span id="hqSv"></span>%</label>
+  </div>
+  <div class="svgwrap"><svg id="hqSvg" viewBox="0 0 680 220" width="680" style="max-width:100%;height:auto" role="img" aria-label="Latency histogram with bucket bounds"></svg></div>
+  <div class="stats" id="hqStats"></div>
+</div>
+<div class="box ex">
+  <span class="lbl">Worked example: a useful alert set</span>
+  <p>For a chat service with an SLO of 99% of requests under 1 s TTFT:</p>
+  <ul>
+    <li><strong>Page</strong> (wake someone) when the error budget is burning fast: for example, more than 2% of requests over 1 s for 5 minutes and over 1 hour (two windows, so a short blip does not page but a real problem does quickly).</li>
+    <li><strong>Page</strong> when 5xx responses exceed a small share of traffic.</li>
+    <li><strong>Ticket</strong> (look during work hours) when leading indicators drift: requests waiting rising over 15 minutes, KV usage near 100% with preemptions, prefix hit rate dropping after a deploy.</li>
+    <li><strong>Do not page</strong> on GPU-Util, memory used or CPU: they are causes to inspect, not symptoms users feel.</li>
+  </ul>
+</div>
+<p>Keep label cardinality low: a label per customer or per prompt creates a new time series for each value and can overwhelm Prometheus. Per-customer accounting belongs in logs or a billing pipeline.</p>
+
+<h2 id="traces">4. Traces and logs</h2>
+<p>A trace shows where one request's time went. Everything before the first token adds to TTFT, and each part has a different fix: gateway and network (client side, section 7), queue (capacity, chapter 6.3), prefill (prompt length, prefix caching, chapter 4.4).</p>
+<div class="svgwrap"><svg id="trSvg" viewBox="0 0 680 230" width="680" style="max-width:100%;height:auto" role="img" aria-label="Spans of one request up to and after the first token"></svg></div>
+<p class="cap">One request's trace (illustrative timings). The first token reaches the client at about 390 ms; decoding 300 tokens then takes about 9 s more.</p>
+<p>Traces follow the OpenTelemetry standard: each service creates spans and passes a trace ID to the next, and a collector sends them to a backend such as Jaeger, Tempo or a commercial tool. vLLM can export OpenTelemetry traces (<code>--otlp-traces-endpoint</code>, with <code>--collect-detailed-traces</code> for model and worker timing). OpenTelemetry's generative AI semantic conventions name standard metrics and attributes, such as <code>gen_ai.server.time_to_first_token</code>, <code>gen_ai.server.time_per_output_token</code> and <code>gen_ai.request.model</code>, so tools can understand them; the conventions are still marked as in development. Sample traces (for example 1% of requests plus all errors and slow requests) to control cost.</p>
+<p><strong>Logs:</strong> structured (JSON) request logs with IDs, lengths, timings, status and the serving version; and audit logs of every change to deployments and configuration. Prompts and outputs often contain personal or confidential data, so do not log them by default; when you need them for debugging, use access controls, retention limits and the customer's consent (chapter 6.9).</p>
+
+<h2 id="nondet">5. Nondeterminism and batch invariance</h2>
+<p>Ask a server the same question at temperature 0 a thousand times and you may get several different answers. Thinking Machines did exactly this with Qwen3-235B-A22B on vLLM: 1,000 completions of 1,000 tokens for "Tell me about Richard Feynman" gave 80 unique completions. All agreed for the first 102 tokens; at token 103, 992 said "Queens, New York" and 8 said "New York City".</p>
+<p>The usual explanation, "GPUs run threads in a random order", is mostly wrong. The forward pass of an LLM uses no atomic adds and the same kernel on the same input gives the same bits every time. The real cause has two parts:</p>
+<ol>
+  <li><strong>Floating-point addition is not associative.</strong> (0.1 + 10²⁰) − 10²⁰ is 0, but 0.1 + (10²⁰ − 10²⁰) is 0.1. Summing the same numbers in a different order gives slightly different results.</li>
+  <li><strong>Kernels are not batch-invariant.</strong> To keep the GPU busy, matmul, attention and normalization kernels pick different strategies for different batch sizes (split-K matmuls, different tile sizes, split-KV attention), which changes the order of each sum. The batch size depends on how much other traffic is on the server, which the user cannot control. So the result for <em>your</em> request depends on <em>other</em> requests.</li>
+</ol>
+<p>Usually the tiny difference changes nothing. But when two tokens are nearly tied, it flips the choice, and every later token follows a different path. Chunked prefill, prefix caching and speculative decoding (chapter 4.3) change kernel shapes in the same way.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Run-to-run deterministic:</strong> the same kernel on the same inputs gives bitwise identical outputs every time. True for most inference kernels.</p>
+  <p><strong>Batch-invariant:</strong> a request's result does not depend on the batch size or on the other requests in the batch. Not true for standard kernels.</p>
+</div>
+<p><strong>The fix</strong> is batch-invariant kernels: every reduction uses a fixed order regardless of batch size. For matmul, use one kernel configuration for all shapes; for attention, split the KV sequence into fixed-size chunks rather than a fixed number of chunks, and treat cached and new KV the same way. With these kernels, all 1,000 completions were identical. The cost, in Thinking Machines' unoptimized version on Qwen3-8B: 1,000 requests took 26 s with default vLLM, 55 s with deterministic kernels and 42 s with an improved attention kernel. vLLM now has a beta batch-invariant mode (<code>VLLM_BATCH_INVARIANT=1</code>) for supported GPUs and models.</p>
+<p>Do you need it? For most chat traffic, no: users sample at temperature above 0 anyway. It matters for debugging and regression tests (a diff then means a real change), for evaluations you want to repeat exactly, and for reinforcement learning, where differences between the sampler and the trainer quietly turn on-policy training into off-policy training.</p>
+
+<h2 id="correct">6. Silent failures and correctness testing</h2>
+<p>Infrastructure changes can lower output quality while every latency and error metric stays green. Two public examples:</p>
+<ul>
+  <li><strong>Anthropic, August to September 2025:</strong> three overlapping infrastructure bugs. A routing error sent some Sonnet 4 requests to servers configured for a 1M-token context (peaking at 16% of Sonnet 4 requests in one hour, and "sticky" routing kept affected users on the wrong servers). A TPU misconfiguration occasionally gave high probability to wrong tokens, such as Thai characters in English answers. A compiler bug in an approximate top-k operation sometimes dropped the most likely token, depending on batch size. Standard evaluations did not catch these, partly because the model often recovers from single mistakes. Their changes: more sensitive evaluations, evaluations run continuously on production systems, detection tests for unexpected characters, and switching to exact top-k at a small efficiency cost.</li>
+  <li><strong>Moonshot's K2 Vendor Verifier:</strong> the same open-weight model (Kimi K2) served by different providers showed tool-call schema accuracy from 100% down to about 83% (results of 15 November 2025). Chat templates, tool-call parsers, quantization and sampling settings all differ between providers.</li>
+</ul>
+<p>A correctness testing plan:</p>
+<ol>
+  <li><strong>Golden tests:</strong> a fixed set of prompts with reference outputs and log probabilities from a trusted setup (for example the original weights in BF16 with Hugging Face Transformers). On each change, compare log probabilities of the reference tokens (a small, stable difference is fine; a jump means a bug) and check greedy outputs on short prompts.</li>
+  <li><strong>Task evaluations</strong> for the skills you rely on (chapter 4.1): accuracy, structured output validity, tool-call accuracy, long-context retrieval.</li>
+  <li><strong>Configuration checks:</strong> chat template, special tokens, tokenizer version, context length, RoPE scaling, sampling defaults. Many silent bugs live here, not in kernels.</li>
+  <li><strong>Production checks:</strong> run a small evaluation continuously against live endpoints; track per-version rates of invalid JSON, failed tool calls, output length, unusual characters and user feedback; compare canary and baseline (chapter 6.5).</li>
+</ol>
+
+<h2 id="client">7. The client side</h2>
+<p>What the user feels includes the network and the client. Setting up a new TLS session costs a few dozen milliseconds, which can be over 10% of a 300 ms latency budget; reuse connections (the OpenAI SDK and most HTTP clients do this when you reuse one client object). Measure TTFT at the client as well as at the server: the difference is network, gateway and client time. Use streaming (server-sent events for text; WebSockets or gRPC for real-time audio, chapter 6.2) so users see tokens as they come, and asynchronous jobs with webhooks for work that can take minutes or hours.</p>
+
+<h2 id="expert">8. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Why batch invariance is cheap for matmul but hard for attention</span>
+  <p>Split-K matmuls are needed when both the batch and the output dimension are small; in LLMs the model dimension is large, so one fixed configuration loses only about 20% against cuBLAS in Thinking Machines' test. Decode attention, however, has almost no parallelism besides the KV length, so it needs a split-KV kernel (Flash-Decoding, chapter 4.2). Fixing the number of splits breaks invariance; fixing the split size keeps it but gives uneven parallelism.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Comparing log probabilities across implementations</span>
+  <p>BF16 implementations of the same model typically differ by small amounts in token log probabilities. A useful test measures the distribution of these differences over many prompts and positions on known-good builds, then alerts when a new build's distribution shifts. A KL divergence between the next-token distributions of reference and candidate gives one number per position and catches broken sampling or attention far earlier than task accuracy does.</p>
+</div>
+
+<h2 id="mistakes">9. Common mistakes</h2>
+<ul>
+  <li>Averaging percentiles across replicas or time windows.</li>
+  <li>Latency histograms with buckets nowhere near the SLO threshold.</li>
+  <li>Alerting on GPU-Util or memory used.</li>
+  <li>High-cardinality labels (user IDs, prompts) in Prometheus.</li>
+  <li>Logging full prompts and outputs by default.</li>
+  <li>Treating any output difference at temperature 0 as a bug, or treating all differences as noise.</li>
+  <li>Testing only latency and errors after a deploy, never output quality.</li>
+</ul>
+
+<h2 id="lab">10. Lab</h2>
+<p><strong>Goal:</strong> see batch non-invariance in a real model, measure the error of histogram percentiles, and design a correctness test.</p>
+<h3>Part A: floating point and batch invariance in one matmul</h3>
+<pre>import torch
+print((0.1 + 1e20) - 1e20, 0.1 + (1e20 - 1e20))
+B, D = 2048, 4096
+a = torch.linspace(-1000, 1000, B*D).reshape(B, D)
+b = torch.linspace(-1000, 1000, D*D).reshape(D, D)
+out1 = torch.mm(a[:1], b)          # row 0 alone
+out2 = torch.mm(a, b)[:1]          # row 0 inside a batch of 2048
+print((out1 - out2).abs().max())</pre>
+<details><summary>What we measured (CPU, PyTorch 2.15)</summary><pre class="out">0.0 0.1
+3726.75</pre>
+<p>The same row computed alone and inside a batch differs by 3,726 in values around 10¹². The relative difference is tiny, but not zero. In BF16, row 0 matched only at batch size 1 and differed by 4,096 (one BF16 step at that size) at batch sizes 3 to 2,048. On a GPU the numbers differ but the effect is the same.</p></details>
+<h3>Part B: greedy decoding alone and in a batch</h3>
+<p>Generate 120 tokens greedily for one prompt alone and inside batches of 4 and 8 different prompts, and find the first token where the outputs differ.</p>
+<pre>import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(name); tok.padding_side = "left"
+chat = lambda p: tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True)
+target = "Tell me about Richard Feynman."
+others = ["Write a haiku about rain.", "Explain TCP in two sentences.", "List three prime numbers.",
+          "What is the capital of Peru?", "Describe a GPU to a child.", "Give me a pasta recipe.", "Why is the sky blue?"]
+for dtype in [torch.float32, torch.bfloat16]:
+    model = AutoModelForCausalLM.from_pretrained(name, dtype=dtype).eval()
+    outs = {}
+    for bs in [1, 4, 8]:
+        enc = tok([chat(target)] + [chat(o) for o in others[:bs - 1]], return_tensors="pt", padding=True)
+        with torch.no_grad():
+            g = model.generate(**enc, max_new_tokens=120, do_sample=False, pad_token_id=tok.eos_token_id)
+        outs[bs] = g[0, enc.input_ids.shape[1]:].tolist()
+    for bs in [4, 8]:
+        diff = next((i for i, (x, y) in enumerate(zip(outs[1], outs[bs])) if x != y), None)
+        print(dtype, "batch", bs, "first different token:", diff)</pre>
+<details><summary>What we measured (CPU, about 2 minutes)</summary><pre class="out">torch.float32   batch 4: first different token None, max |logprob diff| before it 9.18e-06
+torch.float32   batch 8: first different token None, max |logprob diff| before it 7.21e-06
+torch.bfloat16  batch 4: first different token 86, max |logprob diff| before it 1.07e-01
+torch.bfloat16  batch 8: first different token 27, max |logprob diff| before it 6.50e-02
+  alone : ' 20th century. He is widely regarded as one of the'
+  batch8: ' 20th century. He is best known for his work on'</pre>
+<p>(Our version of the script also printed the largest log probability difference before the split.) In FP32 the differences stayed around 10⁻⁵ and the text never changed. In BF16 they reached about 0.1, and the text split at token 27 in a batch of 8 and token 86 in a batch of 4. Both answers are fine; they are just different. On a GPU, expect the same pattern, with the split points depending on the GPU and kernels.</p></details>
+<h3>Part C: histogram percentiles and averaged percentiles</h3>
+<pre>import numpy as np
+from prometheus_client import Histogram, CollectorRegistry
+rng = np.random.default_rng(0)
+ttft = np.concatenate([rng.lognormal(np.log(0.18), 0.35, 9000), rng.lognormal(np.log(0.9), 0.5, 1000)])
+
+def buckets_of(samples, bounds):
+    reg = CollectorRegistry()
+    h = Histogram("ttft_seconds", "TTFT", buckets=bounds, registry=reg)
+    for s in samples: h.observe(s)
+    return [(float(m.labels["le"]), m.value) for m in next(iter(reg.collect())).samples if m.name.endswith("_bucket")]
+
+def histogram_quantile(q, b):           # PromQL's rule: find the bucket, interpolate linearly
+    rank, prev_le, prev_c = q * b[-1][1], 0.0, 0.0
+    for le, c in b:
+        if c >= rank:
+            return prev_le if le == float("inf") else prev_le + (le - prev_le) * (rank - prev_c) / (c - prev_c)
+        prev_le, prev_c = le, c
+
+default = [.005, .01, .025, .05, .075, .1, .25, .5, .75, 1, 2.5, 5, 7.5, 10]
+fine = [round(x, 3) for x in np.arange(0.05, 3.0, 0.05)]
+for name, bounds in [("default", default), ("0.05 s", fine)]:
+    b = buckets_of(ttft, bounds)
+    print(name, [round(histogram_quantile(q, b), 3) for q in (0.5, 0.95, 0.99)])
+print("true", [round(np.quantile(ttft, q), 3) for q in (0.5, 0.95, 0.99)])
+
+r1 = rng.lognormal(np.log(0.2), 0.3, 9000); r2 = rng.lognormal(np.log(1.5), 0.4, 1000)
+print(np.quantile(r1, .99), np.quantile(r2, .99), (np.quantile(r1, .99) + np.quantile(r2, .99)) / 2,
+      np.quantile(np.concatenate([r1, r2]), .99))</pre>
+<details><summary>What we measured</summary><pre class="out">default buckets p50 0.199 p95 0.923 p99 2.199
+0.05 s buckets p50 0.191 p95 0.924 p99 1.604
+true            p50 0.189 p95 0.921 p99 1.603
+p99 replica 1 0.40, replica 2 3.81, average of the two 2.10, true fleet p99 2.39</pre>
+<p>With the default buckets, p99 falls in the 1 to 2.5 s bucket and the estimate is 2.20 s against a true 1.60 s: 37% too high, enough to trigger a false alarm on a 2 s SLO. Finer buckets get it right. Averaging the two replicas' p99s gives 2.10 s; the real fleet p99 is 2.39 s.</p></details>
+<h3>Part D: a dashboard on a real server (GPU)</h3>
+<p>Start vLLM with any small model, run Prometheus (scraping <code>localhost:8000/metrics</code>) and Grafana in Docker, and build panels for: request rate, p50 and p99 TTFT and inter-token latency (with <code>histogram_quantile</code>), requests running and waiting, KV usage, prefix cache hit rate (<code>rate(vllm:prefix_cache_hits_total[5m]) / rate(vllm:prefix_cache_queries_total[5m])</code>) and output tokens per second. Drive it with the load generator from chapter 6.1 and watch requests waiting and TTFT rise together as you pass saturation. Expect TTFT to stay flat until the KV cache or batch limit fills, then climb steeply.</p>
+<h3>Part E: write a golden test</h3>
+<p>Using Part B's model, store reference log probabilities for 20 prompts × 50 greedy tokens in FP32. Write a test that runs a candidate (BF16, or a quantized checkpoint from chapter 4.1) with the reference tokens forced (teacher forcing: feed the reference tokens and read the candidate's log probability for each), and reports the mean and maximum difference. Set thresholds from what BF16 gives, then check that an INT4 checkpoint and a deliberately broken one (wrong chat template) are flagged.</p>
+
+<h2 id="realworld">11. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Observability and correctness in practice</span>
+  <ul>
+    <li><strong>Engines</strong> (vLLM, SGLang, TensorRT-LLM through Dynamo) expose Prometheus metrics; vLLM also exports OpenTelemetry traces.</li>
+    <li><strong>Platforms</strong> combine engine metrics with DCGM GPU metrics and gateway logs in Grafana or commercial tools, with SLO-based alerts.</li>
+    <li><strong>Model providers</strong> run continuous evaluations against production endpoints and track per-deployment quality signals.</li>
+    <li><strong>Reinforcement learning stacks</strong> use batch-invariant inference to match sampler and trainer numerics.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">12. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz66"></div>
+<script type="application/json" id="qz66">[
+{"q":"Which signal shows where one request's time went?","o":["A counter","A gauge","A trace","An audit log"],"a":2,"e":"A trace is a tree of timed spans for one request."},
+{"q":"How do you get a fleet p99 from per-replica histograms?","o":["Average the p99s","Take the maximum p99","Sum the bucket counts, then compute the quantile","Take the median p99"],"a":2,"e":"Merge the histograms, then compute the percentile."},
+{"q":"DCGM_FI_DEV_GPU_UTIL measures:","o":["Tensor core use","Share of time a kernel was running","HBM bandwidth","Power"],"a":1,"e":"It is the same time-based measure as nvidia-smi."},
+{"q":"The main cause of different outputs at temperature 0 on a busy server is:","o":["Random thread order with atomic adds","Kernels that are not batch-invariant, so results depend on batch size","Bad GPUs","The tokenizer"],"a":1,"e":"Batch size changes kernel strategies and the order of sums."},
+{"q":"What did batch-invariant kernels cost in Thinking Machines' unoptimized test?","o":["Nothing","About 26 s rising to 42 to 55 s for the same work","Ten times slower","They were faster"],"a":1,"e":"26 s by default, 55 s deterministic, 42 s with an improved attention kernel."},
+{"q":"Why did standard evaluations miss Anthropic's 2025 infrastructure bugs?","o":["There were no evaluations","The model often recovered from single mistakes and the bugs hit a fraction of requests","Latency alerts fired instead","The bugs only affected logs"],"a":1,"e":"They added more sensitive evaluations and continuous evaluations on production systems."}
+]</script>
+
+<h2 id="summary">13. Summary</h2>
+<ul>
+  <li>Use metrics, logs and traces together, integrated with the application's tools.</li>
+  <li>Measure requests, engine, GPU, fleet and business layers; use DCGM profiling counters, not GPU-Util.</li>
+  <li>Histogram percentiles depend on bucket bounds; aggregate buckets, never percentiles; keep label cardinality low.</li>
+  <li>Alert on SLO burn and user-facing symptoms; ticket on leading indicators.</li>
+  <li>Outputs vary at temperature 0 because kernels are not batch-invariant; batch-invariant kernels fix it at a cost.</li>
+  <li>Test correctness continuously: golden log probabilities, task evaluations, configuration checks and production quality signals.</li>
+</ul>
+
+<h2 id="refs">14. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 7.4.3 and 7.5</td><td>What to monitor for inference, integration with existing tooling, client latency, async inference and streaming protocols.</td></tr>
+<tr><td><a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">Horace He and Thinking Machines Lab, Defeating Nondeterminism in LLM Inference</a></td><td>Why inference is nondeterministic, batch-invariant RMSNorm, matmul and attention, the 1,000-completion experiment and the performance cost.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/features/batch_invariance.html">vLLM: Batch invariance</a></td><td>How to enable batch-invariant mode and which hardware and models are supported.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/design/metrics.html">vLLM: Metrics design</a></td><td>The engine's Prometheus metrics and OpenTelemetry tracing options.</td></tr>
+<tr><td><a href="https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html">NVIDIA DCGM user guide: feature overview</a></td><td>Definitions of SM activity, occupancy, tensor and DRAM activity.</td></tr>
+<tr><td>Chris Fregly, <em>AI Systems Performance Engineering</em>, monitoring sections</td><td>DCGM metrics in Prometheus, NVLink counters, power and thermal throttling.</td></tr>
+<tr><td><a href="https://prometheus.io/docs/practices/histograms/">Prometheus: Histograms and summaries</a></td><td>How histogram_quantile works and how to choose buckets.</td></tr>
+<tr><td><a href="https://sre.google/workbook/alerting-on-slos/">Google SRE workbook: Alerting on SLOs</a></td><td>Error budgets and multi-window burn-rate alerts.</td></tr>
+<tr><td><a href="https://github.com/open-telemetry/semantic-conventions-genai">OpenTelemetry generative AI semantic conventions</a></td><td>Standard names for GenAI spans, metrics and attributes.</td></tr>
+<tr><td><a href="https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues">Anthropic, A postmortem of three recent issues</a></td><td>Three infrastructure bugs that degraded quality silently, and why detection was hard.</td></tr>
+<tr><td><a href="https://github.com/MoonshotAI/K2-Vendor-Verifier">Moonshot AI, K2 Vendor Verifier</a></td><td>Measured differences in tool-call accuracy between providers of the same model.</td></tr>
+<tr><td>Chip Huyen, <em>Designing Machine Learning Systems</em>, chapter 8</td><td>Monitoring and observability for ML systems, including data distribution shifts.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li><em>AI Systems Performance Engineering</em> describes <code>DCGM_FI_DEV_GPU_UTIL</code> as "SM utilization %". NVIDIA's DCGM documentation and nvidia-smi define it as the share of time a kernel was running; SM-level activity is <code>DCGM_FI_PROF_SM_ACTIVE</code>.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Labs A to C run on CPU with PyTorch 2.15, Transformers 5.22 and prometheus_client; Part D is an exercise with expected behaviour, not a measurement.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$,el,css}=IE;
+/* trace waterfall */
+function tr(){const s=$('trSvg');s.innerHTML='';const x0=205,x1=520,T=430,X=t=>x0+t/T*(x1-x0);
+  const sp=[['Network and TLS to gateway',0,35,'--mute'],['Gateway: auth, rate limit',35,41,'--mute'],['Router picks replica',41,44,'--mute'],['Queue: wait for a slot',44,164,'--bad'],['Tokenize',164,168,'--mute'],['Prefill 2,000 tokens',168,348,'--pre'],['First token to client',348,390,'--mute'],['Decode 300 tokens',390,430,'--dec']];
+  for(let t=0;t<=400;t+=100){el('line',{x1:X(t),x2:X(t),y1:16,y2:200,stroke:css('--line')},s);el('text',{x:X(t),y:214,'text-anchor':'middle','font-size':10,fill:css('--ink2')},s,t+' ms');}
+  sp.forEach((p,i)=>{const y=20+i*23;el('text',{x:x0-6,y:y+11,'text-anchor':'end','font-size':10.5,fill:css('--ink')},s,p[0]);
+    el('rect',{x:X(p[1]),y:y,width:Math.max(2,X(p[2])-X(p[1])),height:14,rx:2,fill:css(p[3])},s);
+    if(i===7){el('text',{x:X(p[2])+4,y:y+11,'font-size':10,fill:css('--ink2')},s,'then about 9 s more');}
+    else if(p[2]-p[1]>=20)el('text',{x:X(p[2])+4,y:y+11,'font-size':10,fill:css('--ink2')},s,(p[2]-p[1])+' ms');});
+  el('line',{x1:X(390),x2:X(390),y1:14,y2:200,stroke:css('--good'),'stroke-width':2,'stroke-dasharray':'4 3'},s);
+  el('text',{x:X(390)-4,y:12,'text-anchor':'end','font-size':10,fill:css('--good')},s,'TTFT seen by the client');}
+IE.onTheme(tr);
+/* histogram quantile */
+let seed=7;const rnd=()=>{seed=(seed*1103515245+12345)%2147483648;return seed/2147483648;};
+const gauss=()=>{let u=0,v=0;while(!u)u=rnd();v=rnd();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);};
+const BASE=[];for(let i=0;i<10000;i++)BASE.push([gauss(),rnd()]);
+const BK={d:[.005,.01,.025,.05,.075,.1,.25,.5,.75,1,2.5,5,7.5,10],f:Array.from({length:59},(_,i)=>+(0.05*(i+1)).toFixed(2)),s:[.25,.5,1,2]};
+function q(arr,p){const a=arr.slice().sort((x,y)=>x-y);return a[Math.min(a.length-1,Math.floor(p*a.length))];}
+function hq(p,bounds,cum,n){const r=p*n;let pl=0,pc=0;for(let i=0;i<bounds.length;i++){if(cum[i]>=r)return pl+(bounds[i]-pl)*(r-pc)/((cum[i]-pc)||1);pl=bounds[i];pc=cum[i];}return pl;}
+function hqd(){const sh=+$('hqS').value/100;$('hqSv').textContent=Math.round(sh*100);
+  const xs=BASE.map(([g,u])=>u<sh?Math.exp(Math.log(0.9)+0.5*g):Math.exp(Math.log(0.18)+0.35*g));
+  const bounds=BK[$('hqB').value];const cum=bounds.map(b=>xs.filter(x=>x<=b).length);const n=xs.length;
+  const s=$('hqSvg');s.innerHTML='';const x0=40,x1=660,y0=185,y1=12,XM=3,X=v=>x0+Math.min(v,XM)/XM*(x1-x0);
+  const bins=60,cnt=new Array(bins).fill(0);xs.forEach(x=>{if(x<XM)cnt[Math.floor(x/XM*bins)]++;});const mx=Math.max(...cnt);
+  cnt.forEach((c,i)=>el('rect',{x:X(i*XM/bins)+0.5,y:y0-c/mx*(y0-y1),width:(x1-x0)/bins-1,height:c/mx*(y0-y1),fill:css('--pre-s')},s));
+  bounds.filter(b=>b<=XM).forEach(b=>el('line',{x1:X(b),x2:X(b),y1:y1,y2:y0,stroke:css('--ink2'),'stroke-width':1,'stroke-dasharray':'3 3'},s));
+  for(let t=0;t<=3;t+=0.5){el('text',{x:X(t),y:y0+16,'text-anchor':'middle','font-size':10,fill:css('--ink2')},s,t+' s');}
+  el('line',{x1:x0,x2:x1,y1:y0,y2:y0,stroke:css('--ink2')},s);
+  const tp=[.5,.95,.99].map(p=>q(xs,p)),ep=[.5,.95,.99].map(p=>hq(p,bounds,cum,n));
+  tp.forEach((v,i)=>{el('line',{x1:X(v),x2:X(v),y1:y1,y2:y0,stroke:css('--good'),'stroke-width':2},s);});
+  ep.forEach((v,i)=>{el('line',{x1:X(v),x2:X(v),y1:y1+20,y2:y0,stroke:css('--bad'),'stroke-width':2},s);});
+  el('text',{x:x1,y:y1+4,'text-anchor':'end','font-size':10,fill:css('--good')},s,'green: true p50, p95, p99');
+  el('text',{x:x1,y:y1+18,'text-anchor':'end','font-size':10,fill:css('--bad')},s,'red: histogram_quantile estimates');
+  $('hqStats').innerHTML=['p50','p95','p99'].map((k,i)=>`<div class="stat"><div class="k">${k} true / estimated</div><div class="v">${tp[i].toFixed(2)} / ${ep[i].toFixed(2)} s</div></div>`).join('');}
+['hqB','hqS'].forEach(id=>$(id).addEventListener('input',hqd));IE.onTheme(hqd);
+})();
+</script>
