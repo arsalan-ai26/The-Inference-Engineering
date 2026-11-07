@@ -59,7 +59,7 @@
 </ul>
 
 <h2 id="rlvr">3. RL with verifiable rewards and GRPO</h2>
-<p>When correctness can be checked, by a maths answer checker, unit tests or a compiler, the reward needs no human labels: <strong>RLVR</strong>. DeepSeek-R1 popularized it with <strong>GRPO</strong> (Group Relative Policy Optimization), which drops PPO's value model:</p>
+<p>When correctness can be checked, by a maths answer checker, unit tests or a compiler, the reward needs no human labels: <strong>RLVR</strong>. DeepSeek-R1 (arXiv 2501.12948) popularized it with <strong>GRPO</strong> (Group Relative Policy Optimization), which DeepSeek had introduced a year earlier in DeepSeekMath (arXiv 2402.03300) as a variant of PPO that saves memory by dropping PPO's value model:</p>
 <ol>
   <li>For each prompt, sample a group of G answers (for example 8).</li>
   <li>Score each answer.</li>
@@ -200,6 +200,9 @@ all wrong    rewards [0, 0, 0, 0, 0, 0, 0, 0] advantages [0.0, 0.0, 0.0, 0.0, 0.
 <h2 id="refs">11. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2402.03300">Shao et al., DeepSeekMath</a></td><td>Where GRPO was introduced, as a memory-saving variant of PPO.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2501.12948">DeepSeek-AI, DeepSeek-R1</a></td><td>GRPO with verifiable rewards at scale, and R1-Zero trained by RL from a base model.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2506.13585">MiniMax-M1</a></td><td>CISPO (clipping importance-sampling weights instead of token updates) and full RL training on 512 H800s in three weeks.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2305.18290">Rafailov et al., Direct Preference Optimization</a></td><td>The closed-form reparameterization and the DPO loss.</td></tr>
 <tr><td><a href="https://huggingface.co/docs/trl/grpo_trainer">Hugging Face TRL: GRPO Trainer</a></td><td>The GRPO objective, normalization variants, KL default, vLLM colocate and server modes, train-inference mismatch metrics.</td></tr>
 <tr><td><a href="https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook">Hugging Face, The Smol Training Playbook</a></td><td>DPO and APO results and settings, RLHF vs RLVR, reward hacking and the overlong penalty, asynchronous RL speedups.</td></tr>

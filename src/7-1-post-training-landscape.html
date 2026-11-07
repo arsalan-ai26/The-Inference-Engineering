@@ -44,7 +44,7 @@
 </table></div>
 
 <h2 id="sft-first">2. Why pipelines start with SFT</h2>
-<p>Hugging Face's account of post-training SmolLM3 gives three reasons almost every pipeline starts with SFT: it is cheap, it is stable ("it just works"), and a good SFT checkpoint gives most of the gains and makes DPO or RL far more effective afterwards. RL can only reinforce behaviour the model already sometimes produces; a base model that never follows the answer format gets no reward to learn from. The exception is the frontier, where no stronger teacher exists: DeepSeek trained R1-Zero with RL directly from a base model to discover reasoning behaviour that supervision could not provide.</p>
+<p>Hugging Face's account of post-training SmolLM3 gives three reasons almost every pipeline starts with SFT: it is cheap, it is stable ("it just works"), and a good SFT checkpoint gives most of the gains and makes DPO or RL far more effective afterwards. RL can only reinforce behaviour the model already sometimes produces; a base model that never follows the answer format gets no reward to learn from. The exception is the frontier, where no stronger teacher exists: DeepSeek trained R1-Zero with RL directly from a base model to discover reasoning behaviour that supervision could not provide. The DeepSeek-R1 paper (arXiv 2501.12948) reports that pure RL with verifiable rewards produced self-reflection, verification and strategy changes without human-written reasoning traces, and that these reasoning patterns could then be distilled into smaller models (chapter 7.5). For inference, it is also the paper that created today's long-output reasoning workload (chapter 8.1).</p>
 <p>Two useful observations from the same work: preference optimization (they used APO, a DPO variant) raised instruction following on IFEval by 15 to 20 percentage points over their SFT checkpoint; and RL with verifiable maths rewards, applied naively, made the model's "no thinking" mode write long chains of thought to raise its reward, until a length penalty was added. Every stage optimizes exactly what you measure.</p>
 
 <h2 id="what">3. What post-training changes inside the model</h2>
@@ -156,6 +156,7 @@ examples of shifted tokens: [' conveying', 'Keep', ' but', ' email', ' This', ' 
 <h2 id="refs">12. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2501.12948">DeepSeek-AI, DeepSeek-R1</a></td><td>Reasoning from pure RL (R1-Zero) and distillation of reasoning into smaller models.</td></tr>
 <tr><td><a href="https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook">Hugging Face, The Smol Training Playbook</a> (post-training chapter)</td><td>The post-training compass, why SFT comes first, preference optimization and RLVR results on SmolLM3, and choosing among online DPO, on-policy distillation and RL.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2312.01552">Lin et al., The Unlocking Spell on Base LLMs (URIAL)</a></td><td>Token distribution shift between base and aligned models; alignment by in-context learning.</td></tr>
 <tr><td><a href="https://thinkingmachines.ai/blog/on-policy-distillation/">Thinking Machines, On-Policy Distillation</a></td><td>On-policy vs off-policy and dense vs sparse signals; cost comparison with RL.</td></tr>

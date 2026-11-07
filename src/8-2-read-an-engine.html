@@ -92,7 +92,23 @@ engine_core_outputs = self.scheduler.update_from_output(scheduler_output, model_
 </ul>
 <p>Rules for the change: keep the default path unchanged, add a unit test next to the existing ones in <code>tests/v1/core/</code>, run the relevant existing tests, and benchmark before and after with the chapter 6.1 method.</p>
 
-<h2 id="expert">5. Expert layer</h2>
+<h2 id="deepinfer">5. A second engine to read: DeepInfer</h2>
+<p>DeepSeek's DeepInfer (chapter 4.8) is the engine behind a frontier production service, and it says it "was originally built primarily on vLLM". Reading it next to vLLM shows which parts a production team kept, which it rewrote, and what a single-model engine can drop. Paths below are from commit <code>a679bb8</code> (3 November 2026); lab Part D reproduces the map.</p>
+<div class="tbl"><table>
+<tr><th>Concern</th><th>vLLM (commit a8dacd72)</th><th>DeepInfer (commit a679bb8)</th></tr>
+<tr><td>Entry point</td><td><code>vllm/entrypoints/</code>: HTTP server, <code>LLM</code> class</td><td><code>deepinfer/entrypoints/llm.py</code>: an offline <code>LLM</code> class marked "Derived from vLLM; modified by DeepSeek"; no HTTP server in the release</td></tr>
+<tr><td>Engine loop</td><td><code>v1/engine/core.py</code> <code>EngineCore</code> in its own process</td><td><code>deepinfer/engine/llm_engine.py</code> <code>LLMEngine</code>: <code>step()</code>, <code>_execute_model_async_step()</code>, <code>post_process()</code></td></tr>
+<tr><td>Scheduler and blocks</td><td>Python: <code>v1/core/sched/scheduler.py</code>, <code>kv_cache_manager.py</code>, <code>block_pool.py</code></td><td>C++ behind Python bindings: <code>csrc/engine/scheduler.hpp</code> (<code>Scheduler</code>), <code>block_manager.hpp</code> (<code>BlockManager</code>), with a FLOPs-based cost model in <code>flops_estimator.hpp</code></td></tr>
+<tr><td>CPU/GPU overlap</td><td>Asynchronous scheduling option</td><td>"Zero-overhead scheduling", on by default for decode engines: <code>csrc/engine/zos.cpp</code>, <code>worker/zos_status.py</code></td></tr>
+<tr><td>Prefill and decode roles</td><td>KV connectors and a proxy (chapter 4.6)</td><td>An engine type: <code>NORMAL</code>, <code>PROMPT</code> (prefill only) or <code>COMPLETION</code> (decode only), in <code>engine/engine_type.py</code> and mirrored in the C++ scheduler</td></tr>
+<tr><td>Parallelism</td><td>TP, PP, DP, EP flags; DP coordinator</td><td>Process groups for DP, CP, EP and Engram parallelism in <code>parallel_utils/parallel_state.py</code>; context parallelism in <code>cp.py</code>; expert placement in <code>model_executor/eplb/</code> (<code>policy.py</code>, <code>shuffle.py</code>)</td></tr>
+<tr><td>Speculative decoding</td><td><code>v1/spec_decode/</code>: many drafter types</td><td>One drafter (DSpark, named <code>dflash</code> in the code): <code>models/mtp/dflash.py</code>, TileLang kernels in <code>layers/tilelang_ops/dflash.py</code> and <code>schedule_mtp_varlen.py</code>, scheduling in <code>csrc/engine/mtp_varlen.hpp</code></td></tr>
+<tr><td>Model code</td><td>Hundreds of model files built from shared layers</td><td>One model family: <code>models/deepseek.py</code> and <code>models/v4_modules/</code> (<code>attn.py</code>, <code>compress.py</code>, <code>cross_layer.py</code>, <code>index_attn.py</code>, <code>moe.py</code>, <code>mhc_*.py</code>, <code>engram*.py</code>, <code>yoco.py</code> for bounded replay)</td></tr>
+<tr><td>Kernels</td><td>Many attention backends</td><td>Vendored FlashMLA, DeepGEMM, DeepEP and DeepSelect (with Ascend versions) plus about 25,000 lines of layers and TileLang kernels in <code>model_executor/layers/</code></td></tr>
+</table></div>
+<p>Three lessons. First, <strong>a single-model engine trades generality for depth</strong>: no model registry or backend selector, but kernels and a scheduler tuned for one architecture's heterogeneous cache (paged blocks plus per-sequence state slots, chapter 4.8). Second, <strong>the scheduler moved to C++</strong> and plans by estimated compute, not by token counts: <code>FlopsEstimator</code> counts FP8-equivalent FLOPs per request (including the bounded-replay shortcut), which is how the prefill load balancer can solve for a chunk size that fills a time budget. Third, <strong>roles are types</strong>: a prefill engine refuses to decode, so disaggregation is a deployment of two engine types rather than a feature switched on in one engine. Comments in parts of the code are in Chinese, so a translation tool helps when reading the scheduler.</p>
+
+<h2 id="expert">6. Expert layer</h2>
 <div class="box expert">
   <span class="lbl">Async scheduling and overlapping CPU with GPU</span>
   <p>With asynchronous scheduling (<code>sched/async_scheduler.py</code>), the engine schedules step n + 1 while step n runs on the GPU, hiding scheduler CPU time (chapter 5.1's overhead regime). The cost is complexity: the scheduler must plan with outputs it has not seen yet, which is why draft tokens for speculative decoding are updated in the worker in this mode, as the comment in <code>post_step</code> notes.</p>
@@ -102,7 +118,7 @@ engine_core_outputs = self.scheduler.update_from_output(scheduler_output, model_
   <p><code>vllm/v1/attention/selector.py</code> chooses a backend from the model (MLA, sliding windows, Mamba layers), the hardware, the KV cache dtype and user settings. Each backend supplies a metadata builder that converts the scheduler's batch into the layout its kernel needs (block tables, sequence lengths, split points). Most "why is this slower on my GPU" questions end in this selection and metadata code.</p>
 </div>
 
-<h2 id="mistakes">6. Common mistakes</h2>
+<h2 id="mistakes">7. Common mistakes</h2>
 <ul>
   <li>Reading directories top to bottom instead of following a request.</li>
   <li>Debugging with CUDA graphs and multiprocessing on, where breakpoints do not hit.</li>
@@ -111,7 +127,7 @@ engine_core_outputs = self.scheduler.update_from_output(scheduler_output, model_
   <li>Measuring a change without a before-and-after benchmark on the same workload.</li>
 </ul>
 
-<h2 id="lab">7. Lab</h2>
+<h2 id="lab">8. Lab</h2>
 <h3>Part A: map the codebase yourself (CPU)</h3>
 <pre>git clone --depth 1 https://github.com/vllm-project/vllm.git && cd vllm && git log -1 --format='%h %cd'
 grep -n '^class ' vllm/v1/engine/core.py vllm/v1/core/sched/scheduler.py vllm/v1/core/kv_cache_manager.py \
@@ -146,7 +162,42 @@ executor 3533</pre>
 <h3>Part C: change one component</h3>
 <p>Implement one change from section 4 behind an environment variable, add a unit test, and measure it with the chapter 6.1 harness on a workload that exercises it (memory pressure for the preemption policy, many short prompts for the cache rule). Write a one-page note: what changed, which files, what the benchmark showed, and whether you would propose it upstream.</p>
 
-<h2 id="realworld">8. In the real world</h2>
+<h3>Part D: map DeepInfer (CPU)</h3>
+<p>Clone <code>github.com/deepseek-ai/DeepInfer</code> (the vendored kernel libraries are git submodules and are not needed for reading) and run, from the repository root:</p>
+<pre>git log -1 --format='%h %cd' --date=short
+for d in deepinfer/engine deepinfer/worker deepinfer/model_executor/models deepinfer/model_executor/layers deepinfer/model_executor/eplb deepinfer/model_executor/parallel_utils deepinfer/structure_output deepinfer/ve csrc/engine; do
+  echo "$d $(find $d -type f \( -name '*.py' -o -name '*.hpp' -o -name '*.cpp' \) | xargs cat | wc -l)"; done
+grep -n '^class \|^    def \(step\|_create_scheduler\|_execute_model_async_step\|post_process\)\b' deepinfer/engine/llm_engine.py | head -8
+grep -n '^class \|^struct ' csrc/engine/scheduler.hpp csrc/engine/block_manager.hpp csrc/engine/mtp_varlen.hpp csrc/engine/flops_estimator.hpp | head -12
+ls deepinfer/model_executor/models/mtp deepinfer/model_executor/models/v4_modules | tr '\n' ' '; echo</pre>
+<details><summary>What we found (commit a679bb8)</summary><pre class="out">a679bb8 2026-11-03
+deepinfer/engine 1957
+deepinfer/worker 2805
+deepinfer/model_executor/models 7051
+deepinfer/model_executor/layers 24996
+deepinfer/model_executor/eplb 792
+deepinfer/model_executor/parallel_utils 706
+deepinfer/structure_output 595
+deepinfer/ve 979
+csrc/engine 5216
+67:class DeferredRelease:
+130:class LLMEngine:
+307:    def _create_scheduler(self) -&gt; Scheduler:
+860:    def step(self) -&gt; np.ndarray[np.uint64]:
+961:    def _execute_model_async_step(
+984:    def post_process(self, step_state: WorkerStepState) -&gt; np.ndarray[np.uint64]:
+csrc/engine/scheduler.hpp:45:struct SchedulerOutputs {
+csrc/engine/scheduler.hpp:79:struct Scheduler {
+csrc/engine/block_manager.hpp:27:struct Blocks { // NOTE: gpu blocks 0 是不用的，所以这里 0 代表空
+csrc/engine/block_manager.hpp:119:struct BlockManager : public deepinfer::Lockable {
+csrc/engine/block_manager.hpp:189:struct BlockManagerMutexAcquire {
+csrc/engine/mtp_varlen.hpp:20:class SamplerRuntimeEstimator {
+csrc/engine/mtp_varlen.hpp:48:class ForwardRuntimeEstimator {
+csrc/engine/mtp_varlen.hpp:133:class MTPVarlen {
+csrc/engine/flops_estimator.hpp:28:class FlopsEstimator {
+deepinfer/model_executor/models/mtp: __init__.py dflash.py  deepinfer/model_executor/models/v4_modules: __init__.py attn.py builder.py compress.py containers.py cross_layer.py engram.py engram_metadata.py engram_parameters.py hc.py hc_blocks.py hc_lazy.py heads.py index_attn.py linear.py mhc_modeling.py mhc_ops.py mla_attn.py mlp.py moe.py norm.py rope.py utils.py yoco.py</pre><p>Compare with Part A: the engine and worker together are under 5,000 lines of Python, the C++ engine adds about 5,200, and the model plus its layers and kernels are over 30,000. Write the same one-page map you wrote for vLLM, then answer: where is a request's draft length decided, and where is the decision that a prefill engine never decodes?</p></details>
+
+<h2 id="realworld">9. In the real world</h2>
 <div class="box real">
   <span class="lbl">In practice</span>
   <ul>
@@ -156,7 +207,7 @@ executor 3533</pre>
   </ul>
 </div>
 
-<h2 id="quiz">9. Check yourself</h2>
+<h2 id="quiz">10. Check yourself</h2>
 <div class="widget quiz" data-quiz="qz82"></div>
 <script type="application/json" id="qz82">[
 {"q":"Which process owns the KV cache manager?","o":["API server","Engine core","GPU worker","DP coordinator"],"a":1,"e":"The engine core runs the scheduler and KV cache manager."},
@@ -167,7 +218,7 @@ executor 3533</pre>
 {"q":"For easy breakpoints in vLLM:","o":["Use CUDA graphs","Use enforce_eager and disable V1 multiprocessing","Use tensor parallelism","Use the API server"],"a":1,"e":"Everything then runs in one process without graphs."}
 ]</script>
 
-<h2 id="summary">10. Summary</h2>
+<h2 id="summary">11. Summary</h2>
 <ul>
   <li>vLLM runs API servers, engine cores and GPU workers as separate processes connected by ZMQ and an executor.</li>
   <li>The engine core loop is short: schedule, execute, grammar mask, sample, update; the scheduler assigns tokens so each request catches up.</li>
@@ -175,15 +226,16 @@ executor 3533</pre>
   <li>Read by following a request, debug on a tiny model in one process, pin the commit, change things behind flags and measure.</li>
 </ul>
 
-<h2 id="refs">11. References</h2>
+<h2 id="refs">12. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://github.com/deepseek-ai/DeepInfer/tree/a679bb86ce36e883a98a97733492b686e5b9a08e">DeepInfer source at commit a679bb8</a></td><td>A production engine derived from vLLM, with a C++ scheduler and one model family.</td></tr>
 <tr><td><a href="https://github.com/vllm-project/vllm/tree/a8dacd7238a3a71953cb0c22f13d950a0c6688b6">vLLM source at commit a8dacd72</a></td><td>Every file, class and function named in this chapter.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/design/arch_overview.html">vLLM: Architecture overview</a></td><td>The V1 process architecture and process counts.</td></tr>
 <tr><td><a href="https://www.aleksagordic.com/blog/vllm">Aleksa Gordic, Inside vLLM: Anatomy of a High-Throughput LLM Inference System</a></td><td>A layered walkthrough of the engine core, advanced features, multi-GPU execution and the serving layer.</td></tr>
 <tr><td><a href="https://neutree.ai/blog/nano-vllm-part-1">Neutree, nano-vLLM</a></td><td>The small reference engine from chapter 3.4, useful to compare with the real one.</td></tr>
 </table></div>
-<p class="note">Facts checked on 7 November 2026 against vLLM commit a8dacd72. Part A run on CPU; Parts B and C need a GPU.</p>
+<p class="note">Facts checked on 7 November 2026 against vLLM commit a8dacd72 and DeepInfer commit a679bb8. Parts A and D run on CPU; Parts B and C need a GPU.</p>
 <!--SCRIPT-->
 <script>
 (function(){

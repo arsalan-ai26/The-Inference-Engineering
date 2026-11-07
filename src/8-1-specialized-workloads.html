@@ -72,6 +72,7 @@
   <li><strong>Thinking budgets.</strong> vLLM's <code>thinking_token_budget</code> sampling parameter forces the end-of-thinking marker once the budget is reached, optionally with a transition phrase so the answer follows naturally. Budgets turn an unbounded cost into a bounded one; evaluate quality at each budget.</li>
   <li><strong>Long-tail latency.</strong> Hugging Face measured SmolLM3's thinking mode at a median of about 16,000 tokens on AIME25 with a fat tail, against about 2,000 without thinking: plan capacity for the tail, not the median.</li>
   <li><strong>Speculative decoding</strong> (chapter 4.3) helps the long decode at low concurrency; structured outputs apply only after reasoning if the parser separates them.</li>
+  <li><strong>Architecture changes the bill.</strong> DeepSeek-R1 (arXiv 2501.12948) created this workload. Qwen3 (arXiv 2505.09388) put thinking and non-thinking modes and a thinking budget in one model, so one deployment sees both short and very long outputs. MiniMax-M1 (arXiv 2506.13585) shows why attention design matters here: with mostly linear attention layers, its report states it uses less than half of DeepSeek-R1's FLOPs at a 64K-token generation and about a quarter at 100K (chapter 2.7).</li>
 </ul>
 
 <h2 id="batch">5. Batch and offline inference</h2>
@@ -167,6 +168,7 @@ batch 16:   54.8 output tok/s total,   3.4 tok/s per request,  18.7 s per batch<
 <h2 id="refs">14. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1</a>, <a href="https://arxiv.org/abs/2505.09388">Qwen3 Technical Report</a> and <a href="https://arxiv.org/abs/2506.13585">MiniMax-M1</a></td><td>The reasoning workload, thinking budgets in one model, and the FLOPs of long generations with linear attention.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/features/multimodal_inputs.html">vLLM: Multimodal inputs</a></td><td>Media limits, precomputed embeddings and video token pruning.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/features/reasoning_outputs.html">vLLM: Reasoning outputs</a></td><td>Reasoning parsers, the reasoning field, per-model thinking switches and thinking budgets.</td></tr>
 <tr><td><a href="https://docs.vllm.ai/en/latest/serving/offline_inference.html">vLLM: Offline inference</a></td><td>The LLM class for batch workloads.</td></tr>

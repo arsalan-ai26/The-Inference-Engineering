@@ -59,6 +59,12 @@
 <tr><td>8. Publish</td><td>Can someone else rerun it?</td><td>Configs, scripts, raw data, a short write-up</td></tr>
 </table></div>
 <p>Candidate papers already covered in this book: vLLM and PagedAttention (chapter 3.3), Sarathi-Serve (3.2), SGLang and RadixAttention (3.5), DistServe (4.6) and Flash-Decoding (4.2). Pick one whose mechanism you can isolate at small scale.</p>
+<p>Three newer candidates suit the chapter 8.3 engine:</p>
+<ul>
+  <li><strong>Tree versus linear speculation</strong> (arXiv 2609.24698, on DeepSeek-V4): add a tree-shaped attention mask to the engine's verify step and compare accepted length and throughput against linear drafts at equal budgets. The paper's claim to test: the gain grows with the budget and is largest for less predictable text at small to medium batch, and throughput plateaus past some budget while accepted length keeps rising.</li>
+  <li><strong>Cross-layer index reuse</strong> from LongCat Sparse Attention (Meituan, arXiv 2608.01662): on a small model with a simple top-k attention, compute the selection in one layer and reuse it in the next few, and measure how much quality you lose against the indexing work saved.</li>
+  <li><strong>Keeping only query-critical KV</strong> from Lookahead Sparse Attention (FlashMemory-DeepSeek-V4, arXiv 2606.09079): a cheap retriever chooses which KV chunks stay in memory; measure the KV footprint and needle-test accuracy (chapter 4.7) against keeping everything.</li>
+</ul>
 
 <h2 id="sarathi">3. Worked example: Sarathi-Serve at small scale</h2>
 <h3>The claim</h3>
@@ -176,6 +182,7 @@ for budget, nd in [(4096, 4), (512, 4), (256, 4), (128, 4), (64, 4), (4096, 0), 
 <h2 id="refs">10. References</h2>
 <div class="tbl"><table>
 <tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2609.24698">Tree speculation for DeepSeek-V4</a>, <a href="https://arxiv.org/abs/2608.01662">LongCat Sparse Attention</a> and <a href="https://arxiv.org/abs/2606.09079">FlashMemory-DeepSeek-V4</a></td><td>Three 2026 candidates for a small-scale reproduction.</td></tr>
 <tr><td><a href="http://ccr.sigcomm.org/online/files/p83-keshavA.pdf">S. Keshav, How to Read a Paper</a></td><td>The three-pass method and the five Cs.</td></tr>
 <tr><td><a href="https://arxiv.org/abs/2403.02310">Agrawal et al., Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve</a></td><td>Generation stalls, chunked prefills, stall-free scheduling and the capacity results.</td></tr>
 <tr><td>Chapters 3.2, 3.3, 3.5, 4.2 and 4.6</td><td>The other candidate papers and their mechanisms.</td></tr>
