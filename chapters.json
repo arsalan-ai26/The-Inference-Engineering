@@ -160,6 +160,11 @@
      "4.7",
      "Long-context and tiered KV systems",
      "4-7-long-context"
+    ],
+    [
+     "4.8",
+     "Case study: DeepSeek's inference stack, V3 to DeepInfer",
+     "4-8-deepseek-inference-stack"
     ]
    ]
   },

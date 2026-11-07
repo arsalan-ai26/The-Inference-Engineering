@@ -1,0 +1,380 @@
+<div class="kicker">Part 4 · Model optimization · Chapter 4.8</div>
+<h1>Case study: DeepSeek's inference stack, from V3 to DeepInfer</h1>
+<p class="lede">DeepSeek publishes its model architectures, its kernels, its cluster designs, its serving layout and its production numbers, and in October 2026 it open-sourced DeepInfer, the engine behind its own API. Reading these releases in order is the quickest way to see how the techniques of Parts 2 to 6 fit together in one system. This chapter follows the stack from DeepSeek-V3 (December 2024) through the February 2025 kernel releases, DeepSeek Sparse Attention in V3.2, the one-million-token V4, and V4.1-Flash, whose global KV cache is 890 bytes per token. It ends with DeepInfer itself: what it contains, how each feature maps to an earlier chapter, and what is still missing for a complete service.</p>
+<div class="meta">
+  <span class="chip">Level: expert</span>
+  <span class="chip">Time: 4 hours with the lab</span>
+  <span class="chip">Needs: 2.4, 2.6, 4.2, 4.3, 4.5, 4.6, 6.7</span>
+  <span class="chip">Compute: CPU for Parts A and B; SM100 or Ascend 950 for Part C</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>DeepSeek-V4.1-Flash activates 16B parameters per token in decode. Why only 8B in prefill?</li>
+    <li>Why does DeepInfer run prefill with the smallest expert parallel group that fits, and decode with the largest?</li>
+    <li>DeepSeek's V4.1 service keeps the global KV cache on SSD for at least 72 hours but keeps sliding window KV only for minutes, in host memory. Why treat the two differently?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Its causal encoder-decoder design projects the decoder layers' global KV from the last encoder layer's output, so prefill runs only the 20 encoder layers over the prompt (plus a short replay of the last tokens through the decoder).</li>
+    <li>Prefill already has a large batch per expert, so a small group balances load better and moves less data over NVLink. Decode has a small batch per expert, so a wide group (64 to 128 GPUs) gives each expert more tokens and each GPU fewer weights to read.</li>
+    <li>Global KV is reused over hours and days (long-tail reuse); sliding window KV is reused only inside an active session and is dead once the next turn starts. A cheap approximate rebuild (SWA bounded replay) covers the misses.</li>
+  </ol></details>
+</div>
+
+<h2 id="why">1. Why one lab's stack is worth a chapter</h2>
+<p>Most frontier labs publish a model card and benchmark scores. DeepSeek also publishes the parts an inference engineer needs: per-token KV sizes, the hardware constraints behind each architectural choice, the kernels (FlashMLA, DeepEP, DeepGEMM, DeepSelect, TileKernels), the file system behind its KV cache (3FS), the deployment layout of its service with a day of production statistics (chapter 6.7), and now the engine (DeepInfer). Each release answers a question the previous one created, so reading them in order shows a design being pushed against its bottleneck, then the next bottleneck, for two years.</p>
+<p>The thread to follow is the KV cache. Every generation shrinks it along a different dimension, and every shrink changes where the cost of serving goes: from HBM capacity, to prefill compute, to SSD capacity and I/O.</p>
+<div class="box def">
+  <span class="lbl">Definitions used throughout</span>
+  <p><strong>Global KV:</strong> the KV cache of attention that spans the whole context (in DeepSeek-V4 and later, the compressed main KV plus the lightning indexer's keys). Its size grows with the sequence length and it lives in HBM while a request runs.</p>
+  <p><strong>Persistent KV:</strong> the part of the KV cache stored after a request ends (on SSD or in host memory) so later requests with the same prefix can skip prefill (chapter 4.4).</p>
+  <p><strong>Scale-up domain:</strong> the set of GPUs connected by the fast in-node or in-rack fabric (NVLink, or Huawei's unified bus); a supernode is a large one, such as a 64-GPU or 72-GPU rack.</p>
+</div>
+
+<h2 id="v3">2. DeepSeek-V3 (December 2024): the base design</h2>
+<p>V3 is a 671B-parameter mixture-of-experts model with 37B parameters active per token. Its inference-relevant choices, each covered earlier in the book:</p>
+<ul>
+  <li><strong>Multi-head latent attention (MLA)</strong>, chapters 2.4 and 4.2: one 512-value latent plus a 64-value RoPE key per token per layer, 70,272 bytes per token in BF16.</li>
+  <li><strong>DeepSeekMoE</strong>, chapter 2.6: one shared expert that every token uses plus 256 fine-grained routed experts, 8 active per token, balanced by a bias term instead of an auxiliary loss.</li>
+  <li><strong>Multi-token prediction (MTP)</strong>, chapter 4.3: a one-layer module trained with the model that predicts an extra token, reused at serving time as a draft.</li>
+  <li><strong>FP8 training with fine-grained block scales</strong>, chapters 1.3 and 4.1, which makes FP8 serving the native precision rather than a quantization.</li>
+  <li><strong>DualPipe</strong>, a bidirectional pipeline schedule that overlaps forward and backward computation with communication in training.</li>
+</ul>
+<p>The ISCA 2025 paper "Insights into DeepSeek-V3" explains why the model looks like this, from the hardware side. Three of its arguments matter for serving:</p>
+<ul>
+  <li><strong>Memory first.</strong> Its Table 1 puts V3's KV cache at 70.272 KB per token against 327.680 KB for Qwen-2.5 72B (GQA) and 516.096 KB for Llama-3.1 405B. MLA is what lets a 671B model hold long contexts.</li>
+  <li><strong>Interconnect sets the speed limit of MoE decode.</strong> With one expert per GPU and about 32 tokens per expert, dispatch in FP8 and combine in BF16 over 400 Gb/s InfiniBand take 120.96 µs per layer; with two micro-batches overlapped that gives 61 × 241.92 µs = 14.76 ms per token, about 67 tokens per second, as a theoretical ceiling. On a GB200 NVL72 domain at 900 GB/s the same arithmetic gives about 0.82 ms. The paper calls this purely theoretical; the point is that decode speed for wide MoE is a network number.</li>
+  <li><strong>Node-limited routing.</strong> H800 NVLink gives about 160 GB/s usable against about 40 GB/s effective per InfiniBand NIC, so V3 groups its 256 experts into 8 node-sized groups and sends each token to at most 4 nodes. A token crosses InfiniBand once per node and is forwarded over NVLink inside it.</li>
+</ul>
+<p>The same paper reports that the MTP module's second-token acceptance rate is 80% to 90% in practice, which raises generation speed by 1.8 times. Fire-Flyer AI-HPC (SC'24) covers the cluster underneath: 10,000 PCIe A100 GPUs reaching performance close to DGX-A100 at half the cost and 40% less energy, with HFReduce for all-reduce and 3FS for storage. The common argument of both papers: co-designing the model and software with cheaper hardware beats buying the most expensive interconnect.</p>
+<div class="box expert">
+  <span class="lbl">Expert layer: the hardware wish list</span>
+  <p>Sections 3 to 6 of "Insights into DeepSeek-V3" end with requests to hardware vendors: higher-precision accumulation in FP8 tensor cores and native fine-grained scaling; communication compression (their LogFMT format); a single fabric that merges scale-up and scale-out with hardware offload of forwarding; lower-latency networks (they compare InfiniBand and RoCE and use InfiniBand GPUDirect Async); better error detection; faster CPU to GPU links; and memory-centric designs such as DRAM stacked on logic. Read it next to chapter 5.5: many of these requests shaped the hardware that V4.1 now runs on.</p>
+</div>
+
+<h2 id="osw">3. Open Source Week (February 2025): the kernels</h2>
+<p>In the last week of February 2025 DeepSeek released one repository per day, then the inference system overview that chapter 6.7 uses for its cost model. Each repository has kept changing; the table gives what each README says on 7 November 2026.</p>
+<div class="tbl"><table>
+<tr><th>Repository</th><th>What it does</th><th>Figures in the README (DeepSeek-reported)</th></tr>
+<tr><td>FlashMLA</td><td>Attention kernels: MLA decode at first, then token-level sparse attention for DSA, an FP8 and FP4 KV cache, and a kernel that fuses query norm, RoPE, attention, output RoPE and the cast to FP8</td><td>660 TFLOPS on H800 (April 2025 update); DSA kernels up to 640 TFLOPS prefill and 410 TFLOPS decode (September 2025); on B200 the fused kernel reaches 1,460 TFLOPS prefill and 950 TFLOPS decode; on Ascend 950, 410 TFLOPS prefill (95% of peak) and 360 TFLOPS decode (83%). The 30 September 2026 release removed Hopper support and the V3, V3.2 and V4.0 models; an older commit keeps them.</td></tr>
+<tr><td>DeepEP</td><td>All-to-all dispatch and combine for expert parallelism over NVLink and RDMA, with FP8 dispatch</td><td>Version 2 unified the earlier high-throughput (prefill) and low-latency (decode) kernels into one <code>EPBuffer</code> interface, compiled at runtime; it adds NVLink exchange of redundant expert weights and runs on Ascend 950 through DeepEP-Ascend.</td></tr>
+<tr><td>DeepGEMM</td><td>FP8 (and now FP8 × FP4) matrix multiplication with fine-grained scaling, JIT-compiled, including grouped GEMMs for MoE in contiguous (prefill) and masked (decode) layouts</td><td>Up to 1,550 TFLOPS on H800 (April 2025); Mega MoE, FP8 × FP4 GEMM and an FP4 indexer added April 2026.</td></tr>
+<tr><td>EPLB</td><td>Expert placement with redundant copies of busy experts</td><td>Two policies: hierarchical (pack expert groups onto nodes, then replicate inside nodes; used for prefill) and global (replicate across all GPUs; for decode with a larger EP size).</td></tr>
+<tr><td>DualPipe</td><td>Bidirectional pipeline parallelism for training</td><td>Schedule figures only.</td></tr>
+<tr><td>3FS</td><td>A distributed file system over SSDs and RDMA, used for data loading, checkpoints and the KV cache</td><td>6.6 TiB/s aggregate read on 180 storage nodes; KV cache clients peak at 40 GiB/s read.</td></tr>
+</table></div>
+<p>The Day 6 overview (chapter 6.7) described the V3/R1 service: prefill units of 32 GPUs, decode units of 144 GPUs, two overlapped micro-batches, three load balancers and an on-disk KV cache. Keep those numbers with that service; the V4.1 service in section 7 uses a different layout on different hardware.</p>
+
+<h2 id="v32">4. DeepSeek-V3.2 (late 2025): sparse attention</h2>
+<p>V3.2 added DeepSeek Sparse Attention (DSA, chapter 4.2): a small lightning indexer scores every earlier token and each query attends to only the top 2,048. Core attention cost falls from growing with T² to growing with T × k, while the indexer still scores every pair but cheaply (it can run in FP8). Serving it needed three new pieces: indexer logit kernels in DeepGEMM, sparse attention kernels in FlashMLA, and a fast top-k, which became DeepSelect. The DeepSelect README describes it as the top-k kernel for DSA in V3.2, V4 and V4.1 and for the sampler, on CUDA and Ascend, with 2 to 20 times the speed of <code>torch.topk</code>, measured as effective memory bandwidth at top-k 512.</p>
+<p>DSA did not shrink the KV cache; V3.2's global KV is 48,068 bytes per token in the V4.1 report's Figure 1(b). It shrank the attention compute of long contexts. The next two generations went after memory.</p>
+
+<h2 id="v4">5. DeepSeek-V4 (April 2026): one million tokens</h2>
+<p>V4 is two MoE models: V4-Pro (1.6T parameters, 49B active, 61 layers) and V4-Flash (284B, 13B active, 43 layers), both with a one-million-token context, pre-trained on more than 32T tokens with the Muon optimizer (chapter 7.7) and manifold-constrained hyper-connections (mHC, chapter 2.7). The attention is new.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Compressed Sparse Attention (CSA):</strong> DeepSeek-V4's attention that first compresses the KV of every m tokens into one entry (m = 4 in both V4 models, using learned weights over overlapping windows), then applies DSA so each query attends to only the top-k compressed entries (512 in V4-Flash, 1,024 in V4-Pro).</p>
+  <p><strong>Heavily Compressed Attention (HCA):</strong> V4's second attention type, which compresses the KV of every m′ tokens into one entry (m′ = 128) and attends densely to all of them, with no sparse selection.</p>
+</div>
+<p>V4 interleaves CSA and HCA layers. In both, each compressed entry serves as key and value (shared-KV multi-query attention, chapter 2.4), with a grouped output projection to keep the large concatenated head output cheap. Both also keep a sliding window branch of the last 128 uncompressed tokens (a query cannot see inside its own compressed block otherwise), and an attention sink. The report's efficiency section adds three precision choices: the KV entries are stored in FP8 except the RoPE dimensions in BF16 (nearly half of pure BF16), the lightning indexer computes in FP4, and the top-k is smaller than V3.2's.</p>
+<p>The result, from the report's introduction, at a one-million-token context: V4-Pro needs 27% of V3.2's single-token inference FLOPs (in FP8-equivalent FLOPs) and 10% of its KV cache; V4-Flash needs 10% of the FLOPs and 7% of the KV. Against a BF16 GQA baseline with 8 KV heads of size 128, V4's KV cache is about 2%.</p>
+<h3>What V4 changed in the inference framework</h3>
+<p>The report says the framework "largely inherits from that of DeepSeek-V3", with a new KV layout. Hybrid attention breaks PagedAttention's assumption that every layer stores the same thing per token (chapter 3.3): CSA layers store one entry per 4 tokens, HCA layers one per 128, the indexer has its own dimensions, and sliding window layers keep only a window. V4 splits the cache in two:</p>
+<ul>
+  <li>A <strong>classical paged KV cache</strong> for CSA and HCA, where each block covers lcm(m, m′) original tokens, so one block holds a whole number of entries of both kinds. The sparse attention kernel is co-designed with this layout so blocks can hold different token counts per layer without losing speed.</li>
+  <li>A <strong>state cache</strong> with one fixed-size slot per request, holding the sliding window KV and the tail tokens not yet ready for compression. The report treats this part like the state of a state space model (chapter 2.7): bounded, and dependent only on the current position.</li>
+</ul>
+<p>For the on-disk prefix cache, compressed CSA and HCA entries are stored as they are. Sliding window KV is about 8 times larger because it is uncompressed and in every layer, so the report gives three options: store it all (no recompute, but write-heavy on SSDs), checkpoint it every p tokens, or store none and recompute. Exact recompute needs the last n<sub>win</sub> × L tokens, because each layer's window depends on the previous layer's window.</p>
+
+<h2 id="v41">6. DeepSeek-V4.1-Flash (September 2026): KV compression to the limit</h2>
+<p>The V4.1-Flash report opens with the workload: long-horizon agents make contexts long and input-heavy, sparse attention has already cut attention compute, so storage and data movement of the KV cache are now the bottleneck (chapter 6.8). V4.1-Flash is a 552B-parameter multimodal MoE (plus 196B parameters of Engram, a sparsely accessed conditional memory) with a one-million-token context. Three changes do the work.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Causal encoder-decoder (CED):</strong> V4.1-Flash's layout of its 40 layers into a 20-layer causal encoder and a 20-layer decoder, where the decoder layers' global KV is projected from the last encoder layer's hidden state instead of each layer's own. Prefill needs only the encoder, so it activates 8B parameters per token against 16B in decode.</p>
+  <p><strong>Compressed Sparse Attention 2 (CSA2):</strong> V4.1's attention, in which layers share global KV and top-k selections. Each layer is statically Full (computes its own KV and selection), Reindex (reuses an earlier layer's KV but selects again) or Reuse (reuses both).</p>
+  <p><strong>SWA bounded replay:</strong> rebuilding a missing sliding window KV state approximately by recomputing only the last n<sub>win</sub> tokens (128) and truncating the window to that replayed segment, instead of the n<sub>win</sub> × L tokens an exact rebuild needs.</p>
+</div>
+<ul>
+  <li><strong>CED cuts prefill compute.</strong> The report says it is inspired by YOCO (Microsoft, 2024), in which the upper half of the layers reuses the KV cache of the lower half, and calls the reduction "nearly half" of prefill computation. Each layer still computes its own sliding window KV, so the decoder's windows need a short replay (next item).</li>
+  <li><strong>CSA2 cuts KV storage.</strong> Shared global KV removes duplicate storage across layers; reused selections remove indexer work; a hierarchical sparse indexer in the decoder lets later indexers search only a candidate pool chosen by an earlier one. V4.1 drops HCA and uses CSA2 throughout, with a simplified compressor (no overlapping windows).</li>
+  <li><strong>FP4 main KV.</strong> The main KV cache is trained with quantization-aware training into an E2M1 format with one E4M3 scale per 16 channels (NVFP4 without its global scale); the indexer uses MXFP4. The sliding window KV stays in FP8 because it is sensitive to quantization.</li>
+</ul>
+<p>Together, CSA2 and FP4 bring the global KV to <strong>890 bytes per token</strong>, about a quarter of V4-Flash's 3,514. SWA bounded replay then lets the service stop persisting sliding window KV at all, which brings the persistent KV to about one eighth of V4-Flash's. The report adds that extending the context 256 times, from 4K to 1M tokens, raises V4.1-Flash's decode FLOPs per token by only a quarter.</p>
+<div class="widget" id="kvW">
+  <div class="wt">Interactive: KV cache per session across DeepSeek generations</div>
+  <div class="ws">Global KV only, from the per-token figures in the V4.1-Flash report (Figure 1b) and chapter 2.4 for V3 in BF16. V4 and V4.1 also keep a fixed-size sliding window state per sequence, which does not grow with context. Log scale.</div>
+  <div class="ctrls">
+    <label>Context: <span class="mono" id="kvTv"></span><input type="range" id="kvT" min="12" max="20" step="1" value="20"></label>
+    <label>Concurrent sessions: <span class="mono" id="kvNv"></span><input type="range" id="kvN" min="0" max="8" step="1" value="6"></label>
+  </div>
+  <div class="svgwrap"><svg id="kvSvg" viewBox="0 0 680 210" width="680" style="max-width:100%;height:auto" role="img" aria-label="KV cache size by model generation"></svg></div>
+  <div class="stats" id="kvStats"></div>
+</div>
+<h3>Bounded replay in practice</h3>
+<p>Bounded replay is used twice, and both uses accept an approximation that the report says has negligible quality impact (it also simulates the replay in post-training):</p>
+<ul>
+  <li><strong>Encoder replay on a cache hit.</strong> The prefix cache now depends only on global KV. If the sliding window state for the hit prefix is missing, the last 128 tokens of the prefix are recomputed together with the new suffix, rebuilding only the window.</li>
+  <li><strong>Decoder replay on every prefill.</strong> The decoder never stores its window state, and an exact rebuild would run 20 layers over the last 2,560 tokens. Instead every prefill runs the last 128 prompt tokens through the decoder; the result is used for decode only and never enters the prefix cache. The DeepInfer Q&amp;A says this nearly halves total prefill computation.</li>
+</ul>
+
+<h2 id="deepinfer">7. DeepInfer (October 2026): the engine</h2>
+<p>DeepInfer is "the high-performance inference framework that powers DeepSeek's large-scale production services". The open-source release, read at commit <code>a679bb8</code> (3 November 2026), provides offline inference with the core features for serving at scale, for one model: DeepSeek-V4.1-Flash (checkpoint DeepSeek-V4.1-Flash-1017, also served by the <code>deepseek-flash</code> API model). It is Apache-2.0 and, in its own words, "originally built primarily on vLLM, with additional inspiration from SGLang and TensorRT-LLM". It runs on NVIDIA SM100 GPUs (CUDA 13) and Huawei Ascend 950 NPUs (CANN 9.2), with Python 3.12 and GCC 13 or newer. Hopper GPUs are not supported, so most readers will read this section rather than run it.</p>
+<h3>Features, and where the book taught them</h3>
+<div class="tbl"><table>
+<tr><th>DeepInfer feature (README)</th><th>What it does</th><th>Chapter</th></tr>
+<tr><td>Optimized kernels: FlashMLA, DeepGEMM, DeepEP, TileKernels, DeepSelect, custom TileLang kernels</td><td>Attention, GEMM and fused MoE, all-to-all, routing and quantization, top-k; the report counts 15 kernels per Reuse-mode layer in prefill and 11 in decode</td><td>5.4, 5.8</td></tr>
+<tr><td>Attention data parallelism and balanced context parallelism</td><td>Each GPU runs attention for its own requests (DP size = EP size); CP splits long sequences across GPUs</td><td>4.5, 4.7</td></tr>
+<tr><td>MoE expert parallelism with EPLB</td><td>Experts spread over the group, with redundant copies of hot experts</td><td>4.5</td></tr>
+<tr><td>DSpark with confidence-scheduled verification</td><td>Draft tokens plus a per-token confidence that decides how many to verify; <code>DEEPINFER_ENABLE_MTP_VARLEN=1</code>, maximum draft length <code>DEEPINFER_USE_NEXTN_DECODE</code> (default 5)</td><td>4.3</td></tr>
+<tr><td>SWA bounded replay</td><td><code>DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact</code>, keep 140 tokens (the 128-token window plus backtracking for speculative tokens)</td><td>4.4, this chapter</td></tr>
+<tr><td>Asynchronous scheduling ("zero-overhead batch scheduler"), on by default</td><td>CPU schedules step N+1 while the GPU runs step N</td><td>3.4</td></tr>
+<tr><td>Batch-invariant inference, <code>DEEPINFER_BATCH_INVARIANT=1</code> (NVIDIA only)</td><td>A request's output does not depend on what else is in the batch</td><td>6.6</td></tr>
+<tr><td>Deterministic sampling: batch invariance, <code>DEEPINFER_ENABLE_MTP_VARLEN=0</code> and a fixed <code>seq_seed</code></td><td>Identical inputs and sampling parameters give identical outputs</td><td>1.2, 6.6</td></tr>
+<tr><td>Structured outputs: regex, JSON schema, EBNF via <code>so_args</code></td><td>Grammar compiled asynchronously on a separate machine, token mask applied per step</td><td>3.5</td></tr>
+</table></div>
+<p>The README also lists what a complete service needs that the release does not include: a KV cache system, vision encoder, prefill and decode disaggregation ("most required engine functionality is already implemented"), and load balancing across data-parallel replicas. The deployment Q&amp;A in the repository (<code>doc/inference_deployment_qa.md</code>, version 0.2) describes those missing parts as DeepSeek runs them, and is the most detailed public account of a frontier service. Its main points follow; every number is DeepSeek-reported.</p>
+<div class="svgwrap"><svg id="svcSvg" viewBox="0 0 680 250" width="680" style="max-width:100%;height:auto" role="img" aria-label="DeepSeek V4.1-Flash service layout"></svg></div>
+<p class="cap">The V4.1-Flash service as the DeepInfer Q&amp;A describes it: disaggregated vision encoder (VE), prefill and decode pools, four load balancers, and separate stores for block KV and sliding window KV.</p>
+<ul>
+  <li><strong>Scale.</strong> One cluster serves 155 trillion tokens per day, with revenue of US$38 per GPU-hour at the off-peak price.</li>
+  <li><strong>Parallelism.</strong> Prefill on ordinary 8-GPU machines with EP2 to EP8 (data parallel attention of the same size), the smallest that HBM allows. Decode on 64- to 128-GPU supernodes with EP64 to EP128 ("Wide-EP"). Vision encoders on one cheaper GPU each. No tensor parallelism and, for now, no context parallelism: in their measurements CP was up to 5% slower end to end, worsened expert load balance, and was not needed because V4.1 keeps tail TTFT acceptable even on a full cache miss. The smallest efficient unit is 64 prefill GPUs plus 64 decode GPUs (a roughly 1:1 ratio).</li>
+  <li><strong>Expert load balancing.</strong> Prefill: 4 redundant experts per GPU, a 100-step load window, re-placement every 1,000 steps; measured slowest-to-mean load ratio 1.074 at EP4. Decode: 1 redundant expert per GPU (7 experts per GPU at EP64 after rounding), a 1,000-step window, re-placement every 10,000 steps; ratio 1.090.</li>
+  <li><strong>Prefill scheduling.</strong> Requests are bucketed by total context (under 16K, 16K to 64K, 64K to 256K, 256K and over); engines pull work by remaining compute quota; each step's chunk size is solved from a time budget with a fitted quadratic cost model of new tokens and cached prefix length, capped at 32,768 tokens. There is no prefix-affinity routing, because every prefill machine can read every prefix from shared storage.</li>
+  <li><strong>Decode routing.</strong> A global decode load balancer evens out two quantities per GPU at once: request count (batch size) and total KV length (attention cost). Overall, load balancing reaches about 80% of a perfectly balanced offline benchmark.</li>
+  <li><strong>KV storage.</strong> In-flight KV and per-sequence state in HBM; sliding window KV in host memory on the machine that produced it, found through an in-memory directory and pulled over a 400G network on a cross-machine hit; block KV (main KV and indexer keys) on a dedicated 3FS cluster with 10+2 erasure coding, about 100 PiB of SSD, a TTL of 3 days for agent traffic and 7 days for chat traffic, about 14.4 TB of logical KV per online GPU. Only 20 layers × 134 tokens × 528 bytes = 1,415,040 bytes of sliding window state is saved per sequence.</li>
+  <li><strong>Speculative decoding.</strong> In production the draft model proposes 5 tokens; a confidence head predicts each one's acceptance; the scheduler sorts drafts by expected acceptance and verifies the prefix set that maximizes throughput on a profiled cost curve. On their Open-PerfectBlend data this cuts verified tokens per step by about 30% with nearly the same accepted length, for 4% to 7% more throughput at the production point of about 60 sequences per GPU (table below).</li>
+  <li><strong>Failure handling.</strong> In wide EP one failed GPU stops the whole instance; the platform restarts it with an EP size equal to the healthy GPUs it receives. A decode engine being shut down gets a one-minute grace period, then forwards unfinished requests with their KV to other engines.</li>
+</ul>
+<div class="tbl"><table>
+<tr><th>Sequences per GPU</th><th>Verified per step, fixed 5</th><th>Verified, dynamic</th><th>Accepted, fixed</th><th>Accepted, dynamic</th><th>Gain</th></tr>
+<tr><td class="n">16</td><td class="n">5</td><td class="n">4.44</td><td class="n">3.32</td><td class="n">3.24</td><td class="n">−1.5%</td></tr>
+<tr><td class="n">32</td><td class="n">5</td><td class="n">3.65</td><td class="n">3.25</td><td class="n">3.17</td><td class="n">+1.6%</td></tr>
+<tr><td class="n">60</td><td class="n">5</td><td class="n">3.58</td><td class="n">3.30</td><td class="n">3.21</td><td class="n">+5.4%</td></tr>
+<tr><td class="n">96</td><td class="n">5</td><td class="n">3.24</td><td class="n">3.30</td><td class="n">3.15</td><td class="n">+11.0%</td></tr>
+</table></div>
+<p class="cap">DSpark dynamic-length against fixed-length verification, selected rows of the DeepInfer Q&amp;A table (EP64, estimated throughput per GPU). The gain grows with load because verification compute is what saturates first.</p>
+<div class="widget" id="spW">
+  <div class="wt">Interactive: why verify fewer draft tokens under load</div>
+  <div class="ws">A toy model, not DeepSeek's cost curve. A batch of requests each has 5 draft tokens; draft i survives with probability p<sup>i</sup>. A verify step costs a fixed overhead plus a per-token cost for every draft verified. Dynamic verification keeps only the draft tokens whose expected gain beats their cost.</div>
+  <div class="ctrls">
+    <label>Easy requests, per-token acceptance: <span class="mono" id="spEv"></span><input type="range" id="spE" min="50" max="95" step="5" value="90"></label>
+    <label>Hard requests, acceptance: <span class="mono" id="spHv"></span><input type="range" id="spH" min="10" max="80" step="5" value="60"></label>
+    <label>Requests per GPU: <span class="mono" id="spBv"></span><input type="range" id="spB" min="8" max="128" step="8" value="64"></label>
+  </div>
+  <div class="stats" id="spStats"></div>
+</div>
+<p>Two engine details are worth knowing before you read the code (chapter 8.2 maps it). The scheduler, block manager and cost estimator are C++ (<code>csrc/engine/</code>) behind Python bindings, rather than Python as in vLLM. And asynchronous scheduling interacts with speculation: when step N+1 is scheduled, step N's confidences have not returned, so the CPU fixes only the total verification budget and a TileLang kernel on the GPU assigns each request's length.</p>
+<p>The repository also ships benchmarks. The README's Pareto charts were measured on 4 SM100 GPUs for prefill (EP4, 128K context, bounded replay) and 64 for decode (EP64, 128K context, three draft tokens with 75% per-token acceptance assumed). Read from the charts, approximately: prefill reaches about 87,000 non-cached input tokens per second per GPU with 32,768-token batches at about 375 ms per step; decode reaches about 15,700 output tokens per second per GPU at 64 requests per GPU and about 246 tokens per second per user. These are DeepSeek-reported and not independently reproduced; note that the decode metric counts every draft token at the assumed acceptance.</p>
+
+<h2 id="table">8. Reading the stack as one design</h2>
+<div class="tbl"><table>
+<tr><th></th><th>V3 (Dec 2024)</th><th>V3.2 (late 2025)</th><th>V4-Flash (Apr 2026)</th><th>V4.1-Flash (Sep 2026)</th></tr>
+<tr><td>Attention</td><td>MLA</td><td>MLA + DSA (top 2,048)</td><td>CSA (m = 4, top 512) and HCA (m′ = 128), plus 128-token window</td><td>CSA2 with cross-layer KV and index reuse, plus 128-token window</td></tr>
+<tr><td>Global KV per token</td><td class="n">70,272 B (BF16, ch. 2.4)</td><td class="n">48,068 B</td><td class="n">3,514 B</td><td class="n">890 B</td></tr>
+<tr><td>Active parameters</td><td>37B</td><td>37B</td><td>13B</td><td>8B prefill, 16B decode</td></tr>
+<tr><td>Speculation</td><td>MTP, 1 extra token</td><td>MTP</td><td>MTP, depth 1</td><td>DSpark, 5 drafts, confidence-scheduled</td></tr>
+<tr><td>KV precision</td><td>FP8 or BF16 latent</td><td>Not broken down in the sources</td><td>FP8, BF16 RoPE dims; FP4 indexer</td><td>FP4 main KV; MXFP4 indexer; FP8 window</td></tr>
+<tr><td>Serving layout</td><td colspan="2">H800; prefill 32 GPUs, decode 144 GPUs (ch. 6.7)</td><td>Not published</td><td>SM100 or Ascend 950; prefill EP2 to 8, decode EP64 to 128, VE pool</td></tr>
+<tr><td>Where the KV lives</td><td colspan="2">HBM, on-disk prefix cache (3FS)</td><td>HBM; paged cache plus state cache; disk for compressed entries</td><td>HBM; block KV on 3FS ≥ 72 h; window KV in host memory for minutes</td></tr>
+</table></div>
+<p class="cap">Per-token figures for V3.2, V4-Flash and V4.1-Flash are from the V4.1-Flash report's Figure 1(b); the V3 figure is computed in chapter 2.4. Cells marked "not published" were not found in the sources.</p>
+<p>Read across, the bottleneck moves. V3 made KV small enough for long contexts and made decode a network problem, answered with wide EP. V3.2 made long-context attention compute affordable. V4 shrank KV by compressing the sequence dimension and storing in lower precision. V4.1 shrank it along the layer dimension and in precision again, and attacked the prefill compute that input-heavy agents create. The engine and the service followed each step: a heterogeneous cache layout, storage tiers matched to reuse patterns, and schedulers that model compute cost instead of counting tokens.</p>
+
+<h2 id="expert">9. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Why decode runs on 64 to 144 GPUs per unit</span>
+  <p>With 6 or 8 of several hundred experts active per token, a decode batch of a few hundred requests gives each expert only a handful of tokens per GPU, so expert matmuls read their weights to do almost no work (chapter 2.5). Spreading experts over a wide group gives each GPU fewer experts and each expert more tokens. The DeepInfer Q&amp;A adds the limit: past about EP32 the fused MoE kernel stops gaining, because once memory bandwidth is no longer the bottleneck, wider groups add communication and synchronization. It also notes that jobs sharing NVLink in a supernode interfere, so one EP group uses the whole supernode.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">What others built on DSA</span>
+  <p><strong>Lookahead Sparse Attention</strong> (FlashMemory-DeepSeek-V4, arXiv 2606.09079) trains a neural memory indexer as a dual encoder, without loading the backbone, and keeps only the KV chunks a query will need in GPU memory. The authors report an average KV footprint of 13.5% of the full-context baseline with equal or slightly better accuracy, and at 1M tokens 0.30 times the per-token decode compute, 90% less GPU KV cache, and 2.8 times throughput in prefill-decode disaggregated serving on 8 H20 GPUs. <strong>LongCat Sparse Attention</strong> (Meituan, arXiv 2608.01662) targets the lightning indexer's own O(L²) cost and its scattered memory access with streaming-aware indexing (contiguous KV layouts for coalesced reads), cross-layer indexing and hierarchical coarse-to-fine indexing; V4.1's hierarchical sparse indexer and index reuse follow the same direction.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Tree speculation on compressed attention</span>
+  <p>Tree speculation (chapter 4.3) verifies several branches from a shared prefix in one pass. On V4-Flash this is hard because CSA and HCA compress KV online: branches that diverge from a shared prefix compress into different states. The authors of arXiv 2609.24698 add branch-aware causal verification, temporary state isolation and a state refresh along the accepted path. At a budget of 8 draft tokens the accepted length rises to about 2.83 to 3.41 from 2.39 to 2.84 for linear drafts, with throughput gains of up to about 18.5%; beyond some budget throughput plateaus while accepted length keeps rising. Any model with compressed, sparse or stateful context will meet the same problem.</p>
+</div>
+
+<h2 id="mistakes">10. Common mistakes</h2>
+<ul>
+  <li>Quoting the February 2025 service numbers (H800, 144-GPU decode units, 56% cache hits) as DeepSeek's current deployment.</li>
+  <li>Comparing per-token KV sizes across generations without saying which part is counted: global KV, the window state, the indexer, or all of them.</li>
+  <li>Expecting DeepInfer to run on H100 or H200: the release targets SM100 and Ascend 950, and current FlashMLA has dropped Hopper.</li>
+  <li>Treating DeepInfer as a complete service: the KV cache system, disaggregation and replica load balancing are not in the release.</li>
+  <li>Reading the README's decode throughput as delivered tokens: it counts drafts at an assumed acceptance rate.</li>
+  <li>Assuming bounded replay is exact. It is an approximation the model was trained to tolerate; outputs depend on where the cache hit landed.</li>
+</ul>
+
+<h2 id="lab">11. Lab</h2>
+<p><strong>Goal:</strong> turn the published numbers into capacity and revenue figures, then (with the right hardware) reproduce DeepInfer's benchmark.</p>
+<h3>Part A: KV for one-million-token sessions (CPU)</h3>
+<p>Predict first: how many one-million-token sessions of V3 fit in one B200's 180 GB, ignoring weights? And of V4.1-Flash?</p>
+<pre>ctx = 1_000_000
+per_token = {                      # bytes of global KV per token
+    "V3 (MLA, BF16, ch. 2.4)": 61 * (512 + 64) * 2,
+    "V3.2 (report fig. 1b)": 48_068,
+    "V4-Flash (report fig. 1b)": 3_514,
+    "V4.1-Flash (report)": 890,
+}
+for name, b in per_token.items():
+    gb = b * ctx / 1e9
+    print(f"{name:28s} {b:>7,} B/token  {gb:6.1f} GB per 1M-token session  {64*gb:7.1f} GB for 64 sessions")
+# V4-Pro is given only as a ratio: 10% of V3.2's KV at 1M tokens
+v4pro = 0.10 * per_token["V3.2 (report fig. 1b)"] * ctx / 1e9
+print(f"{'V4-Pro (10% of V3.2 at 1M)':28s} {'':>7}           {v4pro:6.1f} GB per 1M-token session  {64*v4pro:7.1f} GB for 64 sessions")
+hbm = 180e9   # one B200 (SM100), about 180 GB, chapter 5.5
+for name, b in per_token.items():
+    print(f"1M-token sessions per 180 GB of HBM, {name}: {hbm/(b*ctx):.1f}")
+# the SWA state DeepInfer stores per sequence (doc Q&amp;A): 20 layers x 134 tokens x 528 B
+print("SWA state stored per sequence:", f"{20*134*528:,} B")</pre>
+<details><summary>What we computed</summary><pre class="out" id="labA48">V3 (MLA, BF16, ch. 2.4)       70,272 B/token    70.3 GB per 1M-token session   4497.4 GB for 64 sessions
+V3.2 (report fig. 1b)         48,068 B/token    48.1 GB per 1M-token session   3076.4 GB for 64 sessions
+V4-Flash (report fig. 1b)      3,514 B/token     3.5 GB per 1M-token session    224.9 GB for 64 sessions
+V4.1-Flash (report)              890 B/token     0.9 GB per 1M-token session     57.0 GB for 64 sessions
+V4-Pro (10% of V3.2 at 1M)                        4.8 GB per 1M-token session    307.6 GB for 64 sessions
+1M-token sessions per 180 GB of HBM, V3 (MLA, BF16, ch. 2.4): 2.6
+1M-token sessions per 180 GB of HBM, V3.2 (report fig. 1b): 3.7
+1M-token sessions per 180 GB of HBM, V4-Flash (report fig. 1b): 51.2
+1M-token sessions per 180 GB of HBM, V4.1-Flash (report): 202.2
+SWA state stored per sequence: 1,415,040 B</pre>
+<p>A single one-million-token V3 session needs 70 GB, so 64 of them need 4.5 TB, a rack's worth of HBM. The same 64 sessions of V4.1-Flash need 57 GB, under one GPU. That is the change that makes million-token agents a serving product rather than a demo, and it is why the cost moved to prefill compute and SSD capacity. Two caveats: weights and the per-sequence window state also take HBM, and V4-Pro's figure is from a ratio at exactly 1M tokens, not a per-token size.</p></details>
+<h3>Part B: revenue per GPU-hour (CPU)</h3>
+<p>Use the DeepSeek API's <code>deepseek-flash</code> prices (served by V4.1-Flash-1017), checked on 7 November 2026: per million tokens off-peak, $0.003 cache-hit input, $0.15 cache-miss input, $0.60 output; peak rates are double. Combine them with the benchmark throughputs from section 7.</p>
+<pre>price = {"hit": 0.003, "miss": 0.15, "out": 0.60}   # USD per 1M tokens, off-peak (peak is 2x), checked 7 Nov 2026
+prefill_tps = 87_000   # non-cached input tokens/s/GPU, EP4DP4, 32,768-token batch, read from README chart
+decode_tps  = 15_700   # output tokens/s/GPU, EP64DP64, 64 requests per rank, read from README chart
+dspark_tps  = 14_466   # tokens/s/rank, dynamic-length verification at 60 seqs/rank (Q&amp;A table)
+for name, tps, p in [("prefill GPU (cache-miss input)", prefill_tps, price["miss"]),
+                     ("decode GPU (chart)", decode_tps, price["out"]),
+                     ("decode GPU (DSpark table)", dspark_tps, price["out"])]:
+    tok_h = tps * 3600
+    print(f"{name:32s} {tok_h/1e6:6.1f} M tokens/GPU-hour -> ${tok_h/1e6*p:5.2f} off-peak, ${2*tok_h/1e6*p:5.2f} peak")
+print("published overall revenue: $38 per GPU-hour at the off-peak price")
+# 1P:1D is the ratio the Q&amp;A gives; one pair of GPUs earns:
+pair = prefill_tps*3600/1e6*price["miss"] + decode_tps*3600/1e6*price["out"]
+print(f"one prefill GPU + one decode GPU, both full: ${pair:.2f} per 2 GPU-hours = ${pair/2:.2f} per GPU-hour")
+print(f"a cache-hit input token is billed at {price['hit']/price['miss']:.0%} of a miss")</pre>
+<p>Predict first: does a prefill GPU or a decode GPU earn more per hour?</p>
+<details><summary>What we computed</summary><pre class="out" id="labB48">prefill GPU (cache-miss input)    313.2 M tokens/GPU-hour -> $46.98 off-peak, $93.96 peak
+decode GPU (chart)                 56.5 M tokens/GPU-hour -> $33.91 off-peak, $67.82 peak
+decode GPU (DSpark table)          52.1 M tokens/GPU-hour -> $31.25 off-peak, $62.49 peak
+published overall revenue: $38 per GPU-hour at the off-peak price
+one prefill GPU + one decode GPU, both full: $80.89 per 2 GPU-hours = $40.45 per GPU-hour
+a cache-hit input token is billed at 2% of a miss</pre>
+<p>A fully busy pair of one prefill and one decode GPU earns about $40 per GPU-hour off-peak, the same size as the $38 DeepSeek reports. Do not read utilization from that match: the published figure includes cache-hit revenue, idle and peak hours, and the chart throughputs are benchmark points, not production averages. Two things the numbers do show: prices are set close to what the engine can produce per GPU, and a cache hit is billed at 2% of a miss, so the 3FS cluster's job is to turn expensive prefill into almost free input. Compare chapter 6.7's 2025 calculation, where the assumed cost was $2 per H800-hour.</p></details>
+<h3>Part C: run DeepInfer (SM100 or Ascend 950; expected, not measured)</h3>
+<p>On an 8-GPU SM100 node: build with <code>DEEPINFER_ACCELERATOR=nvidia ./build.sh</code>, run <code>python examples/offline_inference.py --ep 8</code>, then <code>python examples/benchmark.py</code> with its defaults (64 decode requests, 32,768-token context, 4,096 non-cached tokens, five draft tokens). Then sweep: <code>bash examples/sweep/run_sweep.sh prefill pe-128k 131072</code> and the decode sweep with three draft tokens. Expect prefill throughput to rise and flatten with batch size and decode throughput to fall per user as requests grow, as in the README charts; on 8 GPUs (EP8) decode throughput per GPU should be well below the EP64 chart, which is the Wide-EP effect the Q&amp;A shows. Plot the points with chapter 6.10's method and mark the SLO point. We did not run this part: no SM100 or Ascend hardware was available.</p>
+
+<h2 id="realworld">12. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Where this stack shows up</span>
+  <ul>
+    <li><strong>Open engines</strong> (vLLM and SGLang, chapter 3.7) integrate FlashMLA, DeepEP and DeepGEMM as backends; DeepInfer itself started from vLLM.</li>
+    <li><strong>Other labs' models</strong> reuse the parts: MLA layers in Kimi Linear's hybrid (chapter 2.7), DSA-style indexing in LongCat Sparse Attention, redundant experts in DeepEP-based expert balancing work from Moonshot (MoonEP) and others.</li>
+    <li><strong>Chinese accelerators</strong> are first-class targets: FlashMLA, DeepEP, DeepGEMM, TileKernels and DeepSelect all ship Ascend 950 backends, and DeepInfer supports both platforms.</li>
+    <li><strong>Agent platforms</strong> are the workload the V4.1 design is priced for: long, input-heavy contexts with high prefix reuse.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">13. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz48"></div>
+<script type="application/json" id="qz48">[
+{"q":"Why does V4.1-Flash activate only 8B parameters per token in prefill?","o":["It skips the MoE layers in prefill","Decoder global KV is projected from the last encoder layer, so prefill runs only the encoder","It uses a smaller draft model for prefill","Prefill runs in FP4"],"a":1,"e":"The causal encoder-decoder design; the decoder layers' windows are rebuilt by a short replay."},
+{"q":"What does CSA2's Reuse mode reuse from an earlier layer?","o":["Only the query","The global KV and the top-k selection","The sliding window KV","The MoE routing"],"a":1,"e":"Reindex reuses the KV but selects again; Reuse takes both. Every layer keeps its own query and window KV."},
+{"q":"Why does DeepSeek not persist sliding window KV for V4.1?","o":["It is compressed to nothing","It is reused only within a short window of an active session, and bounded replay rebuilds it cheaply","SSDs cannot store it","It is the same in every layer"],"a":1,"e":"Global KV has long-tail reuse; window KV is dead once the session moves on."},
+{"q":"Why does DeepInfer use EP64 to EP128 for decode but EP2 to EP8 for prefill?","o":["Decode needs more memory","Decode has few tokens per expert, so a wide group raises the batch per expert; prefill already has large batches","Prefill cannot use NVLink","Licensing"],"a":1,"e":"Small prefill groups balance load better and move less data."},
+{"q":"DSpark's dynamic verification gives its largest gain:","o":["At low load","At high load, where verification compute is scarce","Only with greedy decoding","Only on Ascend"],"a":1,"e":"In the Q&A table the gain goes from −1.5% at 16 sequences per GPU to +11% at 96."},
+{"q":"Which is NOT included in the DeepInfer open-source release?","o":["DSpark","Batch-invariant inference","The KV cache system and replica load balancing","Structured outputs"],"a":2,"e":"The README lists a KV cache system, VE/prefill/decode disaggregation and DP load balancing as required but not included."}
+]</script>
+
+<h2 id="summary">14. Summary</h2>
+<ul>
+  <li>DeepSeek's releases show one design pushed against its bottleneck for two years: KV memory, then attention compute, then KV storage and prefill compute.</li>
+  <li>V3: MLA (70 KB per token), fine-grained MoE, MTP, FP8; decode speed for wide MoE is set by the interconnect.</li>
+  <li>V3.2: DSA cut long-context attention compute; V4: CSA and HCA compressed the sequence dimension, 10% of V3.2's KV at 1M tokens for V4-Pro.</li>
+  <li>V4.1-Flash: CED halves prefill, CSA2 shares KV across layers, FP4 main KV; 890 bytes of global KV per token; bounded replay removes window KV from persistent storage.</li>
+  <li>DeepInfer packages the kernels, attention DP with wide EP and EPLB, DSpark, bounded replay, asynchronous scheduling, batch invariance and structured outputs; the KV cache system and load balancers are described but not released.</li>
+</ul>
+
+<h2 id="refs">15. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 Technical Report</a></td><td>MLA, DeepSeekMoE, auxiliary-loss-free balancing, MTP, FP8 training, DualPipe.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2505.09343">Insights into DeepSeek-V3: Scaling Challenges and Reflections on Hardware for AI Architectures</a> (ISCA 2025)</td><td>KV per token compared, the EP speed limit, node-limited routing, MTP acceptance in production, requests to hardware vendors.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2408.14158">Fire-Flyer AI-HPC</a> (SC'24)</td><td>DeepSeek's cost-driven PCIe A100 cluster, HFReduce and 3FS.</td></tr>
+<tr><td><a href="https://github.com/deepseek-ai/FlashMLA">FlashMLA</a>, <a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>, <a href="https://github.com/deepseek-ai/DeepGEMM">DeepGEMM</a>, <a href="https://github.com/deepseek-ai/EPLB">EPLB</a>, <a href="https://github.com/deepseek-ai/DualPipe">DualPipe</a>, <a href="https://github.com/deepseek-ai/3FS">3FS</a></td><td>The kernel, communication, placement and storage libraries, with current performance figures.</td></tr>
+<tr><td><a href="https://github.com/deepseek-ai/DeepSelect">DeepSelect</a> and <a href="https://github.com/deepseek-ai/TileKernels">TileKernels</a></td><td>The top-k kernel for DSA and the sampler; TileLang kernels for routing, quantization, Engram and mHC on NVIDIA and Ascend.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2512.02556">DeepSeek-V3.2 report</a> and <a href="https://github.com/deepseek-ai/DeepSeek-V3.2-Exp">DeepSeek-V3.2-Exp</a></td><td>DeepSeek Sparse Attention and where its kernels live.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2606.19348">DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</a></td><td>CSA and HCA, efficiency at 1M tokens, the heterogeneous KV layout, on-disk window KV options, batch-invariant kernels.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2609.19969">DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression</a></td><td>CED, CSA2, FP4 main KV, 890 bytes per token, persistent KV management and SWA bounded replay.</td></tr>
+<tr><td><a href="https://github.com/deepseek-ai/DeepInfer">DeepInfer</a>, README and <code>doc/inference_deployment_qa.md</code> at commit a679bb8</td><td>The engine, its features and benchmarks, and the production service it runs in.</td></tr>
+<tr><td><a href="https://api-docs.deepseek.com/quick_start/pricing">DeepSeek API, Models &amp; Pricing</a></td><td>Current prices for the model DeepInfer serves.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2405.05254">Sun et al., You Only Cache Once (YOCO)</a></td><td>The decoder-decoder design that CED builds on.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2606.09079">FlashMemory-DeepSeek-V4: Lookahead Sparse Attention</a></td><td>A backbone-free indexer that keeps only needed KV chunks in GPU memory.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2608.01662">LongCat Sparse Attention</a> (Meituan)</td><td>Streaming-aware, cross-layer and hierarchical indexing for DSA.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2609.24698">Tree-structured speculative decoding for DeepSeek-V4</a></td><td>Keeping compressed attention states consistent across draft branches.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>DeepSeek-V4, V4.1-Flash, DeepInfer, DeepSelect, TileKernels and the three related papers post-date the training data of the models that wrote this chapter. Every statement about them comes from the arXiv pages (full HTML for V4 and V4.1-Flash, abstracts for the others), the GitHub READMEs and the DeepInfer Q&amp;A, read on 7 November 2026.</li>
+  <li>The DeepInfer README's benchmark figures are charts without tables; the prefill and decode throughputs used here are read from them and are approximate.</li>
+  <li>The README's environment variables call bounded replay "YOCO"; the V4.1-Flash report states that CED is inspired by YOCO, which is why the two are linked here.</li>
+  <li>The DeepEP README no longer has the separate normal and low-latency mode tables of 2025; version 2 merged both into <code>EPBuffer</code>. Older descriptions of two modes (including chapter 4.5) describe version 1.</li>
+  <li>The DeepInfer Q&amp;A refers to a Zhihu blog post for the overall architecture; it was not used here, so the KV cache and load balancer details are only those the Q&amp;A states. The V4-Flash serving layout was not found in the sources.</li>
+  <li>The report's V3.2 figure (48,068 bytes per token, exactly 788 bytes per layer over 61 layers) is smaller than chapter 2.4's 70,272 bytes for V3's latent in BF16, although V3.2 adds an indexer. The report does not break the figure down; a lower storage precision for the latent would explain it, but that is not confirmed from the source.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Lab Parts A and B computed with Python 3.13; Part C is expected behaviour, not run.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$,el,css}=IE;
+const fmtB=b=>b>=1e12?(b/1e12).toFixed(2)+' TB':b>=1e9?(b/1e9).toFixed(1)+' GB':(b/1e6).toFixed(1)+' MB';
+const KM=[['V3 (MLA, BF16)',70272,'--bad'],['V3.2',48068,'--dec'],['V4-Flash',3514,'--kv'],['V4.1-Flash',890,'--good']];
+function kv(){const T=2**+$('kvT').value,N=2**+$('kvN').value,s=$('kvSvg');s.innerHTML='';
+  $('kvTv').textContent=T>=1048576?'1M':(T/1024)+'K';$('kvNv').textContent=N;
+  const lo=Math.log10(1e8),hi=Math.log10(1e13),X=v=>150+(Math.log10(Math.max(v,1e8))-lo)/(hi-lo)*500;
+  [1e8,1e9,1e10,1e11,1e12,1e13].forEach(v=>{el('line',{x1:X(v),x2:X(v),y1:14,y2:168,stroke:css('--line')},s);el('text',{x:X(v),y:184,'text-anchor':'middle','font-size':10,fill:css('--ink2')},s,v>=1e12?(v/1e12)+' TB':v>=1e9?(v/1e9)+' GB':(v/1e6)+' MB');});
+  const gpu=180e9;el('line',{x1:X(gpu),x2:X(gpu),y1:10,y2:170,stroke:css('--pre'),'stroke-width':2,'stroke-dasharray':'4 3'},s);
+  el('text',{x:X(gpu)+4,y:200,'font-size':10,fill:css('--pre')},s,'one B200, 180 GB');
+  KM.forEach(([n,b,c],i)=>{const tot=b*T*N,y=22+i*37;
+    el('text',{x:144,y:y+15,'text-anchor':'end','font-size':11,fill:css('--ink')},s,n);
+    el('rect',{x:150,y,width:Math.max(2,X(tot)-150),height:22,rx:3,fill:css(c+'-s'),stroke:css(c)},s);
+    const tx=X(tot)+6>590?X(tot)-6:X(tot)+6;el('text',{x:tx,y:y+15,'text-anchor':X(tot)+6>590?'end':'start','font-size':10.5,fill:css('--ink')},s,fmtB(tot));});
+  const v41=890*T*N,v3=70272*T*N;
+  $('kvStats').innerHTML=`<div class="stat"><div class="k">V4.1-Flash, total</div><div class="v">${fmtB(v41)}</div></div><div class="stat"><div class="k">V3, total</div><div class="v">${fmtB(v3)}</div></div><div class="stat"><div class="k">B200s just for V3's KV</div><div class="v">${(v3/gpu).toFixed(1)}</div></div><div class="stat"><div class="k">Ratio V3 / V4.1</div><div class="v">${(70272/890).toFixed(0)}×</div></div>`;}
+['kvT','kvN'].forEach(i=>$(i).addEventListener('input',kv));IE.onTheme(kv);
+function svc(){const s=$('svcSvg');s.innerHTML='';
+  const d=el('defs',{},s),m=el('marker',{id:'svA',viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto'},d);el('path',{d:'M0,0 L10,5 L0,10 z',fill:css('--ink2')},m);
+  const box=(x,y,w,h,c,t1,t2)=>{el('rect',{x,y,width:w,height:h,rx:5,fill:css(c+'-s'),stroke:css(c)},s);el('text',{x:x+w/2,y:y+(t2?h/2-2:h/2+4),'text-anchor':'middle','font-size':11,'font-weight':600,fill:css('--ink')},s,t1);if(t2)el('text',{x:x+w/2,y:y+h/2+12,'text-anchor':'middle','font-size':9.5,fill:css('--ink2')},s,t2);};
+  const ar=(x1,y1,x2,y2)=>el('path',{d:`M ${x1} ${y1} L ${x2} ${y2}`,stroke:css('--ink2'),'stroke-width':1.5,fill:'none','marker-end':'url(#svA)'},s);
+  box(10,90,110,56,'--kv','Entrypoint','Recipe, cache match');
+  box(160,10,130,46,'--kv','Vision encoders','1 GPU each');
+  box(150,90,150,56,'--pre','Prefill','8-GPU nodes, EP2 to 8');
+  box(340,90,150,56,'--dec','Decode','supernode, EP64 to 128');
+  box(530,90,140,56,'--good','Client','streamed tokens');
+  ar(120,110,158,40);ar(120,118,148,118);ar(225,56,225,88);ar(300,118,338,118);ar(490,118,528,118);
+  el('text',{x:304,y:110,'font-size':9.5,fill:css('--kv')},s,'KV');
+  el('rect',{x:90,y:190,width:270,height:48,rx:5,fill:css('--panel2'),stroke:css('--line')},s);
+  el('text',{x:225,y:209,'text-anchor':'middle','font-size':11,'font-weight':600,fill:css('--ink')},s,'3FS: block KV on SSD');
+  el('text',{x:225,y:224,'text-anchor':'middle','font-size':9.5,fill:css('--ink2')},s,'about 100 PiB, TTL 3 days agent, 7 days chat');
+  el('rect',{x:380,y:190,width:230,height:48,rx:5,fill:css('--panel2'),stroke:css('--line')},s);
+  el('text',{x:495,y:209,'text-anchor':'middle','font-size':11,'font-weight':600,fill:css('--ink')},s,'Host memory: window KV');
+  el('text',{x:495,y:224,'text-anchor':'middle','font-size':9.5,fill:css('--ink2')},s,'10% of DRAM per machine, minutes');
+  el('path',{d:'M 225 146 L 225 188',stroke:css('--kv'),'stroke-width':1.5,'stroke-dasharray':'3 3'},s);
+  el('path',{d:'M 440 146 L 440 188',stroke:css('--kv'),'stroke-width':1.5,'stroke-dasharray':'3 3'},s);
+  el('text',{x:340,y:30,'font-size':10,fill:css('--ink2')},s,'Load balancers: VE, prefill, decode, expert');
+  el('text',{x:340,y:46,'font-size':10,fill:css('--ink2')},s,'Smallest efficient unit: 64 prefill + 64 decode GPUs');}
+IE.onTheme(svc);
+function sp(){const pe=$('spE').value/100,ph=$('spH').value/100,B=+$('spB').value;
+  $('spEv').textContent=pe.toFixed(2);$('spHv').textContent=ph.toFixed(2);$('spBv').textContent=B;
+  const reqs=[];for(let i=0;i<B;i++)reqs.push(i%2?ph:pe);
+  const a=1.0,b=0.002;            // step cost: fixed overhead plus per verified draft token (arbitrary units)
+  const cost=q=>a+b*(B+q);        // every request also computes its one real token
+  const acc=(p,n)=>{let e=0,s=1;for(let k=1;k<=n;k++){s*=p;e+=s;}return e;};
+  const fixedQ=5*B,fixedA=reqs.reduce((t,p)=>t+1+acc(p,5),0),fixedT=fixedA/cost(fixedQ);
+  const cand=[];reqs.forEach(p=>{let s=1;for(let k=1;k<=5;k++){s*=p;cand.push(s);}});cand.sort((x,y)=>y-x);
+  let best=-1,bq=0,ba=0,run=B;for(let q=0;q<=cand.length;q++){if(q>0)run+=cand[q-1];const t=run/cost(q);if(t>best){best=t;bq=q;ba=run;}}
+  $('spStats').innerHTML=`<div class="stat"><div class="k">Fixed 5: verified per request</div><div class="v">5.00</div></div><div class="stat"><div class="k">Dynamic: verified per request</div><div class="v">${(bq/B).toFixed(2)}</div></div><div class="stat"><div class="k">Tokens per step, fixed / dynamic</div><div class="v">${(fixedA/B).toFixed(2)} / ${(ba/B).toFixed(2)}</div></div><div class="stat"><div class="k">Throughput gain</div><div class="v">${((best/fixedT-1)*100).toFixed(1)}%</div></div>`;}
+['spE','spH','spB'].forEach(i=>$(i).addEventListener('input',sp));sp();
+})();
+</script>

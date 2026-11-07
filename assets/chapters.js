@@ -189,6 +189,13 @@ window.IE_CHAPTERS = [
 "ready": true
 },
 {
+"n": "4.8",
+"title": "Case study: DeepSeek's inference stack, V3 to DeepInfer",
+"slug": "4-8-deepseek-inference-stack",
+"part": 4,
+"ready": true
+},
+{
 "n": "5.1",
 "title": "Compute, memory and overhead",
 "slug": "5-1-compute-memory-overhead",
