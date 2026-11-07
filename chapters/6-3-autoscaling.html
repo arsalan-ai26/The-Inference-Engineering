@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>6.3 Autoscaling and concurrency</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="6.3">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 6 · Chapter 6.3</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 6 · Production inference infrastructure · Chapter 6.3</div>
+<h1>Autoscaling and concurrency</h1>
+<p class="lede">Traffic to an AI product rises and falls through the day and spikes without warning. A fixed number of GPUs either wastes money in quiet hours or breaks the latency targets at peaks. Autoscaling adds and removes replicas to follow demand. For LLM inference it is harder than for web services: replicas are expensive, take minutes to start, and their capacity depends on prompt lengths and cache hits, not just request counts. This chapter shows how to measure what one replica can handle, which signals to scale on, how each autoscaling parameter trades cost against latency, and when scaling to zero makes sense.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 3.2, 6.1, 6.2</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>A service receives 10 requests per second and each takes 3 s on average. How many requests are in flight at once?</li>
+    <li>Why is GPU utilization a poor primary signal for scaling LLM replicas?</li>
+    <li>Cold starts take 10 minutes. What does that force on your autoscaling policy?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>30, by Little's law: in flight = arrival rate × time in system.</li>
+    <li>It lags demand, and it saturates early: one long prefill or a modest decode batch can show 100% (chapter 5.1) while the replica still has room. Queue length and requests in flight lead it.</li>
+    <li>Scale up early, with headroom for the spikes you expect within 10 minutes; scale down slowly; and keep a minimum number of replicas warm. Faster cold starts let you run leaner.</li>
+  </ol></details>
+</div>
+
+<h2 id="concurrency">1. Concurrency, not requests per second</h2>
+<p>Web services are often sized in requests per second. LLM replicas are better sized in <strong>concurrency</strong>: the number of requests being processed at the same moment, because that is what fills the batch and the KV cache. Little's law links the two:</p>
+<div class="formula">requests in flight = arrival rate × average time in the system</div>
+<div class="box ex">
+  <span class="lbl">Worked example</span>
+  <p>20 requests per second, each taking 6 s end to end (a 0.4 s TTFT and 200 tokens at 28 ms). In flight: 20 × 6 = 120. If one replica meets the SLO at up to 32 concurrent requests (from the load test in chapter 6.1), you need ⌈120 ÷ 32⌉ = 4 replicas, and more with headroom. If answers double in length, the same 20 requests per second need twice the concurrency and twice the replicas.</p>
+</div>
+<p>The <strong>concurrency target</strong> per replica comes from benchmarks, not from the engine's maximum. <code>max-num-seqs</code> (chapter 3.2) caps how many requests an engine will run; the target is how many it can run while meeting your SLOs, usually lower. The two must match: an autoscaler that thinks a replica handles 64 requests while the engine queues everything above 32 will scale too late.</p>
+<p>Capacity is also bounded by KV memory: concurrency × average context × KV bytes per token must fit in the KV pool (chapter 2.4). For Llama 3.1 8B on an H100 with about 62 GB for KV at 128 KiB per token, contexts of 2,048 tokens allow about 230 sequences; contexts of 16K, about 29.</p>
+
+<h2 id="signals">2. What to scale on</h2>
+<div class="tbl"><table>
+<tr><th>Signal</th><th>Type</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Requests in flight per replica</td><td>Traffic</td><td>Leads demand; matches the concurrency target</td><td>Ignores request size: ten 100K-token prompts are not ten chat turns</td></tr>
+<tr><td>Queue length / waiting requests (<code>vllm:num_requests_waiting</code>)</td><td>Traffic</td><td>Direct sign of overload</td><td>Non-zero only once you are already behind</td></tr>
+<tr><td>Tokens in flight, or prefill tokens waiting</td><td>Traffic</td><td>Accounts for long prompts</td><td>Needs custom metrics</td></tr>
+<tr><td>KV cache usage (<code>vllm:kv_cache_usage_perc</code>)</td><td>Utilization</td><td>Shows memory pressure before preemption</td><td>Prefix caching keeps it high even when idle in some engines</td></tr>
+<tr><td>GPU utilization</td><td>Utilization</td><td>Easy to collect</td><td>Lags; saturates early; says little about headroom (chapter 5.1)</td></tr>
+<tr><td>Latency (p95 TTFT or TPOT)</td><td>Outcome</td><td>What users feel</td><td>Reacts only after the SLO is already at risk</td></tr>
+</table></div>
+<p>Practical policy: scale up on a traffic signal (requests or tokens in flight per replica against the concurrency target), and use queue length and latency as guard rails that trigger faster scale-up. Traffic signals lead; utilization lags. In Kubernetes this usually means the Horizontal Pod Autoscaler or KEDA reading the engine's Prometheus metrics, or a platform's own autoscaler.</p>
+
+<h2 id="params">3. The five parameters</h2>
+<div class="tbl"><table>
+<tr><th>Parameter</th><th>Meaning</th><th>Raising it</th></tr>
+<tr><td>Minimum replicas</td><td>Always running, whatever the traffic</td><td>Fewer cold starts, more idle cost</td></tr>
+<tr><td>Maximum replicas</td><td>Upper bound (budget or quota)</td><td>Survives bigger spikes, higher worst-case bill</td></tr>
+<tr><td>Autoscaling window</td><td>How long traffic is averaged before deciding</td><td>Steadier decisions, slower reaction to spikes</td></tr>
+<tr><td>Scale-down delay</td><td>How long demand must stay low before removing a replica</td><td>Less flapping, more spend after traffic falls</td></tr>
+<tr><td>Concurrency target (with headroom)</td><td>Requests per replica the autoscaler aims for</td><td>Fewer replicas, higher latency risk</td></tr>
+</table></div>
+<p>Cold-start time (chapter 6.2) is the hidden sixth parameter: a replica requested now serves traffic only after it starts. Headroom (aiming for, say, 80% of the concurrency target) buys time for that.</p>
+<div class="widget" id="asW">
+  <div class="wt">Interactive: one day of autoscaling</div>
+  <div class="ws">Simulated demand (requests in flight) over 24 hours with a daily cycle and two bursts. The autoscaler averages demand over the window, asks for enough replicas to keep each at the target × headroom, waits the cold start before new replicas serve, and removes replicas only after the scale-down delay. Grey: demand. Teal: serving capacity. Red marks: minutes with more demand than capacity.</div>
+  <div class="ctrls">
+    <label>Concurrency target <input type="number" id="asT" value="16" min="4" max="64" style="width:56px"></label>
+    <label>Headroom: <span class="mono" id="asHv"></span><input type="range" id="asH" min="0.5" max="1" step="0.05" value="0.8"></label>
+    <label>Window (min): <span class="mono" id="asWv"></span><input type="range" id="asWin" min="1" max="30" step="1" value="5"></label>
+    <label>Scale-down delay (min): <span class="mono" id="asDv"></span><input type="range" id="asD" min="0" max="120" step="5" value="15"></label>
+    <label>Cold start (min): <span class="mono" id="asCv"></span><input type="range" id="asC" min="1" max="20" step="1" value="6"></label>
+    <label>Min replicas <input type="number" id="asM" value="2" min="0" max="10" style="width:50px"></label>
+  </div>
+  <div class="svgwrap"><svg id="asSvg" viewBox="0 0 680 240" width="680" style="max-width:100%;height:auto" role="img" aria-label="Demand and capacity over a day"></svg></div>
+  <div class="stats" id="asStats"></div>
+</div>
+<p>Try shrinking the cold start from 6 to 1 minute: over-capacity minutes fall with almost no extra cost. That is why cold-start work (chapter 6.2) is an autoscaling investment. Then raise the scale-down delay to 60 minutes: fewer flaps, more replica-hours.</p>
+
+<h2 id="zero">4. Scale to zero, and when not to</h2>
+<p>Scale to zero removes every replica when there is no traffic and starts one when a request arrives. It needs fast cold starts and a queue that holds requests until a replica is ready. It suits development, internal tools used in business hours, and scheduled batch jobs. For a latency-sensitive product with light, unpredictable traffic, each "first request" waits a full cold start; the Kiely book's advice is that if you rely on scale to zero there, a pay-per-token API may be the better choice until traffic grows.</p>
+
+<h2 id="components">5. Scaling compound systems</h2>
+<p>Real products chain several models and CPU stages: speech-to-text, an LLM, text-to-speech; or retrieval, reranking and generation; plus CPU-heavy pre- and post-processing. Packaging them as one unit forces them to scale together, which leaves expensive GPUs idle while CPU stages run. Anyscale reports that production AI workloads often run well below 50% sustained GPU utilization for this reason. Scale each component on its own signal and hardware (a small GPU or MIG slice for a classifier, a full node for the LLM, CPUs for preprocessing), but keep them in the same cluster to avoid extra network hops.</p>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Predictive and scheduled scaling</span>
+  <p>When traffic follows a daily or weekly pattern, scaling ahead of time (from a forecast or a schedule) hides cold starts entirely. Reactive scaling then only handles deviations from the forecast.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Scaling disaggregated and multi-node replicas</span>
+  <p>With prefill/decode disaggregation (chapter 4.6), prefill and decode pools scale on different signals (queued prompt tokens and TTFT vs running sequences, KV usage and TPOT). Multi-node replicas (chapter 4.5) scale in large steps that must be provisioned as a group; leader/worker abstractions (for example LeaderWorkerSet in Kubernetes) treat them as one unit.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Load shedding</span>
+  <p>When demand exceeds even the maximum replicas, accepting every request makes everyone's latency terrible. Admission control (rejecting or deferring low-priority requests early, as Mooncake does with prediction-based early rejection) keeps the SLO for the requests you do accept (chapter 6.4).</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Scaling on GPU utilization alone.</li>
+  <li>A concurrency target taken from the engine's maximum instead of the measured SLO knee.</li>
+  <li>No headroom with multi-minute cold starts.</li>
+  <li>Scale-down delays so short that replicas flap during normal fluctuations.</li>
+  <li>Counting only ready replicas in cost, not starting ones.</li>
+  <li>Scaling a multi-stage pipeline as one container.</li>
+  <li>Scale to zero for a latency-sensitive product with sparse traffic.</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<p><strong>Goal:</strong> size replicas from measurements and tune an autoscaling policy for bursty traffic.</p>
+<h3>Part A: size by hand</h3>
+<p>Traffic: 50 requests per second, 2,000 input and 300 output tokens. Your load test (chapter 6.1) says one replica meets p95 TTFT under 1 s and p95 TPOT under 40 ms up to 48 concurrent requests, with a typical request taking 0.5 s TTFT plus 300 × 30 ms. How many replicas at 80% headroom? How many if outputs grow to 900 tokens?</p>
+<details><summary>Answer</summary><p>Time per request: 0.5 + 300 × 0.03 = 9.5 s. In flight: 50 × 9.5 = 475. Per replica at 80%: 48 × 0.8 = 38.4. Replicas: ⌈475 ÷ 38.4⌉ = 13. With 900 tokens: 0.5 + 27 = 27.5 s, 1,375 in flight, 36 replicas. Output length drives concurrency; also check that 48 sequences of up to 2,900 tokens fit in the KV pool.</p></details>
+<h3>Part B: an autoscaling simulator (CPU, seconds)</h3>
+<pre>import math, random
+random.seed(3)
+def demand(minute):                     # requests in flight each minute: daily cycle + two bursts
+    base = 60 + 50 * math.sin((minute / 1440 - 0.3) * 2 * math.pi)
+    burst = 120 if 600 &lt;= minute &lt; 615 else 0
+    burst += 80 if 1100 &lt;= minute &lt; 1130 else 0
+    return max(0, base + burst + random.gauss(0, 6))
+
+def simulate(target=16, headroom=0.8, window=5, down_delay=15, cold_start=6, min_r=2, max_r=20):
+    ready, starting, hist, last_high = min_r, [], [], 0
+    over, gpu_min = 0, 0
+    for m in range(1440):
+        d = demand(m); hist.append(d)
+        ready += sum(1 for s in starting if s == m); starting = [s for s in starting if s &gt; m]
+        avg = sum(hist[-window:]) / len(hist[-window:])
+        # TODO: want = replicas needed for avg at target * headroom, clipped to [min_r, max_r]
+        have = ready + len(starting)
+        if want &gt;= ready: last_high = m
+        if want &gt; have:                                  # new replicas serve after the cold start
+            starting += [m + cold_start] * (want - have)
+        elif want &lt; ready and m - last_high &gt;= down_delay:
+            ready -= 1
+        if d &gt; ready * target: over += 1
+        gpu_min += ready + len(starting)                 # starting replicas cost money too
+    return over, gpu_min / 60
+
+for cfg in [dict(), dict(headroom=1.0), dict(window=1), dict(window=15),
+            dict(cold_start=1), dict(cold_start=15), dict(down_delay=60)]:
+    over, gh = simulate(**cfg)
+    print(f"{str(cfg) or 'default':24s} minutes over capacity {over:4d}   replica-hours {gh:6.1f}")</pre>
+<details><summary>Solution</summary>
+<pre>        want = min(max_r, max(min_r, math.ceil(avg / (target * headroom))))</pre></details>
+<details><summary>What we measured, and why</summary><pre class="out">default                  minutes over capacity   18   replica-hours  141.7
+{'headroom': 1.0}        minutes over capacity  132   replica-hours  117.4
+{'window': 1}            minutes over capacity   14   replica-hours  153.2
+{'window': 15}           minutes over capacity   38   replica-hours  137.5
+{'cold_start': 1}        minutes over capacity   10   replica-hours  140.6
+{'cold_start': 15}       minutes over capacity   39   replica-hours  142.4
+{'down_delay': 60}       minutes over capacity   18   replica-hours  154.9</pre>
+<p>No headroom saves 17% of the cost but runs over capacity for more than two hours. A 1-minute window reacts faster but chases noise (more replica-hours). Long cold starts double the over-capacity time at the same cost; short ones cut it. A long scale-down delay costs 9% more for no gain here. Now design a policy for the bursts: keep the default cost within 10% and get over-capacity minutes under 10.</p></details>
+<h3>Part C: autoscaling signals from a real engine (T4)</h3>
+<p>Run vLLM on a T4 and a load ramp with the benchmark client from chapter 6.1. Scrape <code>/metrics</code> every second and plot <code>vllm:num_requests_running</code>, <code>vllm:num_requests_waiting</code>, <code>vllm:kv_cache_usage_perc</code> and GPU utilization (from <code>nvidia-smi</code>) against time. Which signal rises first when the load passes the knee? Which would you use for scale-up, and which as a guard rail?</p>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Autoscaling in production</span>
+  <ul>
+    <li><strong>Inference platforms</strong> scale on concurrency per replica with configurable windows, delays and minimum replicas, and invest heavily in cold starts because they set how lean a fleet can run.</li>
+    <li><strong>Kubernetes stacks</strong> use KEDA or custom metrics adapters on engine metrics (waiting requests, KV usage), and gateways that queue during scale-up.</li>
+    <li><strong>Large services</strong> mix reserved baseline capacity with on-demand and spot capacity for peaks (chapter 6.5).</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz63"></div>
+<script type="application/json" id="qz63">[
+{"q":"15 requests per second, 4 s each. Requests in flight:","o":["3.75","60","19","4"],"a":1,"e":"Little's law: 15 × 4 = 60."},
+{"q":"The concurrency target per replica should come from:","o":["max-num-seqs","The load test's SLO knee","GPU memory size","The number of CPUs"],"a":1,"e":"It is the concurrency that still meets latency targets."},
+{"q":"Which signal leads demand rather than lagging it?","o":["GPU utilization","Requests or tokens in flight","Power draw","Temperature"],"a":1,"e":"Traffic signals move as soon as requests arrive."},
+{"q":"Raising the scale-down delay mainly:","o":["Reduces cost","Reduces flapping at the cost of paying for replicas after traffic falls","Shortens cold starts","Raises the concurrency target"],"a":1,"e":"It trades spend for stability."},
+{"q":"Why does a shorter cold start reduce cost at the same SLO?","o":["Cheaper GPUs","You can keep less headroom and scale down more confidently","It lowers TPOT","It raises max replicas"],"a":1,"e":"Replicas arrive in time, so fewer need to wait idle."},
+{"q":"A pipeline has CPU preprocessing and a GPU model in one container. The fix:","o":["Bigger GPUs","Scale the stages separately on their own resources","More CPU threads in the container","Scale to zero"],"a":1,"e":"Otherwise GPUs sit allocated while CPU stages run."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>Size replicas by concurrency (Little's law) using the measured SLO knee per replica, and check KV capacity for your context lengths.</li>
+  <li>Scale on leading traffic signals; use queue length and latency as guard rails; treat GPU utilization as a lagging hint.</li>
+  <li>Minimum and maximum replicas, window, scale-down delay and target with headroom trade cost against latency; cold-start time sets how much headroom you need.</li>
+  <li>Scale to zero only where first-request latency does not matter.</li>
+  <li>Scale compound pipelines per component, in one cluster.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, sections 7.2 to 7.2.5</td><td>Traffic vs utilization signals, the autoscaling parameters, batching and concurrency, cold starts, scale to zero, independent component scaling.</td></tr>
+<tr><td><a href="https://www.anyscale.com/blog/gpu-in-efficiency-in-ai-workloads">Anyscale: GPU (in)efficiency in AI workloads</a></td><td>Why monolithic containers leave GPUs underused, and disaggregated multi-stage execution.</td></tr>
+<tr><td><a href="https://keda.sh/">KEDA</a> and <a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/">Kubernetes HPA</a></td><td>Event-driven and metric-driven autoscaling in Kubernetes.</td></tr>
+<tr><td><a href="https://docs.vllm.ai/en/latest/usage/metrics/">vLLM: Metrics</a></td><td>The running, waiting and KV usage metrics used for scaling.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2407.00079">Mooncake</a></td><td>Prediction-based early rejection under overload.</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 23</td><td>A 24-hour autoscaling simulation and cold-start breakdown.</td></tr>
+</table></div>
+<h3>Notes on sources</h3>
+<ul>
+  <li>The day 23 README of <em>100 Days of Inference</em> estimates about 90 concurrent requests for Llama 3 8B with about 62 GB of KV memory at 2,048 tokens. With the correct 128 KiB per token (GQA, 8 KV heads), it is about 230; the README's figure matches the incorrect 512 KB per token noted in chapter 3.3.</li>
+</ul>
+<p class="note">Facts checked on 7 November 2026. Part B was run with Python 3.13.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+function rng(seed){let s=seed>>>0;return()=>{s=(s*1664525+1013904223)>>>0;return s/4294967296;};}
+let D=null;function dem(){const r=rng(3);const g=()=>{let u=0,v=0;while(!u)u=r();v=r();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);};D=[];for(let m=0;m<1440;m++){let b=60+50*Math.sin((m/1440-0.3)*2*Math.PI);if(m>=600&&m<615)b+=120;if(m>=1100&&m<1130)b+=80;D.push(Math.max(0,b+g()*6));}}
+dem();
+function as(){const T=+$('asT').value,H=+$('asH').value,W=+$('asWin').value,DD=+$('asD').value,C=+$('asC').value,MN=+$('asM').value,MX=40;
+  $('asHv').textContent=H.toFixed(2);$('asWv').textContent=W;$('asDv').textContent=DD;$('asCv').textContent=C;
+  let ready=Math.max(MN,1),starting=[],last=0,over=0,gm=0;const cap=[],ov=[];
+  for(let m=0;m<1440;m++){ready+=starting.filter(s=>s===m).length;starting=starting.filter(s=>s>m);
+    const lo=Math.max(0,m-W+1);let a=0;for(let i=lo;i<=m;i++)a+=D[i];a/=(m-lo+1);
+    const want=Math.min(MX,Math.max(MN,Math.ceil(a/(T*H))));const have=ready+starting.length;
+    if(want>=ready)last=m;if(want>have){for(let i=0;i<want-have;i++)starting.push(m+C);}else if(want<ready&&m-last>=DD)ready--;
+    cap.push(ready*T);if(D[m]>ready*T){over++;ov.push(m);}gm+=ready+starting.length;}
+  const svg=$('asSvg');svg.innerHTML='';const x0=40,x1=655,y0=210,y1=10;const mx=Math.max(...D,...cap)*1.05;const X=m=>x0+m/1440*(x1-x0),Y=v=>y0-v/mx*(y0-y1);
+  for(let h=0;h<=24;h+=4){el('line',{x1:X(h*60),x2:X(h*60),y1:y0,y2:y0+4,stroke:css('--ink2')},svg);el('text',{x:X(h*60),y:y0+18,'text-anchor':'middle',fill:css('--ink2'),'font-size':10},svg,h+':00');}
+  let d1='',d2='';D.forEach((v,m)=>{d1+=(m?'L':'M')+X(m).toFixed(1)+','+Y(v).toFixed(1);});cap.forEach((v,m)=>{d2+=(m?'L':'M')+X(m).toFixed(1)+','+Y(v).toFixed(1);});
+  el('path',{d:d1,fill:'none',stroke:css('--mute'),'stroke-width':1},svg);el('path',{d:d2,fill:'none',stroke:css('--kv'),'stroke-width':2},svg);
+  ov.forEach(m=>el('rect',{x:X(m),y:y0-6,width:1.5,height:6,fill:css('--bad')},svg));
+  $('asStats').innerHTML=[['Minutes over capacity',over],['Replica-hours',(gm/60).toFixed(1)],['Peak replicas',Math.max(...cap)/T]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['asT','asH','asWin','asD','asC','asM'].forEach(id=>$(id).addEventListener('input',as));IE.onTheme(as);
+})();
+</script>
+
+</body>
+</html>

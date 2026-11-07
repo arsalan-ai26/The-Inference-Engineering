@@ -263,7 +263,7 @@ window.IE_CHAPTERS = [
 "title": "Autoscaling and concurrency",
 "slug": "6-3-autoscaling",
 "part": 6,
-"ready": false
+"ready": true
 },
 {
 "n": "6.4",
