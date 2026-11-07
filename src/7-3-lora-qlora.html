@@ -1,0 +1,237 @@
+<div class="kicker">Part 7 · Fine-tuning and post-training · Chapter 7.3</div>
+<h1>LoRA and QLoRA</h1>
+<p class="lede">Full fine-tuning updates every weight and needs memory for gradients and optimizer state on all of them: about 16 bytes per parameter, so an 8B model needs well over 100 GB. LoRA freezes the model and trains two small matrices per layer whose product is the update, cutting trainable parameters by orders of magnitude. QLoRA goes further by storing the frozen model in 4 bits, which puts an 8B fine-tune on a free Colab T4. This chapter does the memory arithmetic for each method, explains rank, alpha and target modules, summarizes when LoRA matches full fine-tuning, and runs a real LoRA training job.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 hours with the lab</span>
+  <span class="chip">Needs: 1.3, 1.5, 4.1, 7.2</span>
+  <span class="chip">Compute: Colab CPU (Part C: Colab T4)</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>A weight matrix is 4,096 × 14,336. How many parameters does a rank-16 LoRA adapter for it add?</li>
+    <li>Roughly how much GPU memory does QLoRA fine-tuning of an 8B model need at 2,048 tokens, batch 1? Does it fit a 16 GB T4?</li>
+    <li>Does a merged LoRA model run slower than the base model?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>16 × (4,096 + 14,336) = 294,912, against 58.7 million in the matrix: 0.5%.</li>
+    <li>About 7 GB by the lab's estimate (4-bit weights about 4.1 GB, adapters and their optimizer state, checkpointed activations and fp32 logits), plus CUDA overhead. Yes, it fits.</li>
+    <li>No. Merging adds B × A into W once; the result has the same shape and cost as the base model. Serving the adapter separately (unmerged) adds a small cost (chapter 7.6).</li>
+  </ol></details>
+</div>
+
+<h2 id="full">1. Why full fine-tuning is expensive</h2>
+<p>Training with AdamW in mixed precision keeps, for every trainable parameter: the weight in BF16 (2 bytes), its gradient (2 bytes), an FP32 master copy (4 bytes) and Adam's two moment estimates (8 bytes): about 16 bytes. On top come activations saved for the backward pass and the logits.</p>
+<div class="formula">full fine-tuning memory ≈ 16 × parameters + activations + logits</div>
+<p>For Llama 3.1 8B that is about 128 GB before activations: several GPUs and sharded optimizer state. And each fine-tuned copy is a full model to store and serve.</p>
+
+<h2 id="lora">2. LoRA: train a low-rank update</h2>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>LoRA (low-rank adaptation):</strong> keep the pretrained weight W (d × k) frozen and learn an update ΔW = B × A, where B is d × r and A is r × k with a small <strong>rank</strong> r. The layer computes W x + (α ÷ r) × B (A x).</p>
+  <p><strong>Alpha (α):</strong> a scaling factor for the update; the effective scale is α ÷ r.</p>
+  <p><strong>Target modules:</strong> the linear layers that get adapters, such as the attention projections (q, k, v, o) and the MLP projections (gate, up, down).</p>
+  <p><strong>Merging:</strong> adding (α ÷ r) × B × A into W after training, giving a normal model with no extra cost at inference.</p>
+</div>
+<div class="svgwrap"><svg id="loSvg" viewBox="0 0 680 200" width="680" style="max-width:100%;height:auto" role="img" aria-label="LoRA adds a low-rank path next to a frozen weight"></svg></div>
+<p>A is initialized randomly and B with zeros, so training starts exactly at the pretrained model. Trainable parameters per matrix: r × (d + k) instead of d × k. The LoRA paper reports, for GPT-3 175B, 10,000 times fewer trainable parameters and 3 times less GPU memory than full fine-tuning with Adam, with on-par or better quality and no added inference latency once merged.</p>
+<div class="formula">LoRA memory ≈ 2 × parameters (frozen BF16) + 16 × adapter parameters + activations + logits</div>
+
+<h2 id="settings">3. Rank, alpha, targets and learning rate</h2>
+<p>Thinking Machines' "LoRA Without Regret" ran systematic comparisons with full fine-tuning (FullFT) and found:</p>
+<ul>
+  <li><strong>LoRA matches FullFT</strong> in sample efficiency and final quality on post-training-sized datasets, when a few details are right. On datasets larger than the adapter's capacity, it learns more slowly.</li>
+  <li><strong>Apply it to all layers, especially the MLP</strong> (and MoE) layers, which hold most parameters. Attention-only LoRA underperformed even with matched parameter counts; adding attention on top of MLP-only gave no further benefit.</li>
+  <li><strong>The best learning rate is about 10 times the FullFT rate</strong>, for both supervised learning and RL.</li>
+  <li><strong>LoRA is less tolerant of large batch sizes</strong> than FullFT in some settings, independent of rank.</li>
+  <li><strong>For RL, very low ranks suffice</strong>, even rank 1, because each episode carries only a few bits of information.</li>
+  <li><strong>Compute:</strong> LoRA uses slightly more than two thirds of FullFT's FLOPs per pass (no gradient for the frozen weights).</li>
+</ul>
+<p>Other practical points: Raschka suggests α = 2 × r as a starting heuristic; ranks from 8 to 64 are common for SFT; and runs are surprisingly consistent across seeds, so a single run is informative.</p>
+
+<h2 id="qlora">4. QLoRA: a 4-bit frozen base</h2>
+<p>QLoRA stores the frozen base model in 4 bits and backpropagates through it into BF16 LoRA adapters. The paper fine-tuned a 65B model on one 48 GB GPU while preserving 16-bit fine-tuning quality, using three ideas:</p>
+<ul>
+  <li><strong>NF4 (4-bit NormalFloat):</strong> 16 quantization levels placed for normally distributed weights (chapter 4.1's block scales, with levels chosen by quantiles).</li>
+  <li><strong>Double quantization:</strong> the block scales are themselves quantized, cutting their overhead from 0.5 to about 0.127 bits per parameter.</li>
+  <li><strong>Paged optimizers:</strong> optimizer state moves to CPU memory during memory spikes instead of crashing.</li>
+</ul>
+<p>The cost is time: every forward and backward pass dequantizes the weights. Raschka measured 33% memory savings for 39% longer training on a 7B model. Kernel libraries such as Unsloth reduce that overhead.</p>
+<div class="widget" id="lmemW">
+  <div class="wt">Interactive: will this fine-tune fit?</div>
+  <div class="ws">Estimated peak memory with gradient checkpointing (layer inputs kept, one layer recomputed at a time) and FP32 logits. Real runs add CUDA context and allocator overhead of about 1 to 2 GB. LoRA here targets all seven linear layers per block.</div>
+  <div class="ctrls">
+    <label>Model <select id="lmM"><option value="q05">Qwen2.5-0.5B</option><option value="q15" selected>Qwen2.5-1.5B</option><option value="l8">Llama 3.1 8B</option><option value="l70">Llama 3.1 70B</option></select></label>
+    <label>Method <select id="lmMe"><option value="full">Full fine-tuning</option><option value="lora">LoRA</option><option value="qlora" selected>QLoRA</option></select></label>
+    <label>Rank <select id="lmR"><option>8</option><option selected>16</option><option>64</option><option>256</option></select></label>
+    <label>Sequence length <select id="lmS"><option>512</option><option>1024</option><option selected>2048</option><option>8192</option></select></label>
+    <label>Batch <select id="lmB"><option selected>1</option><option>2</option><option>4</option><option>8</option></select></label>
+    <label>GPU <select id="lmG"><option value="16">T4 16 GB</option><option value="24">L4 / RTX 4090 24 GB</option><option value="80">H100 80 GB</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="lmSvg" viewBox="0 0 680 80" width="680" style="max-width:100%;height:auto" role="img" aria-label="Memory breakdown bar"></svg></div>
+  <div class="stats" id="lmStats"></div>
+</div>
+
+<h2 id="what">5. What fine-tuning learns, and what it does not</h2>
+<p>The lab trains a rank-16 adapter on 16 made-up facts ("the support code for region K is ZX-110") for 30 steps. The model learns the answer format perfectly and quickly, yet gives the wrong code for a region it was trained on. Small SFT runs teach behaviour and format much faster than they store facts: the same lesson as chapter 7.1, now from your own run. For facts, use retrieval; if they must live in the weights, it takes many more examples and paraphrases, and you must test recall on held-out phrasings.</p>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Capacity: when does rank limit learning?</span>
+  <p>Thinking Machines frames LoRA capacity in information terms: neural networks store about 2 bits per parameter, so an adapter is capacity-limited only when the dataset holds more information than its parameters can absorb. Post-training datasets usually do not; large continued-pretraining corpora do, which is where full fine-tuning keeps an edge.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Variants</span>
+  <p>Many LoRA variants exist (DoRA, rsLoRA, LoRA+, PiSSA and others, available in PEFT) that change the scaling, initialization or learning rates of A and B. The findings above about all-layer targeting and the 10 times learning rate matter more than the variant in most practical runs.</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Attention-only targets.</li>
+  <li>Using the full fine-tuning learning rate for LoRA (about 10 times too low).</li>
+  <li>Ignoring the logits: with a 128K or 150K vocabulary, FP32 logits for long sequences take gigabytes.</li>
+  <li>Expecting QLoRA to be as fast as LoRA.</li>
+  <li>Merging an adapter trained on a 4-bit base into BF16 weights without re-checking quality (the adapter learned to correct the quantized weights).</li>
+  <li>Testing only on training prompts, so failures to recall facts go unseen.</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<h3>Part A: estimate before you train</h3>
+<pre>def est(P, h, L, f, kv, V, r=16, seq=2048, batch=1, method="lora"):
+    adapter = r * L * (9 * h + 2 * kv + 3 * f)           # LoRA on q, k, v, o, gate, up, down
+    weights = {"full": 2 * P, "lora": 2 * P, "qlora": P * (4 + 0.127) / 8}[method]
+    states = 14 * P if method == "full" else 16 * adapter # grads + fp32 master + Adam (full: weights counted above)
+    acts = 2 * seq * batch * h * L + 34 * seq * batch * h # checkpointed layer inputs + one layer recomputed
+    logits = 4 * seq * batch * V                          # fp32 logits for the loss
+    return (weights + states + acts + logits) / 1e9, adapter
+models = {"Qwen2.5-1.5B": (1.54e9, 1536, 28, 8960, 256, 151936), "Llama-3.1-8B": (8.03e9, 4096, 32, 14336, 1024, 128256)}
+for name, cfg in models.items():
+    for m in ["full", "lora", "qlora"]:
+        gb, ad = est(*cfg, method=m)
+        print(f"{name:13s} {m:5s} ≈ {gb:6.1f} GB  (r=16 adapter {ad/1e6:.0f} M parameters)")</pre>
+<details><summary>What we computed</summary><pre class="out">Qwen2.5-1.5B  full  ≈   26.2 GB  (r=16 adapter 18 M parameters)
+Qwen2.5-1.5B  lora  ≈    4.9 GB  (r=16 adapter 18 M parameters)
+Qwen2.5-1.5B  qlora ≈    2.6 GB  (r=16 adapter 18 M parameters)
+Llama-3.1-8B  full  ≈  130.4 GB  (r=16 adapter 42 M parameters)
+Llama-3.1-8B  lora  ≈   18.6 GB  (r=16 adapter 42 M parameters)
+Llama-3.1-8B  qlora ≈    6.7 GB  (r=16 adapter 42 M parameters)</pre>
+<p>The activation term uses the per-layer formula from Korthikanti et al. (34 bytes per token per hidden unit for the parts other than attention scores, which FlashAttention avoids storing); Llama-style blocks differ in detail, so treat these as estimates to compare with Part C.</p></details>
+<h3>Part B: count adapter parameters and train one (CPU, about 2 minutes)</h3>
+<pre>import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name)
+model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", task_type="CAUSAL_LM"))
+model.print_trainable_parameters()
+facts = [(f"What is the support code for region {c}?", f"The support code for region {c} is ZX-{100+i}.")
+         for i, c in enumerate("ABCDEFGHIJKLMNOP")]
+def encode(q, a):                                     # assistant-only labels, as in chapter 7.2
+    p = tok.apply_chat_template([{"role": "user", "content": q}], tokenize=False, add_generation_prompt=True)
+    pi = tok(p, add_special_tokens=False)["input_ids"]; ai = tok(a + "&lt;|im_end|&gt;", add_special_tokens=False)["input_ids"]
+    return pi + ai, [-100] * len(pi) + ai
+data = [encode(q, a) for q, a in facts]
+opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=2e-4)
+for step in range(30):
+    items = [data[(step * 4 + k) % len(data)] for k in range(4)]
+    L = max(len(x) for x, _ in items)
+    ids = torch.tensor([x + [tok.pad_token_id] * (L - len(x)) for x, _ in items])
+    lab = torch.tensor([y + [-100] * (L - len(y)) for _, y in items])
+    att = torch.tensor([[1] * len(x) + [0] * (L - len(x)) for x, _ in items])
+    loss = model(input_ids=ids, attention_mask=att, labels=lab).loss
+    loss.backward(); opt.step(); opt.zero_grad()
+    if step % 5 == 0: print(step, round(loss.item(), 3))
+# then ask about region K with the adapter on, and inside `with model.disable_adapter():`</pre>
+<p>Predict first: after 30 steps, will the model answer "ZX-110" for region K?</p>
+<details><summary>What we measured (2 CPU cores, 78 s for 30 steps)</summary><pre class="out">attention only     r=  8: trainable   1.08 M = 0.22% of 494 M
+attention only     r= 64: trainable   8.65 M = 1.75% of 494 M
+all linear layers  r=  8: trainable   4.40 M = 0.89% of 494 M
+all linear layers  r= 64: trainable  35.19 M = 7.12% of 494 M
+step  0 loss 1.804
+step  5 loss 0.200
+step 10 loss 0.236
+step 15 loss 0.254
+step 20 loss 0.204
+step 25 loss 0.191
+step 29 loss 0.186
+after training: The support code for region K is ZX-105.
+adapter off:    The support code for region K (Kazakhstan) is 1234567</pre>
+<p>The parameter counts match the formula exactly (r × layers × (9h + 2kv + 3f) = 4.40 M at r = 8). The loss fell from 1.8 to about 0.19 in five steps and then stalled: the format was learned at once, the numbers were not. With the adapter on, the answer has the trained format but the wrong code (ZX-105 instead of ZX-110); with it off, the base model makes something up. Try 200 steps, a higher rank, and paraphrased questions, and see how slowly exact recall improves.</p></details>
+<h3>Part C: QLoRA on a Colab T4</h3>
+<p>Fine-tune Qwen2.5-1.5B-Instruct (or Llama 3.1 8B) with QLoRA using an Unsloth or TRL plus PEFT notebook at 2,048 tokens, batch 1. Record <code>torch.cuda.max_memory_allocated()</code> after a few steps and compare with Part A. Then switch to LoRA in BF16 (FP16 on a T4) and compare memory and seconds per step. Expect the measured QLoRA peak within a couple of gigabytes of the estimate, and QLoRA slower per step than LoRA when both fit.</p>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">LoRA in practice</span>
+  <ul>
+    <li><strong>Most open-model fine-tuning</strong> outside large labs uses LoRA or QLoRA on one GPU.</li>
+    <li><strong>Platforms</strong> serve many customer adapters on one base model (chapter 7.6).</li>
+    <li><strong>RL post-training</strong> increasingly uses LoRA, since low ranks carry the few bits RL provides.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz73"></div>
+<script type="application/json" id="qz73">[
+{"q":"Bytes per parameter for full fine-tuning with AdamW in mixed precision:","o":["2","4","About 16","64"],"a":2,"e":"Weights, gradients, FP32 master copy and two Adam moments."},
+{"q":"Trainable parameters of a rank-r LoRA on a d × k matrix:","o":["d × k","r × (d + k)","r²","d + k"],"a":1,"e":"B is d × r and A is r × k."},
+{"q":"Which targets worked best in LoRA Without Regret?","o":["Attention only","All layers, especially the MLP","Embeddings only","The output head"],"a":1,"e":"Attention-only underperformed even at matched parameter counts."},
+{"q":"The best LoRA learning rate relative to full fine-tuning is about:","o":["The same","10 times higher","10 times lower","100 times lower"],"a":1,"e":"Consistent across SFT and RL in their runs."},
+{"q":"QLoRA's double quantization reduces:","o":["Activation memory","The overhead of the quantization scales","Gradient size","Context length"],"a":1,"e":"From 0.5 to about 0.127 bits per parameter."},
+{"q":"Why did the lab's adapter give the right format but the wrong code?","o":["A bug in PEFT","Small SFT runs learn format much faster than they store facts","The learning rate was zero","The template was wrong"],"a":1,"e":"Use retrieval for facts."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>Full fine-tuning costs about 16 bytes per parameter plus activations; LoRA trains r × (d + k) parameters per matrix on a frozen base.</li>
+  <li>Target all linear layers, use about 10 times the full fine-tuning learning rate, watch large batch sizes; low ranks suffice for RL.</li>
+  <li>QLoRA stores the base in NF4 with double quantization and trades speed for memory; an 8B QLoRA fits a 16 GB GPU.</li>
+  <li>Merged adapters cost nothing at inference; fine-tuning teaches behaviour faster than facts.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://arxiv.org/abs/2106.09685">Hu et al., LoRA: Low-Rank Adaptation of Large Language Models</a></td><td>The method, initialization, scaling and GPT-3 memory results.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2305.14314">Dettmers et al., QLoRA</a></td><td>NF4, double quantization, paged optimizers; 65B on one 48 GB GPU.</td></tr>
+<tr><td><a href="https://thinkingmachines.ai/blog/lora/">Thinking Machines, LoRA Without Regret</a></td><td>When LoRA matches full fine-tuning; targets, learning rate, batch size, RL and compute.</td></tr>
+<tr><td><a href="https://huggingface.co/docs/peft/index">Hugging Face PEFT</a></td><td>The library used in the lab, with LoRA and its variants.</td></tr>
+<tr><td><a href="https://docs.unsloth.ai/">Unsloth documentation</a></td><td>Optimized single-GPU LoRA and QLoRA, with Colab notebooks for Part C.</td></tr>
+<tr><td><a href="https://magazine.sebastianraschka.com/p/practical-tips-for-finetuning-llms">Sebastian Raschka, Practical Tips for Finetuning LLMs Using LoRA</a></td><td>QLoRA's memory and runtime trade-off, alpha heuristic, rank choice.</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2205.05198">Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models</a></td><td>The per-layer activation memory formula used in the estimates.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. Part B measured on 2 CPU cores with PyTorch 2.15, Transformers 5.22 and PEFT 0.21; Part C is an exercise with expected results.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {$,el,css}=IE;
+function lo(){const s=$('loSvg');s.innerHTML='';
+  const box=(x,y,w,h,f,st,t,t2)=>{el('rect',{x,y,width:w,height:h,rx:6,fill:css(f),stroke:css(st)},s);el('text',{x:x+w/2,y:y+h/2+(t2?-2:4),'text-anchor':'middle','font-size':12,'font-weight':600,fill:css('--ink')},s,t);if(t2)el('text',{x:x+w/2,y:y+h/2+14,'text-anchor':'middle','font-size':10,fill:css('--ink2')},s,t2);};
+  const d=el('defs',{},s),m=el('marker',{id:'loA',viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto'},d);el('path',{d:'M0,0 L10,5 L0,10 z',fill:css('--ink2')},m);
+  const ar=(x1,y1,x2,y2)=>el('line',{x1,y1,x2,y2,stroke:css('--ink2'),'stroke-width':1.5,'marker-end':'url(#loA)'},s);
+  box(10,80,70,40,'--panel2','--line','x','input');
+  box(150,20,170,60,'--panel2','--mute','W (frozen)','d × k, e.g. 4096 × 14336');
+  box(150,120,75,60,'--pre-s','--pre','A','r × k');
+  box(245,120,75,60,'--pre-s','--pre','B','d × r, zeros');
+  box(380,80,170,40,'--good-s','--good','W x + (α/r) B A x','');
+  box(590,80,80,40,'--panel2','--line','output','');
+  ar(80,95,148,55);ar(80,105,148,150);ar(225,150,243,150);ar(320,50,378,92);ar(320,150,378,110);ar(550,100,588,100);
+  el('text',{x:345,y:196,'text-anchor':'middle','font-size':10.5,fill:css('--pre')},s,'trainable: r × (d + k) = 294,912 at r = 16 (0.5% of W)');}
+IE.onTheme(lo);
+const M={q05:[0.494e9,896,24,4864,128,151936],q15:[1.54e9,1536,28,8960,256,151936],l8:[8.03e9,4096,32,14336,1024,128256],l70:[70.6e9,8192,80,28672,1024,128256]};
+function lmem(){const [P,h,L,f,kv,V]=M[$('lmM').value],me=$('lmMe').value,r=+$('lmR').value,S=+$('lmS').value,B=+$('lmB').value,G=+$('lmG').value;
+  const ad=r*L*(9*h+2*kv+3*f);const w=me==='qlora'?P*(4.127)/8:2*P;const st=me==='full'?14*P:16*ad;const ac=2*S*B*h*L+34*S*B*h;const lg=4*S*B*V;
+  const parts=[['Weights',w,'--pre'],['Grads + optimizer',st,'--dec'],['Activations',ac,'--kv'],['Logits',lg,'--bad']];const tot=parts.reduce((a,p)=>a+p[1],0)/1e9;
+  const s=$('lmSvg');s.innerHTML='';const mx=Math.max(tot,G)*1.05;const X=v=>10+v/mx*660;let x=10;
+  parts.forEach(p=>{const wd=p[1]/1e9/mx*660;el('rect',{x,y:12,width:Math.max(0,wd),height:26,fill:css(p[2])},s);x+=wd;});
+  el('line',{x1:X(G),x2:X(G),y1:4,y2:46,stroke:css('--ink'),'stroke-width':2,'stroke-dasharray':'4 3'},s);
+  el('text',{x:Math.min(X(G),600),y:62,'text-anchor':'middle','font-size':10.5,fill:css('--ink')},s,G+' GB GPU');
+  let lx=10;parts.forEach(p=>{el('rect',{x:lx,y:68,width:10,height:10,fill:css(p[2])},s);el('text',{x:lx+14,y:77,'font-size':10,fill:css('--ink2')},s,p[0]);lx+=140;});
+  const fits=tot+1.5<=G;
+  $('lmStats').innerHTML=[['Estimated peak',tot.toFixed(1)+' GB'],['Trainable parameters',me==='full'?(P/1e9).toFixed(2)+' B':(ad/1e6).toFixed(1)+' M'],['Fits with ~1.5 GB overhead',fits?'Yes':'No']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['lmM','lmMe','lmR','lmS','lmB','lmG'].forEach(id=>$(id).addEventListener('input',lmem));IE.onTheme(lmem);
+})();
+</script>

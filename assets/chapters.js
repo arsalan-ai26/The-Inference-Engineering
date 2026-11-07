@@ -333,7 +333,7 @@ window.IE_CHAPTERS = [
 "title": "LoRA and QLoRA",
 "slug": "7-3-lora-qlora",
 "part": 7,
-"ready": false
+"ready": true
 },
 {
 "n": "7.4",
