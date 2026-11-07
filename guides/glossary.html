@@ -32,6 +32,7 @@
 <div class="ge"><dt>All-to-all</dt><dd>every GPU sends a different piece to every other GPU. <a class="chref" href="../chapters/4-5-model-parallelism.html">Chapter 4.5</a></dd></div>
 <div class="ge"><dt>Alpha (α)</dt><dd>a scaling factor for the update; the effective scale is α ÷ r. <a class="chref" href="../chapters/7-3-lora-qlora.html">Chapter 7.3</a></dd></div>
 <div class="ge"><dt>Arithmetic intensity</dt><dd>(of an operation): its FLOPs ÷ the bytes it must read and write. <a class="chref" href="../chapters/2-5-inference-arithmetic.html">Chapter 2.5</a></dd></div>
+<div class="ge"><dt>Attention-FFN disaggregation (AFD)</dt><dd>Running attention and the feed-forward or MoE layers of the same model on separate GPU pools, passing activations between them each layer (Step-3, MegaScale-Infer). <a class="chref" href="../chapters/4-5-model-parallelism.html">Chapter 4.5</a></dd></div>
 <div class="ge"><dt>Attention sink</dt><dd>The first few tokens of a sequence, which receive large attention weights regardless of content. Keeping them makes sliding-window attention stable. <a class="chref" href="../chapters/4-2-efficient-attention.html">Chapter 4.2</a></dd></div>
 <div class="ge"><dt>Attention weight</dt><dd>how much one token reads from another. The weights for one query add up to 1. <a class="chref" href="../chapters/2-2-attention.html">Chapter 2.2</a></dd></div>
 <div class="ge"><dt>AWQ (activation-aware weight quantization)</dt><dd>A weight-only quantization method that scales up the small share of weight channels that see large activations before rounding, protecting the weights that matter most. <a class="chref" href="../chapters/4-1-quantization.html">Chapter 4.1</a></dd></div>
@@ -51,6 +52,7 @@
 <div class="ge"><dt>Cache-aware routing</dt><dd>Sending a request to the replica most likely to hold its prefix in the KV cache, balanced against that replica's load. <a class="chref" href="../chapters/4-4-kv-reuse.html">Chapter 4.4</a></dd></div>
 <div class="ge"><dt>Cache salt</dt><dd>A per-tenant value mixed into prefix-cache block hashes so only requests with the same salt can share cached KV blocks. <a class="chref" href="../chapters/6-9-fault-tolerance-security.html">Chapter 6.9</a></dd></div>
 <div class="ge"><dt>Canary deployment</dt><dd>Sending a small share of traffic to a new version, watching its metrics, and raising the share in steps or rolling back. <a class="chref" href="../chapters/6-5-capacity-cost.html">Chapter 6.5</a></dd></div>
+<div class="ge"><dt>Cascade attention (shared-prefix attention)</dt><dd>Computing attention over a prefix shared by many sequences once per decode step, with all their queries in one matrix product, then merging with per-sequence suffix attention (Hydragen). <a class="chref" href="../chapters/4-4-kv-reuse.html">Chapter 4.4</a></dd></div>
 <div class="ge"><dt>Catastrophic forgetting</dt><dd>Loss of skills that are not in the fine-tuning data, such as general instruction following, after training on a narrow task. <a class="chref" href="../chapters/7-2-sft-data.html">Chapter 7.2</a></dd></div>
 <div class="ge"><dt>Causal encoder-decoder (CED)</dt><dd>V4.1-Flash's layout of its 40 layers into a 20-layer causal encoder and a 20-layer decoder, where the decoder layers' global KV is projected from the last encoder layer's hidden state instead of each layer's own. Prefill needs only the encoder, so it activates 8B parameters per token against 16B in decode. <a class="chref" href="../chapters/4-8-deepseek-inference-stack.html">Chapter 4.8</a></dd></div>
 <div class="ge"><dt>Causal mask</dt><dd>A mask that stops each token attending to later tokens, so a token's output depends only on itself and earlier tokens. <a class="chref" href="../chapters/2-2-attention.html">Chapter 2.2</a></dd></div>
@@ -64,6 +66,7 @@
 <div class="ge"><dt>Compute-bound</dt><dd>the math units are the bottleneck. Time ≈ FLOPs ÷ achievable FLOP/s. Faster math (more tensor cores, lower precision) helps; nothing else does. <a class="chref" href="../chapters/5-1-compute-memory-overhead.html">Chapter 5.1</a></dd></div>
 <div class="ge"><dt>Compute capability</dt><dd>a version number for the GPU's architecture. T4 is 7.5, A100 8.0, L4 8.9, H100 9.0, B200 10.0. Software must include code compiled for your GPU's capability. <a class="chref" href="../chapters/1-6-remote-gpu-setup.html">Chapter 1.6</a></dd></div>
 <div class="ge"><dt>Concurrency target</dt><dd>The number of simultaneous requests one replica should handle while meeting the SLO. Autoscalers scale on it. <a class="chref" href="../chapters/6-3-autoscaling.html">Chapter 6.3</a></dd></div>
+<div class="ge"><dt>Confidence-scheduled verification</dt><dd>Choosing per request how many draft tokens to verify from their predicted acceptance probabilities and the engine's cost curve, instead of a fixed draft length. <a class="chref" href="../chapters/4-3-speculative-decoding.html">Chapter 4.3</a></dd></div>
 <div class="ge"><dt>Confidential VM</dt><dd>a virtual machine whose memory is encrypted with keys held inside the CPU, so the host operating system and hypervisor cannot read it (Intel TDX, AMD SEV-SNP). <a class="chref" href="../chapters/6-7-case-studies-clusters.html">Chapter 6.7</a></dd></div>
 <div class="ge"><dt>Constrained decoding (structured output)</dt><dd>Masking the logits at each step so only tokens that keep the output valid for a grammar or JSON schema can be sampled. <a class="chref" href="../chapters/3-5-prefix-caching-structured-output.html">Chapter 3.5</a></dd></div>
 <div class="ge"><dt>Container</dt><dd>a running instance of an image with a thin writable layer that disappears when it stops. <a class="chref" href="../chapters/6-2-packaging-startup.html">Chapter 6.2</a></dd></div>
@@ -78,9 +81,12 @@
 <div class="ge"><dt>CUDA toolkit</dt><dd>the compiler (<code>nvcc</code>) and headers. You need it only to compile CUDA code yourself, for example some custom kernels or packages built from source. <a class="chref" href="../chapters/1-6-remote-gpu-setup.html">Chapter 1.6</a></dd></div>
 </dl>
 <h2 id="l-d">D</h2><dl class="gl">
+<div class="ge"><dt>Data-parallel attention (attention DP)</dt><dd>Each GPU runs full attention for its own subset of requests and holds only their KV cache, while MoE layers use expert parallelism across the same GPUs. Avoids KV duplication for MLA. <a class="chref" href="../chapters/4-5-model-parallelism.html">Chapter 4.5</a></dd></div>
 <div class="ge"><dt>Data parallelism</dt><dd>each GPU holds a copy of the model and processes different data; gradients are averaged with all-reduce. <a class="chref" href="../chapters/7-7-training-systems.html">Chapter 7.7</a></dd></div>
 <div class="ge"><dt>DCGM (Data Center GPU Manager)</dt><dd>NVIDIA's tool for GPU health and performance metrics, exported to Prometheus with dcgm-exporter. <a class="chref" href="../chapters/6-6-observability-correctness.html">Chapter 6.6</a></dd></div>
 <div class="ge"><dt>Decode</dt><dd>The phase that makes output tokens one at a time, each step reading all weights and the KV cache. Usually memory-bound. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
+<div class="ge"><dt>DeepEP</dt><dd>DeepSeek's library of all-to-all dispatch and combine kernels for expert parallelism over NVLink and RDMA. Version 1 had high-throughput (prefill) and low-latency (decode) kernels; version 2 unified them in one EPBuffer interface. <a class="chref" href="../chapters/4-5-model-parallelism.html">Chapter 4.5</a></dd></div>
+<div class="ge"><dt>Delta rule</dt><dd>A linear-attention update that first reads what the state returns for a key and writes only the difference, so new information replaces old along that key. Gated DeltaNet adds a forgetting gate. <a class="chref" href="../chapters/2-7-frontier-architectures.html">Chapter 2.7</a></dd></div>
 <div class="ge"><dt>Derivative</dt><dd>how much an output changes when you change one input by a tiny amount. If dL/dw = 3, increasing w by 0.001 increases L by about 0.003. <a class="chref" href="../chapters/1-5-neural-nets.html">Chapter 1.5</a></dd></div>
 <div class="ge"><dt>Disaggregated serving</dt><dd>prefill and decode run on separate engines, usually separate GPUs or nodes. <a class="chref" href="../chapters/4-6-disaggregation.html">Chapter 4.6</a></dd></div>
 <div class="ge"><dt>Distillation</dt><dd>training a smaller student to imitate a larger teacher (chapter 7.5). <a class="chref" href="../chapters/7-1-post-training-landscape.html">Chapter 7.1</a></dd></div>
@@ -88,6 +94,7 @@
 <div class="ge"><dt>Drafter (speculator, proposer)</dt><dd>anything that cheaply guesses the next tokens: a small model, extra heads, or a lookup in earlier text. <a class="chref" href="../chapters/4-3-speculative-decoding.html">Chapter 4.3</a></dd></div>
 <div class="ge"><dt>Draft length k</dt><dd>how many tokens are guessed per round (vLLM: <code>num_speculative_tokens</code>). <a class="chref" href="../chapters/4-3-speculative-decoding.html">Chapter 4.3</a></dd></div>
 <div class="ge"><dt>Driver</dt><dd>the low-level software that talks to the GPU. It is installed on the machine by the provider. It sets the highest CUDA version you can use. <a class="chref" href="../chapters/1-6-remote-gpu-setup.html">Chapter 1.6</a></dd></div>
+<div class="ge"><dt>DSpark</dt><dd>DeepSeek-V4.1-Flash's speculative decoding module: a three-block drafter that proposes five tokens, plus a confidence head whose predicted acceptance rates decide how many drafts each request verifies. <a class="chref" href="../chapters/4-8-deepseek-inference-stack.html">Chapter 4.8</a></dd></div>
 </dl>
 <h2 id="l-e">E</h2><dl class="gl">
 <div class="ge"><dt>E2E (end-to-end latency)</dt><dd>the full request time. <a class="chref" href="../chapters/2-4-kv-cache.html">Chapter 2.4</a></dd></div>
@@ -95,6 +102,7 @@
 <div class="ge"><dt>Element</dt><dd>one item in a vector. In code, <code>v[0]</code> is the first element. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
 <div class="ge"><dt>Embedding</dt><dd>The learned vector for a token ID, looked up from the embedding table at the start of the model. <a class="chref" href="../chapters/2-1-tokenization.html">Chapter 2.1</a></dd></div>
 <div class="ge"><dt>Encode / decode</dt><dd>text to IDs, and IDs back to text. <a class="chref" href="../chapters/2-1-tokenization.html">Chapter 2.1</a></dd></div>
+<div class="ge"><dt>EPLB (expert-parallel load balancer)</dt><dd>DeepSeek's algorithm for choosing which experts to replicate and where: a hierarchical policy (expert groups to nodes, then within nodes) for prefill and a global policy for wide decode. <a class="chref" href="../chapters/4-5-model-parallelism.html">Chapter 4.5</a></dd></div>
 <div class="ge"><dt>Erlang C</dt><dd>The queueing formula for c identical servers with random arrivals, used to estimate waiting time at a given utilization. <a class="chref" href="../chapters/6-4-routing-queueing.html">Chapter 6.4</a></dd></div>
 <div class="ge"><dt>Error budget</dt><dd>the failures the SLO allows (here 1% of requests). <a class="chref" href="../chapters/6-6-observability-correctness.html">Chapter 6.6</a></dd></div>
 <div class="ge"><dt>Evidence label</dt><dd>a tag on every number: <strong>measured</strong> (you ran it, with the config and raw data), <strong>simulated</strong> (from a model or simulator you built, with its assumptions), <strong>estimated</strong> (arithmetic from specifications), or <strong>quoted</strong> (from a source, with the reference). <a class="chref" href="../chapters/8-5-final-capstone.html">Chapter 8.5</a></dd></div>
@@ -151,6 +159,8 @@
 <h2 id="l-l">L</h2><dl class="gl">
 <div class="ge"><dt>LeaderWorkerSet</dt><dd>A Kubernetes API that treats a leader pod and its worker pods as one replica, for models sharded across nodes. <a class="chref" href="../chapters/6-7-case-studies-clusters.html">Chapter 6.7</a></dd></div>
 <div class="ge"><dt>Learning rate</dt><dd>the step size. Too small: training is slow. Too large: the loss jumps around or explodes. <a class="chref" href="../chapters/1-5-neural-nets.html">Chapter 1.5</a></dd></div>
+<div class="ge"><dt>Lightning attention</dt><dd>MiniMax's blockwise linear attention, which passes the running state between blocks of tokens; used in 7 of every 8 layers of MiniMax-01 and M1. <a class="chref" href="../chapters/2-7-frontier-architectures.html">Chapter 2.7</a></dd></div>
+<div class="ge"><dt>Lightning indexer</dt><dd>A small, cheap scoring network in DeepSeek Sparse Attention that scores every earlier token (or compressed entry) for each query, so real attention runs only on the top-k. Can run in FP8 or FP4. <a class="chref" href="../chapters/4-2-efficient-attention.html">Chapter 4.2</a></dd></div>
 <div class="ge"><dt>LLM-as-a-judge</dt><dd>using a model to score outputs against a rubric or to compare two outputs. <a class="chref" href="../chapters/7-6-evaluating-serving-finetuned.html">Chapter 7.6</a></dd></div>
 <div class="ge"><dt>Log</dt><dd>a timestamped record of one event, such as a request finishing or a configuration change. Shows <em>what</em> happened in detail. <a class="chref" href="../chapters/6-6-observability-correctness.html">Chapter 6.6</a></dd></div>
 <div class="ge"><dt>Logit</dt><dd>the raw score the model gives one token. It can be any real number. A higher logit means "more likely next". <a class="chref" href="../chapters/1-2-probability-sampling.html">Chapter 1.2</a></dd></div>
@@ -206,6 +216,7 @@
 <div class="ge"><dt>Per-channel and group-wise scales</dt><dd>One quantization scale per output channel, or per group of consecutive weights (for example 128). Smaller groups follow outliers better at the cost of storing more scales. <a class="chref" href="../chapters/4-1-quantization.html">Chapter 4.1</a></dd></div>
 <div class="ge"><dt>Persistent KV</dt><dd>the part of the KV cache stored after a request ends (on SSD or in host memory) so later requests with the same prefix can skip prefill (chapter 4.4). <a class="chref" href="../chapters/4-8-deepseek-inference-stack.html">Chapter 4.8</a></dd></div>
 <div class="ge"><dt>Piecewise CUDA graphs</dt><dd>Capturing CUDA graphs for the parts of a model step between operations that cannot be captured (such as some attention kernels), as vLLM does. <a class="chref" href="../chapters/5-7-compilation-cuda-graphs.html">Chapter 5.7</a></dd></div>
+<div class="ge"><dt>Ping-pong pipelining</dt><dd>Splitting a batch into micro-batches that alternate between an attention pool and an expert pool so both stay busy, as in MegaScale-Infer. <a class="chref" href="../chapters/4-5-model-parallelism.html">Chapter 4.5</a></dd></div>
 <div class="ge"><dt>Pipeline parallelism</dt><dd>Splitting a model by layers across GPUs or nodes; each stage passes activations to the next. <a class="chref" href="../chapters/4-5-model-parallelism.html">Chapter 4.5</a></dd></div>
 <div class="ge"><dt>Pod</dt><dd>Kubernetes' unit of deployment, one or more containers scheduled together on one node. <a class="chref" href="../chapters/6-7-case-studies-clusters.html">Chapter 6.7</a></dd></div>
 <div class="ge"><dt>Policy</dt><dd>the model being trained, viewed as a rule that picks the next token. <a class="chref" href="../chapters/7-4-preference-rl.html">Chapter 7.4</a></dd></div>
@@ -222,12 +233,14 @@
 </dl>
 <h2 id="l-q">Q</h2><dl class="gl">
 <div class="ge"><dt>QAT (quantization-aware training)</dt><dd>train with the low precision simulated, so the weights adapt to it. <a class="chref" href="../chapters/4-1-quantization.html">Chapter 4.1</a></dd></div>
+<div class="ge"><dt>QK-Clip</dt><dd>Kimi K2's fix for Muon training instability: after each update, rescale the query and key projection weights so attention logits stay bounded (MuonClip). <a class="chref" href="../chapters/7-7-training-systems.html">Chapter 7.7</a></dd></div>
 <div class="ge"><dt>Quantization</dt><dd>Storing weights, activations or the KV cache in fewer bits (for example INT8, FP8, INT4) to cut memory and bandwidth, at some accuracy risk. <a class="chref" href="../chapters/1-3-number-formats.html">Chapter 1.3</a></dd></div>
 <div class="ge"><dt>Query (q)</dt><dd>what this token is looking for. <a class="chref" href="../chapters/2-2-attention.html">Chapter 2.2</a></dd></div>
 </dl>
 <h2 id="l-r">R</h2><dl class="gl">
 <div class="ge"><dt>Radix tree (prefix tree)</dt><dd>A tree keyed by token sequences. SGLang's RadixAttention uses it to find the longest cached prefix of a new request. <a class="chref" href="../chapters/3-5-prefix-caching-structured-output.html">Chapter 3.5</a></dd></div>
 <div class="ge"><dt>Readiness and liveness probes</dt><dd>Health checks: liveness asks whether the process should be restarted; readiness asks whether it can receive traffic now. <a class="chref" href="../chapters/6-2-packaging-startup.html">Chapter 6.2</a></dd></div>
+<div class="ge"><dt>Redundant experts</dt><dd>Extra copies of frequently used MoE experts placed on other GPUs, so no single GPU becomes the straggler under expert parallelism. Placed by observed load (EPLB). <a class="chref" href="../chapters/4-5-model-parallelism.html">Chapter 4.5</a></dd></div>
 <div class="ge"><dt>Reference model</dt><dd>a frozen copy of the starting policy (usually the SFT checkpoint). A <strong>KL penalty</strong> keeps the policy's probabilities close to it. <a class="chref" href="../chapters/7-4-preference-rl.html">Chapter 7.4</a></dd></div>
 <div class="ge"><dt>Registers</dt><dd>the fastest storage, private to each thread. <a class="chref" href="../chapters/5-2-gpu-architecture.html">Chapter 5.2</a></dd></div>
 <div class="ge"><dt>Registry</dt><dd>where images are stored and pulled from. <a class="chref" href="../chapters/6-2-packaging-startup.html">Chapter 6.2</a></dd></div>
@@ -254,6 +267,7 @@
 <div class="ge"><dt>Scalar</dt><dd>one number, for example 0.7. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
 <div class="ge"><dt>Scale to zero</dt><dd>Removing all replicas of an idle deployment, accepting a cold start for the next request. <a class="chref" href="../chapters/6-3-autoscaling.html">Chapter 6.3</a></dd></div>
 <div class="ge"><dt>Scale-up domain</dt><dd>the set of GPUs connected by the fast in-node or in-rack fabric (NVLink, or Huawei's unified bus); a supernode is a large one, such as a 64-GPU or 72-GPU rack. <a class="chref" href="../chapters/4-8-deepseek-inference-stack.html">Chapter 4.8</a></dd></div>
+<div class="ge"><dt>Selective batching</dt><dd>Orca's technique of batching the operations that ignore sequence boundaries (linear layers over a flat token list) while running attention per request; the basis of continuous batching. <a class="chref" href="../chapters/3-2-batching-scheduling.html">Chapter 3.2</a></dd></div>
 <div class="ge"><dt>SFT (supervised fine-tuning)</dt><dd>training on example conversations so the model imitates the assistant's replies. <a class="chref" href="../chapters/7-1-post-training-landscape.html">Chapter 7.1</a></dd></div>
 <div class="ge"><dt>Shape</dt><dd>the size of each dimension, written as a list. [2, 8, 4096] means 2 × 8 × 4,096 numbers. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
 <div class="ge"><dt>Shared memory (SMEM)</dt><dd>fast on-chip memory shared by the threads of one block. <a class="chref" href="../chapters/5-2-gpu-architecture.html">Chapter 5.2</a></dd></div>
@@ -305,6 +319,7 @@
 <h2 id="l-v">V</h2><dl class="gl">
 <div class="ge"><dt>Value (v)</dt><dd>the information this token passes on when another token attends to it. <a class="chref" href="../chapters/2-2-attention.html">Chapter 2.2</a></dd></div>
 <div class="ge"><dt>Vector</dt><dd>an ordered list of numbers, for example [0.2, −1.3, 0.5]. The number of items is its <strong>dimension</strong> or <strong>length</strong>. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
+<div class="ge"><dt>VE/prefill/decode disaggregation (EPD)</dt><dd>Running the vision encoder, prefill and decode of a multimodal model as three separately scaled pools. <a class="chref" href="../chapters/4-6-disaggregation.html">Chapter 4.6</a></dd></div>
 <div class="ge"><dt>Verification</dt><dd>one target forward pass over the k draft tokens. <a class="chref" href="../chapters/4-3-speculative-decoding.html">Chapter 4.3</a></dd></div>
 <div class="ge"><dt>Vocabulary</dt><dd>the full list of tokens the model knows. Chapter 2.1 explains how text becomes tokens. <a class="chref" href="../chapters/1-2-probability-sampling.html">Chapter 1.2</a></dd></div>
 </dl>
@@ -314,6 +329,7 @@
 <div class="ge"><dt>Weight matrix</dt><dd>a matrix of learned numbers inside a model layer. <a class="chref" href="../chapters/1-1-linear-algebra.html">Chapter 1.1</a></dd></div>
 <div class="ge"><dt>Weight-only quantization</dt><dd>weights are stored in low precision and converted back (dequantized) to 16-bit inside the matmul kernel. The math runs in 16-bit. <a class="chref" href="../chapters/4-1-quantization.html">Chapter 4.1</a></dd></div>
 <div class="ge"><dt>Weight (w)</dt><dd>a learned number that says how much one input matters. <a class="chref" href="../chapters/1-5-neural-nets.html">Chapter 1.5</a></dd></div>
+<div class="ge"><dt>Wide-EP</dt><dd>Expert parallelism over a large group (for example 64 to 128 GPUs in one supernode) for decode, so each expert sees enough tokens and each GPU reads fewer expert weights. <a class="chref" href="../chapters/4-8-deepseek-inference-stack.html">Chapter 4.8</a></dd></div>
 <div class="ge"><dt>WxAy</dt><dd>weights stored in x bits, activations (the inputs to each matmul) in y bits. W4A16 is weight-only quantization; W8A8 quantizes both. <a class="chref" href="../chapters/4-1-quantization.html">Chapter 4.1</a></dd></div>
 </dl>
 <h2 id="l-x">X</h2><dl class="gl">
@@ -322,6 +338,7 @@
 </dl>
 <h2 id="l-z">Z</h2><dl class="gl">
 <div class="ge"><dt>ZeRO and FSDP (fully sharded data parallelism)</dt><dd>data parallelism that shards optimizer state (ZeRO-1), also gradients (ZeRO-2), and also the weights themselves (ZeRO-3, FSDP) across the GPUs, gathering weights just in time for each layer. <a class="chref" href="../chapters/7-7-training-systems.html">Chapter 7.7</a></dd></div>
+<div class="ge"><dt>Zero-computation expert</dt><dd>An MoE routing slot that returns its input unchanged at no cost, so the number of real experts (and active parameters) varies per token, as in LongCat-Flash. <a class="chref" href="../chapters/2-6-dense-vs-moe.html">Chapter 2.6</a></dd></div>
 <div class="ge"><dt>Zero point</dt><dd>An offset stored with a quantization scale so that an asymmetric range of values (for example −0.2 to 1.5) maps onto the integer grid without wasting levels. <a class="chref" href="../chapters/4-1-quantization.html">Chapter 4.1</a></dd></div>
 </dl>
 <h2 id="refs">References</h2><p>Definitions are condensed from the chapters of this book; each chapter's own references list the sources behind them.</p>

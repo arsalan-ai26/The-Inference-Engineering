@@ -573,5 +573,90 @@
   "Slot mapping",
   "The position of each token's keys and values in a paged KV cache: block table entry p // block size, offset p % block size.",
   "8.3"
+ ],
+ [
+  "Lightning indexer",
+  "A small, cheap scoring network in DeepSeek Sparse Attention that scores every earlier token (or compressed entry) for each query, so real attention runs only on the top-k. Can run in FP8 or FP4.",
+  "4.2"
+ ],
+ [
+  "Redundant experts",
+  "Extra copies of frequently used MoE experts placed on other GPUs, so no single GPU becomes the straggler under expert parallelism. Placed by observed load (EPLB).",
+  "4.5"
+ ],
+ [
+  "EPLB (expert-parallel load balancer)",
+  "DeepSeek's algorithm for choosing which experts to replicate and where: a hierarchical policy (expert groups to nodes, then within nodes) for prefill and a global policy for wide decode.",
+  "4.5"
+ ],
+ [
+  "DeepEP",
+  "DeepSeek's library of all-to-all dispatch and combine kernels for expert parallelism over NVLink and RDMA. Version 1 had high-throughput (prefill) and low-latency (decode) kernels; version 2 unified them in one EPBuffer interface.",
+  "4.5"
+ ],
+ [
+  "Data-parallel attention (attention DP)",
+  "Each GPU runs full attention for its own subset of requests and holds only their KV cache, while MoE layers use expert parallelism across the same GPUs. Avoids KV duplication for MLA.",
+  "4.5"
+ ],
+ [
+  "Attention-FFN disaggregation (AFD)",
+  "Running attention and the feed-forward or MoE layers of the same model on separate GPU pools, passing activations between them each layer (Step-3, MegaScale-Infer).",
+  "4.5"
+ ],
+ [
+  "Ping-pong pipelining",
+  "Splitting a batch into micro-batches that alternate between an attention pool and an expert pool so both stay busy, as in MegaScale-Infer.",
+  "4.5"
+ ],
+ [
+  "Zero-computation expert",
+  "An MoE routing slot that returns its input unchanged at no cost, so the number of real experts (and active parameters) varies per token, as in LongCat-Flash.",
+  "2.6"
+ ],
+ [
+  "DSpark",
+  "DeepSeek-V4.1-Flash's speculative decoding module: a three-block drafter that proposes five tokens, plus a confidence head whose predicted acceptance rates decide how many drafts each request verifies.",
+  "4.8"
+ ],
+ [
+  "Confidence-scheduled verification",
+  "Choosing per request how many draft tokens to verify from their predicted acceptance probabilities and the engine's cost curve, instead of a fixed draft length.",
+  "4.3"
+ ],
+ [
+  "Selective batching",
+  "Orca's technique of batching the operations that ignore sequence boundaries (linear layers over a flat token list) while running attention per request; the basis of continuous batching.",
+  "3.2"
+ ],
+ [
+  "Delta rule",
+  "A linear-attention update that first reads what the state returns for a key and writes only the difference, so new information replaces old along that key. Gated DeltaNet adds a forgetting gate.",
+  "2.7"
+ ],
+ [
+  "Lightning attention",
+  "MiniMax's blockwise linear attention, which passes the running state between blocks of tokens; used in 7 of every 8 layers of MiniMax-01 and M1.",
+  "2.7"
+ ],
+ [
+  "QK-Clip",
+  "Kimi K2's fix for Muon training instability: after each update, rescale the query and key projection weights so attention logits stay bounded (MuonClip).",
+  "7.7"
+ ],
+ [
+  "Cascade attention (shared-prefix attention)",
+  "Computing attention over a prefix shared by many sequences once per decode step, with all their queries in one matrix product, then merging with per-sequence suffix attention (Hydragen).",
+  "4.4"
+ ],
+ [
+  "Wide-EP",
+  "Expert parallelism over a large group (for example 64 to 128 GPUs in one supernode) for decode, so each expert sees enough tokens and each GPU reads fewer expert weights.",
+  "4.8"
+ ],
+ [
+  "VE/prefill/decode disaggregation (EPD)",
+  "Running the vision encoder, prefill and decode of a multimodal model as three separately scaled pools.",
+  "4.6"
  ]
 ]
