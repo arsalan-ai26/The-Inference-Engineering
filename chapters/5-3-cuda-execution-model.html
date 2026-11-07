@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>5.3 The CUDA execution model</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="5.3">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 5 · Chapter 5.3</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 5 · GPUs, hardware and kernels · Chapter 5.3</div>
+<h1>The CUDA execution model</h1>
+<p class="lede">Chapter 5.2 described the hardware. This chapter describes how software uses it: a program on the CPU launches kernels, each kernel runs as a grid of thread blocks, and the CPU and GPU work asynchronously, talking through queues called streams. Most performance surprises in inference engines (idle GPUs, mysterious stalls, slow small models) come from this model, not from the math. You will write two small kernels, see how a launch maps onto the hardware, and learn to find hidden CPU-GPU synchronizations using timing alone.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 5.1, 5.2</span>
+  <span class="chip">Compute: Colab CPU (simulator), then T4</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>A kernel processes 1,000,003 elements with 256 threads per block. How many blocks, and why does the kernel need an <code>if</code>?</li>
+    <li>You time a PyTorch GPU function with <code>time.time()</code> before and after, without synchronizing. What did you measure?</li>
+    <li>Name two PyTorch operations that silently force the CPU to wait for the GPU.</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>⌈1,000,003 ÷ 256⌉ = 3,907 blocks, which is 1,000,192 threads. The last 189 threads have no element, so each thread checks <code>i &lt; n</code> before touching memory.</li>
+    <li>Only how long the CPU took to queue the work. The GPU may still be running.</li>
+    <li>Any two of: <code>.item()</code>, <code>.cpu()</code> or <code>.tolist()</code>, <code>print(gpu_tensor)</code>, Python <code>if</code> on a GPU tensor, boolean-mask indexing, <code>torch.nonzero</code>.</li>
+  </ol></details>
+</div>
+
+<h2 id="kernel">1. Kernels, threads, blocks and grids</h2>
+<p>A <strong>kernel</strong> is a function that runs on the GPU. When the CPU launches it, it says how many threads to start, arranged in two levels:</p>
+<ul>
+  <li>a <strong>block</strong> of threads (up to 1,024), which runs on one SM and can share that SM's shared memory and synchronize internally;</li>
+  <li>a <strong>grid</strong> of blocks, which can be very large and is spread over all the SMs as they become free.</li>
+</ul>
+<p>Every thread runs the same code. It finds out which piece of data is its own from built-in variables:</p>
+<div class="formula">global index i = blockIdx.x × blockDim.x + threadIdx.x</div>
+<p>Here is the classic first kernel in CUDA C++, and the same kernel in Python with Numba. Both compute out = a × x + y.</p>
+<pre>// CUDA C++
+__global__ void scale_add(const float* x, const float* y, float* out, float a, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // which element is mine?
+    if (i &lt; n) out[i] = a * x[i] + y[i];            // guard the overhang
+}
+// launch from the CPU: enough blocks of 256 threads to cover n
+scale_add&lt;&lt;&lt;(n + 255) / 256, 256&gt;&gt;&gt;(x, y, out, 2.0f, n);</pre>
+<p>The launch says nothing about which SM runs which block. The hardware's block scheduler hands blocks to SMs as resources free up, many blocks per SM at a time (chapter 5.2's occupancy), in no guaranteed order. That is why blocks cannot wait for each other inside a kernel: correctness must not depend on block order.</p>
+<div class="widget" id="lgW">
+  <div class="wt">Interactive: how a launch maps onto the GPU</div>
+  <div class="ws">Choose the problem size and the block size. The picture shows the blocks of the grid; the stats show how many waves the GPU needs if each SM holds a fixed number of blocks at once (here, as many as fit by threads, at most 32).</div>
+  <div class="ctrls">
+    <label>Elements n <input type="number" id="lgN" value="100000" min="1" step="1000" style="width:110px"></label>
+    <label>Threads per block <select id="lgT"><option>64</option><option>128</option><option selected>256</option><option>512</option><option>1024</option></select></label>
+    <label>GPU <select id="lgG"><option value="40">T4 (40 SMs)</option><option value="108">A100 (108 SMs)</option><option value="132" selected>H100 (132 SMs)</option></select></label>
+  </div>
+  <div class="svgwrap"><svg id="lgSvg" viewBox="0 0 680 120" width="680" style="max-width:100%;height:auto" role="img" aria-label="Blocks of a grid"></svg></div>
+  <div class="stats" id="lgStats"></div>
+</div>
+<p>Small problems are a problem for GPUs: 100,000 elements with 256-thread blocks is 391 blocks, enough for about one wave on an H100, and each thread does one multiply-add. The launch overhead (microseconds) can exceed the work. That is the overhead regime of chapter 5.1 seen from the inside.</p>
+
+<h2 id="shared">2. Cooperating inside a block: shared memory and barriers</h2>
+<p>Element-wise kernels need no cooperation. Most interesting kernels do: a sum, a softmax, a tile of a matrix multiply. Threads in a block cooperate through shared memory and a barrier, <code>__syncthreads()</code>, which makes every thread in the block wait until all have reached it.</p>
+<p>A block sum is the standard example: each thread loads one value into shared memory, then the block repeatedly adds the upper half onto the lower half (128 → 64 → ... → 1), with a barrier after every round so no thread reads a slot before it is written. Thread 0 writes the block's partial sum. A second small step adds the partial sums. Part A of the lab runs this kernel. Softmax, RMSNorm and attention kernels are built from the same pattern: a reduction (max, sum of squares, sum of exponentials) followed by an element-wise step.</p>
+<div class="box watch">
+  <span class="lbl">Watch out</span>
+  <p>A <code>__syncthreads()</code> inside an <code>if</code> that only some threads take can hang the block. Barriers must be reached by every thread of the block.</p>
+</div>
+
+<h2 id="async">3. The CPU and GPU work asynchronously</h2>
+<p>When PyTorch runs <code>y = x @ w</code> on a GPU, the CPU does not wait for the multiply. It checks shapes, picks a kernel, puts a launch command on a queue and returns immediately with a tensor whose values do not exist yet. The GPU takes commands from the queue in order and runs them. In a healthy program the CPU runs far ahead, the queue is never empty, and the GPU never waits.</p>
+<div class="box def">
+  <span class="lbl">Definitions</span>
+  <p><strong>Host / device:</strong> the CPU and its memory / the GPU and its memory.</p>
+  <p><strong>Stream:</strong> an ordered queue of GPU work. Work in one stream runs in order; work in different streams may overlap. PyTorch uses one default stream per device unless told otherwise.</p>
+  <p><strong>Synchronization:</strong> the CPU waits until the GPU has finished queued work. Explicit (<code>torch.cuda.synchronize()</code>) or implicit (any operation that needs a GPU value on the CPU).</p>
+  <p><strong>CUDA event:</strong> a marker recorded in a stream; the time between two events is GPU time, measured on the GPU.</p>
+</div>
+<div class="widget" id="tlW">
+  <div class="wt">Interactive: a timeline with and without a hidden synchronization</div>
+  <div class="ws">Twelve GPU kernels of the same length. The CPU needs a short time to launch each one. In the second version, the program reads one GPU value on the CPU (for example <code>.item()</code>) after every kernel.</div>
+  <div class="ctrls">
+    <label>GPU kernel time (µs): <span class="mono" id="tlKv"></span><input type="range" id="tlK" min="2" max="60" step="1" value="20"></label>
+    <label>CPU launch time (µs): <span class="mono" id="tlLv"></span><input type="range" id="tlL" min="2" max="30" step="1" value="8"></label>
+  </div>
+  <div class="svgwrap"><svg id="tlSvg" viewBox="0 0 680 230" width="680" style="max-width:100%;height:auto" role="img" aria-label="CPU and GPU timelines"></svg></div>
+  <div class="stats" id="tlStats"></div>
+</div>
+<p>Make the kernels short (5 µs) and the launch time 8 µs: even without synchronization the GPU idles between kernels, because the CPU cannot launch fast enough. That is launch-bound decode, and the fix is fewer launches (fusion, chapter 5.4) or recording the whole sequence once and replaying it (CUDA graphs, chapter 5.7).</p>
+
+<h2 id="sync">4. Hidden synchronizations</h2>
+<p>Any operation whose result the CPU needs right now forces it to wait for the GPU to finish all queued work. After that, the GPU's queue is empty and it idles until the CPU launches more. In a decode loop, one such call per step can cost a large share of throughput. Common triggers:</p>
+<ul>
+  <li><code>tensor.item()</code>, <code>.tolist()</code>, <code>.cpu()</code>, <code>.numpy()</code>, <code>print(tensor)</code>.</li>
+  <li>Python control flow on a GPU value: <code>if (x &gt; 0).any():</code> calls <code>bool()</code> on a GPU tensor.</li>
+  <li><strong>Dynamic shapes:</strong> operations whose output size depends on GPU data, such as boolean-mask indexing <code>x[mask]</code>, <code>torch.nonzero</code>, slicing with a GPU tensor <code>x[:gpu_n]</code>, or <code>repeat_interleave</code> without <code>output_size</code>. The CPU must learn the size before it can allocate the output.</li>
+  <li>Copies from pageable (non-pinned) CPU memory to the GPU, and many allocator calls when memory is fragmented.</li>
+</ul>
+<p>Engines avoid these by keeping decisions on the GPU (masking instead of indexing), constructing simple tensors directly on the device instead of copying them, deciding shapes on the CPU from information it already has, and doing CPU bookkeeping for step n + 1 while the GPU runs step n. PyTorch can flag synchronizations: <code>torch.cuda.set_sync_debug_mode("warn")</code> (experimental, and it does not catch every case).</p>
+
+<h3>Timing GPU code correctly</h3>
+<pre>start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+start.record()
+y = model(x)                      # queued on the stream
+end.record()
+torch.cuda.synchronize()          # wait until the end event has happened
+print(start.elapsed_time(end), "ms of GPU time")</pre>
+<p>Always warm up first (the first call compiles kernels, allocates memory and fills caches), and time many repetitions.</p>
+
+<h2 id="launch">5. What a kernel launch costs, and how engines avoid paying it</h2>
+<p>Each launch costs CPU time (PyTorch dispatch, argument setup, the driver call) and some GPU-side latency, on the order of microseconds in total. A transformer layer in eager PyTorch launches dozens of kernels; a 32-layer model, over a thousand per decode step. For large batches that is noise; for batch 1 on a fast GPU it can be most of the step (chapter 2.4's GPT-2 lab showed this).</p>
+<p>Three remedies, in increasing order of effect:</p>
+<ol>
+  <li><strong>Fewer, larger kernels:</strong> fusion, by hand or by compiler (chapter 5.4).</li>
+  <li><strong>Less CPU work per launch:</strong> a compiled graph instead of Python (<code>torch.compile</code>, chapter 5.7).</li>
+  <li><strong>CUDA graphs:</strong> record the whole sequence of kernels for a step once, then replay it with a single launch. vLLM and SGLang capture graphs for a set of batch sizes and replay them every decode step (chapters 3.4 and 5.7).</li>
+</ol>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Streams for overlap</span>
+  <p>Work in separate streams can overlap: a copy of the next request's data, a KV block transfer (chapter 4.6) or an all-reduce (chapter 4.5) on one stream while compute runs on another. Engines and communication libraries (NCCL) use dedicated streams for this. Overlap needs pinned host memory for copies and care with dependencies, expressed with events between streams.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Persistent kernels and megakernels</span>
+  <p>Instead of one launch per operation, a persistent kernel launches once with exactly as many blocks as the GPU can hold and loops over work items itself. Pushed to the limit, a "megakernel" runs an entire forward pass in one launch with its own on-GPU scheduler. Research systems have shown large latency gains for small-batch decode this way; it trades flexibility and engineering effort for the last microseconds.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Thread block clusters (Hopper and newer)</span>
+  <p>Hopper adds a level between block and grid: a cluster of blocks scheduled together on nearby SMs that can read each other's shared memory (distributed shared memory). Large GEMM and attention kernels use clusters to share loaded tiles and cut HBM traffic.</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Timing without synchronizing, or without warm-up.</li>
+  <li>Calling <code>.item()</code> or printing a GPU tensor in a hot loop.</li>
+  <li>Boolean-mask indexing on the GPU in a decode path (dynamic shapes).</li>
+  <li>Forgetting the <code>if (i &lt; n)</code> guard and reading past the end of a buffer.</li>
+  <li>A barrier inside a branch that not every thread takes.</li>
+  <li>Assuming blocks run in order, or that two blocks can wait for each other.</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<p><strong>Goal:</strong> write and launch two kernels, then find a hidden synchronization with timing alone.</p>
+<h3>Part A: two kernels in Numba (CPU simulator, then T4)</h3>
+<p>Numba compiles Python functions into CUDA kernels. On a machine without a GPU, set <code>NUMBA_ENABLE_CUDASIM=1</code> before importing Numba to run the same code in a slow CPU simulator, which is handy for checking logic. On a T4, leave it unset.</p>
+<pre>import numpy as np, math
+from numba import cuda, float32
+
+@cuda.jit
+def scale_add(x, y, out, a, n):
+    i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x   # global thread index
+    if i &lt; n:                                                   # the last block may overhang
+        out[i] = a * x[i] + y[i]
+
+TPB = 128
+@cuda.jit
+def block_sum(x, partial, n):
+    buf = cuda.shared.array(TPB, dtype=float32)    # shared by the threads of one block
+    t = cuda.threadIdx.x
+    i = cuda.blockIdx.x * TPB + t
+    buf[t] = x[i] if i &lt; n else 0.0
+    cuda.syncthreads()                             # all slots written
+    s = TPB // 2
+    while s &gt; 0:                                   # TODO: tree reduction.
+        # if t &lt; s: add buf[t + s] into buf[t]; then a barrier for every thread; halve s
+        s //= 2
+    if t == 0:
+        partial[cuda.blockIdx.x] = buf[0]
+
+n = 1003                                           # small for the simulator; use 10_000_000 on a T4
+x = np.random.rand(n).astype(np.float32); y = np.random.rand(n).astype(np.float32)
+dx, dy = cuda.to_device(x), cuda.to_device(y)     # host to device
+dout = cuda.device_array_like(x)
+blocks = math.ceil(n / 256)
+scale_add[blocks, 256](dx, dy, dout, np.float32(2.0), n)   # launch: [grid, block]
+print("scale_add max error", np.abs(dout.copy_to_host() - (2 * x + y)).max())
+
+blocks = math.ceil(n / TPB)
+p = cuda.device_array(blocks, dtype=np.float32)
+block_sum[blocks, TPB](dx, p, n)
+print("block_sum", p.copy_to_host().sum(), "numpy", x.sum())</pre>
+<details><summary>Solution</summary>
+<pre>    while s &gt; 0:
+        if t &lt; s:
+            buf[t] += buf[t + s]
+        cuda.syncthreads()
+        s //= 2</pre>
+<p>Measured in the simulator: scale_add maximum error 0.0; block_sum 500.2174 against NumPy's 500.2174. Now break it on purpose: move <code>cuda.syncthreads()</code> inside the <code>if t &lt; s</code>. On a real GPU this can hang or give wrong sums; explain why from section 2.</p></details>
+<p><strong>On a T4:</strong> time <code>scale_add</code> for n = 10⁴, 10⁶ and 10⁸ with CUDA events (<code>cuda.event()</code> in Numba). Compute achieved GB/s (12 bytes per element). At which size does it approach the T4's 320 GB/s, and what dominates below that?</p>
+
+<h3>Part B: find the hidden synchronization (T4)</h3>
+<p>Two functions do the same GPU work; one contains a synchronization. Find which, using only the time each call takes to <em>return</em> (no profiler).</p>
+<pre>import torch, time
+x = torch.randn(2048, 2048, device="cuda", dtype=torch.float16)
+w = torch.randn(2048, 2048, device="cuda", dtype=torch.float16) / 45
+
+def step_a(y):
+    for _ in range(30):
+        y = torch.relu(y @ w)
+    return y
+
+def step_b(y):
+    for _ in range(30):
+        y = torch.relu(y @ w)
+        if y.abs().max() &gt; 1e4:          # looks harmless
+            break
+    return y
+
+for f in (step_a, step_b):
+    f(x); torch.cuda.synchronize()        # warm up
+    t0 = time.perf_counter(); f(x)
+    t_return = time.perf_counter() - t0   # CPU time until the call returns
+    torch.cuda.synchronize()
+    t_total = time.perf_counter() - t0    # until the GPU has finished
+    print(f.__name__, f"returns after {t_return*1e3:.2f} ms, GPU done after {t_total*1e3:.2f} ms")</pre>
+<details><summary>What to look for, and the fix</summary><p>step_a returns long before the GPU finishes: the CPU queued all 30 matmuls and left. step_b returns only when the GPU is done, and its total time is longer: the <code>if</code> calls <code>bool()</code> on a GPU tensor, so the CPU waits after every matmul and the GPU idles while the next launch is prepared. Confirm by running step_b after <code>torch.cuda.set_sync_debug_mode("warn")</code>. Fix: check once after the loop, or keep the decision on the GPU (for example <code>torch.where</code>), or check only every N steps.</p></details>
+<h3>Part C: launch overhead</h3>
+<p>Time 1,000 calls of <code>t.add_(1)</code> on a 1-element GPU tensor with CUDA events, then 1,000 calls on a 10-million-element tensor. Divide to get the time per call. The first is almost pure launch and dispatch overhead; compare it with the GPU-side time of a decode step of Qwen2.5-0.5B (chapter 2.4) and estimate how many launches such a step can afford.</p>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">The execution model in engines</span>
+  <ul>
+    <li><strong>vLLM and SGLang</strong> keep the scheduler's CPU work off the GPU's critical path, prepare the next step while the current one runs, and replay CUDA graphs for decode.</li>
+    <li><strong>Engine contributions</strong> often remove a single hidden synchronization or host-to-device copy; Modal described fixes of exactly this kind in open-source engines.</li>
+    <li><strong>Speculative decoding and sampling code</strong> is a frequent source of dynamic shapes; contributors use sync debug modes in tests to keep it clean.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz53"></div>
+<script type="application/json" id="qz53">[
+{"q":"What does threadIdx.x give a thread?","o":["Its SM number","Its position within its block","Its warp ID","The grid size"],"a":1,"e":"Combined with blockIdx.x and blockDim.x it gives the global index."},
+{"q":"Why do kernels check if (i < n)?","o":["For speed","The last block may have more threads than remaining elements","CUDA requires it","To avoid divergence"],"a":1,"e":"Grids are whole blocks; the overhang must not read or write out of bounds."},
+{"q":"Which line forces a CPU-GPU synchronization?","o":["y = x @ w","z = torch.relu(y)","n = int(mask.sum())","y.add_(1)"],"a":2,"e":"int() needs the value on the CPU."},
+{"q":"Why can't block 5 wait for block 9 inside a kernel?","o":["It can","Blocks may run in any order, and block 9 may not be scheduled until block 5 finishes","Different warps","Shared memory is too small"],"a":1,"e":"Waiting could deadlock; blocks must be independent."},
+{"q":"What do CUDA graphs remove?","o":["The math","Per-kernel CPU launch overhead, by replaying a recorded sequence with one launch","Memory reads","Synchronizations inside kernels"],"a":1,"e":"The GPU work is the same; the CPU cost per kernel disappears."},
+{"q":"A function returns to Python only after the GPU has finished all its work. This suggests:","o":["Perfect overlap","A synchronization inside it","A compute-bound kernel","CUDA graphs"],"a":1,"e":"Without a sync the CPU returns as soon as work is queued."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>A kernel launch starts a grid of blocks of threads; each thread finds its data from blockIdx, blockDim and threadIdx and guards against overhang.</li>
+  <li>Blocks run on SMs in any order; threads in a block cooperate through shared memory and barriers.</li>
+  <li>The CPU queues work on streams and runs ahead; anything that needs a GPU value on the CPU synchronizes and leaves the GPU idle.</li>
+  <li>Time GPU code with synchronization or CUDA events, after warm-up.</li>
+  <li>Launch overhead is microseconds per kernel; fusion, compilation and CUDA graphs remove it.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://vanshnawander.github.io/vansh/posts/blocks-threads-kernels.html">Vansh Nawander: Blocks, threads and kernels</a></td><td>A step-by-step introduction to the launch hierarchy.</td></tr>
+<tr><td><a href="https://tomasruizt.github.io/posts/08_cpu_gpu_synchronization/">Tomas Ruiz: CPU-GPU synchronization</a></td><td>How synchronizations look in Nsight Systems, dynamic shapes as a trigger, and sync debug mode in tests.</td></tr>
+<tr><td><a href="https://modal.com/blog/host-overhead-inference-efficiency">Modal: Host overhead and inference efficiency</a></td><td>Host overhead in production engines and fixes: avoiding transfers, fusion and CUDA graphs.</td></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 4.1</td><td>CUDA's components: kernels, graphs, driver and runtime.</td></tr>
+<tr><td>Hwu, Kirk and El Hajj, <em>Programming Massively Parallel Processors</em>, chapters 2 to 5 and 10</td><td>The execution model, memory, and reductions in depth.</td></tr>
+<tr><td><a href="https://numba.readthedocs.io/en/stable/cuda/index.html">Numba for CUDA GPUs</a></td><td>Writing kernels in Python, and the CUDA simulator.</td></tr>
+<tr><td><a href="https://docs.pytorch.org/docs/stable/notes/cuda.html">PyTorch: CUDA semantics</a></td><td>Asynchronous execution, streams, events and synchronization in PyTorch.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. The Part A kernels were run in Numba 0.68's CUDA simulator.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {el,css,$}=IE;
+function lg(){const n=Math.max(1,+$('lgN').value),T=+$('lgT').value,S=+$('lgG').value;const B=Math.ceil(n/T),per=Math.min(32,Math.floor(2048/T));
+  const waves=Math.ceil(B/(S*per));const svg=$('lgSvg');svg.innerHTML='';const show=Math.min(B,200);const cols=50,w=680/cols;
+  for(let b=0;b<show;b++){const x=(b%cols)*w,y=Math.floor(b/cols)*26;const last=b===B-1&&n%T;el('rect',{x:x+1,y:y+2,width:w-2,height:22,rx:3,fill:css(last?'--dec':'--kv'),'fill-opacity':.85},svg);}
+  if(B>show)el('text',{x:0,y:116,fill:css('--ink2'),'font-size':11},svg,`showing ${show} of ${IE.int(B)} blocks`);
+  $('lgStats').innerHTML=[['Blocks',IE.int(B)],['Threads launched',IE.int(B*T)],['Idle threads in the last block',n%T?T-n%T:0],['Waves (≤ '+per+' blocks per SM)',waves]].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['lgN','lgT','lgG'].forEach(id=>$(id).addEventListener('input',lg));IE.onTheme(lg);
+function tl(){const K=+$('tlK').value,L=+$('tlL').value;$('tlKv').textContent=K;$('tlLv').textContent=L;
+  const N=12,svg=$('tlSvg');svg.innerHTML='';
+  function sim(sync){let cpu=0,gpu=0;const c=[],g=[];for(let i=0;i<N;i++){const ls=cpu;cpu+=L;c.push([ls,cpu,'launch']);const gs=Math.max(gpu,cpu);gpu=gs+K;g.push([gs,gpu]);if(sync){c.push([cpu,gpu,'wait']);cpu=gpu;}}return{c,g,end:Math.max(cpu,gpu)};}
+  const a=sim(false),b=sim(true);const mx=Math.max(a.end,b.end);const X=t=>90+t/mx*580;
+  [[a,'No sync',10],[b,'Sync each step',120]].forEach(([s,name,y0])=>{el('text',{x:0,y:y0+14,fill:css('--ink'),'font-size':12,'font-weight':600},svg,name);
+    el('text',{x:0,y:y0+36,fill:css('--ink2'),'font-size':11},svg,'CPU');el('text',{x:0,y:y0+66,fill:css('--ink2'),'font-size':11},svg,'GPU');
+    s.c.forEach(([t0,t1,k])=>el('rect',{x:X(t0),y:y0+24,width:Math.max(1,X(t1)-X(t0)),height:16,fill:css(k==='launch'?'--pre':'--bad'),'fill-opacity':k==='launch'?.9:.35},svg));
+    s.g.forEach(([t0,t1])=>el('rect',{x:X(t0),y:y0+54,width:Math.max(1,X(t1)-X(t0)-1),height:16,fill:css('--kv')},svg));});
+  const busy=(N*K);$('tlStats').innerHTML=[['Total, no sync',IE.int(a.end)+' µs'],['GPU busy, no sync',Math.round(busy/a.end*100)+'%'],['Total, with sync',IE.int(b.end)+' µs'],['GPU busy, with sync',Math.round(busy/b.end*100)+'%']].map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+['tlK','tlL'].forEach(id=>$(id).addEventListener('input',tl));IE.onTheme(tl);
+})();
+</script>
+
+</body>
+</html>

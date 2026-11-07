@@ -207,7 +207,7 @@ window.IE_CHAPTERS = [
 "title": "The CUDA execution model",
 "slug": "5-3-cuda-execution-model",
 "part": 5,
-"ready": false
+"ready": true
 },
 {
 "n": "5.4",
