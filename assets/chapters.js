@@ -270,7 +270,7 @@ window.IE_CHAPTERS = [
 "title": "Routing, load balancing and queueing",
 "slug": "6-4-routing-queueing",
 "part": 6,
-"ready": false
+"ready": true
 },
 {
 "n": "6.5",

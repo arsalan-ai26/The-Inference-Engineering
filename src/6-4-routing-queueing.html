@@ -1,0 +1,251 @@
+<div class="kicker">Part 6 · Production inference infrastructure · Chapter 6.4</div>
+<h1>Routing, load balancing and queueing</h1>
+<p class="lede">With more than one replica, every request needs a destination. For web services, spreading requests evenly is nearly optimal. For LLMs it is not: one request may carry 50 tokens and the next 50,000, replicas hold different cached prefixes and LoRA adapters, and responses stream for seconds or minutes. This chapter covers the difference between routers and load balancers, the routing policies used for LLMs and when each wins, queues and priorities, the queueing math that tells you how much headroom to keep, and how modern LLM-aware gateways put it together.</p>
+<div class="meta">
+  <span class="chip">Level: core</span>
+  <span class="chip">Time: 3 to 4 hours with the lab</span>
+  <span class="chip">Needs: 4.4, 6.1, 6.3</span>
+  <span class="chip">Compute: Colab CPU</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why can round-robin give terrible tail latency for LLM traffic even when replicas are identical?</li>
+    <li>What is "power of two choices"?</li>
+    <li>At 95% utilization, roughly how does waiting time compare with 80%?</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Requests differ hugely in cost. Round-robin counts requests, not work, so a replica that received a 50,000-token prompt keeps getting its share of new requests, which queue behind it.</li>
+    <li>Pick two replicas at random and send the request to the less loaded one. Much better than random, with very little state.</li>
+    <li>Several times longer. For 4 servers in the standard M/M/c model, mean wait goes from about 0.75 to about 4.5 service times. Waits explode as utilization nears 100%.</li>
+  </ol></details>
+</div>
+
+<h2 id="roles">1. Routers, load balancers and queues</h2>
+<ul>
+  <li><strong>Load balancer:</strong> a system-level component that spreads traffic over healthy replicas ("where <em>could</em> this request go?"). It handles health checks and removes failing replicas.</li>
+  <li><strong>Router:</strong> a request-level decision ("where <em>should</em> this request go?") using information about the request and the replicas: prompt length, prefix, requested model or LoRA adapter, priority, replica load and cache contents.</li>
+  <li><strong>Queue:</strong> where requests wait when every replica is at its concurrency target, while the autoscaler adds capacity (chapter 6.3).</li>
+</ul>
+<p>Real stacks chain them: a global load balancer picks a region (chapter 6.5), a gateway routes to a model deployment, and an LLM-aware router picks a replica.</p>
+
+<h2 id="different">2. Why LLM routing is different</h2>
+<ul>
+  <li><strong>Request cost varies by orders of magnitude.</strong> Prefill cost scales with prompt length, decode time with output length; a request count says almost nothing about load.</li>
+  <li><strong>Replicas have state.</strong> A replica that holds a prefix in its KV cache serves that request much faster (chapter 4.4); one that has a LoRA adapter loaded avoids loading it.</li>
+  <li><strong>Long-lived streams.</strong> A request occupies a slot for its whole generation; connection-level balancing at the start of a stream decides its fate for minutes.</li>
+  <li><strong>Engines already batch internally.</strong> Sending more requests to a replica is fine until its concurrency target, then latency rises steeply.</li>
+</ul>
+
+<h2 id="policies">3. Routing policies</h2>
+<div class="tbl"><table>
+<tr><th>Policy</th><th>How it chooses</th><th>Needs</th><th>Good for</th></tr>
+<tr><td>Round-robin / random</td><td>Next in turn / any</td><td>Nothing</td><td>Uniform, short requests only</td></tr>
+<tr><td>Least requests (connections)</td><td>Fewest in-flight requests</td><td>Request counts per replica</td><td>Better, but blind to request size</td></tr>
+<tr><td>Power of two choices</td><td>Less loaded of two random replicas</td><td>Load of two replicas</td><td>Scales to many routers and replicas with little state</td></tr>
+<tr><td>Token- or work-aware</td><td>Least outstanding work (prompt tokens, estimated decode)</td><td>Per-replica work estimates</td><td>Heavy-tailed prompt lengths</td></tr>
+<tr><td>Prefix-cache-aware</td><td>Replica holding the longest prefix, within a load cap</td><td>Approximate or exact (KV events) cache index</td><td>Chat, agents, shared system prompts (chapter 4.4)</td></tr>
+<tr><td>LoRA-aware</td><td>Replica with the adapter loaded</td><td>Adapter residency per replica</td><td>Many fine-tunes on one base model</td></tr>
+<tr><td>SLO- or latency-aware</td><td>Replica predicted to meet the request's TTFT and TPOT</td><td>A latency predictor from live metrics</td><td>Mixed priorities and strict SLOs</td></tr>
+</table></div>
+<p>Policies are combined: filter replicas that cannot serve the request (wrong adapter, overloaded), score the rest on several signals (cache affinity, queue length, KV usage), and pick the best. llm-d's Endpoint Picker uses exactly this filter-score-pick pipeline. Ray Serve's prefix-aware router, which keeps an approximate prefix tree of what it sent where, reported 60% lower TTFT and over 40% higher throughput than power-of-two routing on a shared-prefix workload with a 32B model.</p>
+<div class="widget" id="rtW">
+  <div class="wt">Interactive: routing heavy-tailed prompts</div>
+  <div class="ws">Four replicas each prefill at 20,000 tokens per second, first come first served. Prompt lengths are log-normal (typically a few hundred to a few thousand tokens) and 2% are 50,000-token documents. Compare policies on TTFT as load rises. (TTFT only; decode ignored.)</div>
+  <div class="ctrls">
+    <label>Requests per second: <span class="mono" id="rtRv"></span><input type="range" id="rtR" min="5" max="40" step="1" value="30"></label>
+    <label>Share of 50K-token prompts: <span class="mono" id="rtLv"></span><input type="range" id="rtL" min="0" max="0.05" step="0.005" value="0.02"></label>
+  </div>
+  <div class="svgwrap"><svg id="rtSvg" viewBox="0 0 680 200" width="680" style="max-width:100%;height:auto" role="img" aria-label="TTFT by routing policy"></svg></div>
+  <div class="ws" id="rtNote"></div>
+</div>
+
+<h2 id="queues">4. Queues, priorities and fairness</h2>
+<p>When every replica is at its target, requests wait. Queue design decides who waits:</p>
+<ul>
+  <li><strong>FIFO</strong> is fair in arrival order and simple.</li>
+  <li><strong>Priority queues</strong> serve higher tiers first (paid over free, interactive over batch). Combine with aging so low priority still progresses.</li>
+  <li><strong>Per-tenant fairness</strong> (fair-share scheduling) stops one customer's burst from filling the queue for everyone.</li>
+  <li><strong>Deadlines:</strong> each request carries a time after which its answer is useless; drop or reject it then instead of spending GPU time on it.</li>
+  <li><strong>Admission control:</strong> when the queue predicts a wait beyond the SLO, reject early (HTTP 429 with a retry hint) or route to a lower tier, rather than accepting requests that will fail anyway.</li>
+</ul>
+<p>When new replicas come up, the queue must hand them work immediately up to their concurrency target; otherwise requests keep waiting for the old replicas while the new ones idle.</p>
+
+<h2 id="math">5. The queueing math behind headroom</h2>
+<p>A standard model for c identical servers with random (Poisson) arrivals and random service times is M/M/c. Its key result is that waiting time is not proportional to load: it grows slowly at first and explodes near full utilization. The Erlang C formula gives the probability that a request must wait and the mean wait.</p>
+<div class="widget" id="ecW">
+  <div class="wt">Interactive: waiting time vs utilization (M/M/c)</div>
+  <div class="ws">Mean wait in units of one request's service time, for c servers. Real LLM replicas batch internally, so treat this as a guide to the shape, not a precise prediction.</div>
+  <div class="ctrls"><label>Servers (replicas) c <select id="ecC"><option>1</option><option>2</option><option selected>4</option><option>8</option><option>16</option></select></label></div>
+  <div class="svgwrap"><svg id="ecSvg" viewBox="0 0 680 230" width="680" style="max-width:100%;height:auto" role="img" aria-label="Mean wait against utilization"></svg></div>
+  <div class="stats" id="ecStats"></div>
+</div>
+<p>Two practical conclusions. First, plan to run at 70% to 80% of capacity, not 95%: the last 20% of utilization costs most of your latency budget, and bursts push you there anyway. Second, larger pools tolerate higher utilization for the same wait (pooling): 16 replicas behind one queue wait far less than 4 groups of 4 at the same load, which is another reason to route across the whole pool rather than pin traffic.</p>
+
+<h2 id="gateways">6. LLM-aware gateways in practice</h2>
+<ul>
+  <li><strong>llm-d</strong> (Kubernetes): a gateway proxy following the Gateway API Inference Extension, with an Endpoint Picker that scores pods on KV-cache affinity, queue depth and live metrics, multi-priority flow control with fair sharing, and an optional latency predictor for SLO-aware routing.</li>
+  <li><strong>NVIDIA Dynamo:</strong> KV-aware routing across workers, integrated with disaggregation (chapter 4.6).</li>
+  <li><strong>SGLang router</strong> and <strong>vLLM's production stack</strong>: cache-aware routing in front of engine replicas.</li>
+  <li><strong>Ray Serve:</strong> pluggable request routers, including the prefix-aware router above.</li>
+</ul>
+<p>Whatever the stack, the router needs live data from replicas (in-flight requests, waiting queue, KV usage, cache events). Stale data leads to herding: every router sends to the replica that looked emptiest a second ago.</p>
+
+<h2 id="expert">7. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">Routing inside a replica: DP ranks</span>
+  <p>With data-parallel attention for large MoE models (chapter 4.5), one "replica" contains several DP ranks, each with its own KV cache. Requests must be routed to the rank holding their prefix, so prefix-aware routing extends inside the replica.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Herding and randomization</span>
+  <p>Many independent routers reading the same slightly stale load data all choose the same "least loaded" replica. Power of two choices and adding randomness to scores avoid this; so does centralizing the decision in one Endpoint Picker per pool.</p>
+</div>
+<div class="box expert">
+  <span class="lbl">Semantic and model routing</span>
+  <p>Some gateways route by content: easy questions to a small model, hard ones to a large model, or each domain to a fine-tuned variant. This saves cost but changes quality; evaluate it like any model change.</p>
+</div>
+
+<h2 id="mistakes">8. Common mistakes</h2>
+<ul>
+  <li>Round-robin or least-connections in front of LLM replicas with heavy-tailed prompts.</li>
+  <li>Cache affinity without a load cap (chapter 4.4).</li>
+  <li>Unbounded queues that accept requests guaranteed to miss their SLO.</li>
+  <li>Planning capacity at 95% utilization.</li>
+  <li>Long-lived streams cut by load balancer idle timeouts.</li>
+  <li>Routers acting on stale metrics and herding.</li>
+</ul>
+
+<h2 id="lab">9. Lab</h2>
+<p><strong>Goal:</strong> compare routing policies on heavy-tailed traffic and quantify headroom with queueing math.</p>
+<h3>Part A: the 100 Days notebook</h3>
+<p>Run day 24 (routing, load balancing and queueing) of <em>100 Days of Inference</em>: its three routing simulators, priority-queue burst test and M/M/c curves.</p>
+<h3>Part B: routing policies (CPU, seconds)</h3>
+<pre>import random
+PREFILL = 20_000                                     # tokens per second per replica
+def make_requests(n=4000, rate=30, seed=0):
+    rnd = random.Random(seed); t = 0; reqs = []
+    for _ in range(n):
+        t += rnd.expovariate(rate)
+        length = 50_000 if rnd.random() &lt; 0.02 else int(rnd.lognormvariate(6.5, 0.8))
+        reqs.append((t, length))
+    return reqs
+
+def run(policy, R=4, seed=0):
+    rnd = random.Random(seed + 1)
+    free_at = [0.0] * R; ttft = []; rr = 0
+    for t, n in make_requests(seed=seed):
+        backlog = [max(0.0, f - t) for f in free_at]     # seconds of queued work per replica
+        if policy == "round robin": r = rr % R; rr += 1
+        elif policy == "random":    r = rnd.randrange(R)
+        elif policy == "power of two":
+            pass   # TODO: sample two replicas, pick the one with less backlog
+        elif policy == "least work":
+            pass   # TODO: pick the replica with the least backlog
+        start = max(t, free_at[r]); free_at[r] = start + n / PREFILL
+        ttft.append(free_at[r] - t)
+    ttft.sort()
+    return ttft[len(ttft) // 2], ttft[int(0.99 * (len(ttft) - 1))]
+
+for pol in ["round robin", "random", "power of two", "least work"]:
+    p50, p99 = run(pol)
+    print(f"{pol:13s} TTFT p50 {p50*1e3:7.0f} ms   p99 {p99*1e3:7.0f} ms")</pre>
+<details><summary>Solution</summary>
+<pre>        elif policy == "power of two":
+            a, b = rnd.sample(range(R), 2); r = a if backlog[a] &lt;= backlog[b] else b
+        elif policy == "least work":
+            r = min(range(R), key=lambda k: backlog[k])</pre></details>
+<details><summary>What we measured, and why</summary><pre class="out">round robin   TTFT p50    1722 ms   p99   18687 ms
+random        TTFT p50    1642 ms   p99   20512 ms
+power of two  TTFT p50     177 ms   p99    4010 ms
+least work    TTFT p50     149 ms   p99    3340 ms</pre>
+<p>At about 70% utilization, blind policies let short requests queue behind 50,000-token prompts: the median user waits 1.7 s and the p99 user almost 19 s. Looking at just two replicas cuts the median ten times; full knowledge of outstanding work does a little better. Now set the long-prompt share to 0: how much do the policies differ? Then add a cache-affinity rule from chapter 4.4 on top of least work.</p></details>
+<h3>Part C: headroom from Erlang C</h3>
+<pre>import math
+def erlang_c(c, rho):                                # probability a request must wait
+    a = c * rho
+    s = sum(a**k / math.factorial(k) for k in range(c))
+    top = a**c / math.factorial(c) / (1 - rho)
+    return top / (s + top)
+for rho in [0.5, 0.7, 0.8, 0.9, 0.95, 0.98]:
+    pw = erlang_c(4, rho)
+    print(f"utilization {rho:.2f}: P(wait) {pw:.2f}, mean wait {pw / (4 * (1 - rho)):5.2f} x service time")</pre>
+<details><summary>What we measured</summary><p>For 4 servers: mean wait 0.09, 0.36, 0.75, 1.97, 4.46 and 11.95 service times at 50%, 70%, 80%, 90%, 95% and 98% utilization. Repeat with c = 16 at 90%: the wait is far smaller. Use this to argue for a utilization target in your capacity plan (chapter 6.5).</p></details>
+
+<h2 id="realworld">10. In the real world</h2>
+<div class="box real">
+  <span class="lbl">Routing in production</span>
+  <ul>
+    <li><strong>Kubernetes inference stacks</strong> adopt LLM-aware gateways (llm-d, Gateway API Inference Extension) instead of plain service load balancing.</li>
+    <li><strong>Agent and chat platforms</strong> route sessions to replicas holding their history, with load caps.</li>
+    <li><strong>Multi-tenant APIs</strong> use per-tenant quotas, priority tiers and early rejection (429s) to keep SLOs under overload.</li>
+    <li><strong>LoRA platforms</strong> route by adapter residency to avoid loading adapters on every request.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">11. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz64"></div>
+<script type="application/json" id="qz64">[
+{"q":"A load balancer answers ___; a router answers ___.","o":["where should / where could","where could this request go / where should it go","how fast / how many","which model / which GPU"],"a":1,"e":"Load balancers keep a set of healthy options; routers pick the best one per request."},
+{"q":"Why is least-requests routing weak for LLMs?","o":["It needs too much state","Request counts ignore that requests differ hugely in work","It causes herding always","It breaks streaming"],"a":1,"e":"One 50K-token prompt can equal hundreds of chat turns."},
+{"q":"Power of two choices needs:","o":["Global state of all replicas","The load of two randomly chosen replicas","A prefix tree","KV events"],"a":1,"e":"That small sample removes most of random routing's imbalance."},
+{"q":"Why plan for 70% to 80% utilization?","o":["GPUs overheat","Waiting time grows steeply near 100%","Engines require it","Billing rules"],"a":1,"e":"Queueing delay explodes as utilization approaches 1."},
+{"q":"A request will clearly miss its SLO in the queue. Best action:","o":["Keep it queued","Reject early or route to a lower tier","Move it to the front","Retry it twice"],"a":1,"e":"Admission control protects the requests that can still succeed."},
+{"q":"llm-d's Endpoint Picker selects pods by:","o":["Round-robin","A filter, score and pick pipeline using live metrics and KV affinity","DNS","Random choice"],"a":1,"e":"It combines several signals with configurable plugins."}
+]</script>
+
+<h2 id="summary">12. Summary</h2>
+<ul>
+  <li>Load balancers keep healthy options; routers pick per request; queues hold overflow while capacity is added.</li>
+  <li>LLM requests differ hugely in cost and replicas hold state (KV prefixes, adapters), so request-count routing fails.</li>
+  <li>Use work-aware or power-of-two routing, add cache and adapter affinity with load caps, and consider SLO-aware scoring.</li>
+  <li>Design queues with priorities, per-tenant fairness, deadlines and early rejection.</li>
+  <li>Queueing math says waits explode near full utilization: keep 20% to 30% headroom and pool capacity.</li>
+</ul>
+
+<h2 id="refs">13. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td>Philip Kiely, <em>Inference Engineering</em>, section 7.2.3</td><td>Routers vs load balancers, KV- and LoRA-aware routing, and queues.</td></tr>
+<tr><td><a href="https://www.anyscale.com/blog/ray-serve-faster-first-token-custom-routing">Anyscale: Ray Serve custom request routing</a></td><td>Power of two choices vs a prefix-aware router; 60% lower TTFT on a shared-prefix workload.</td></tr>
+<tr><td><a href="https://llm-d.ai/docs/architecture">llm-d: Architecture</a></td><td>The LLM-aware router, Endpoint Picker, flow control and latency predictor.</td></tr>
+<tr><td><a href="https://llm-d.ai/blog/kvcache-wins-you-can-see">llm-d: KV-cache wins you can see</a></td><td>Precise prefix-aware scheduling results (chapter 4.4).</td></tr>
+<tr><td><a href="https://github.com/elizabetht/100-days-of-inference">100 Days of Inference</a>, day 24</td><td>Routing simulators, priority queues under bursts, and M/M/c curves.</td></tr>
+<tr><td>Fuheng Wu, <em>Distributed AI Systems</em></td><td>Load balancing and scheduling in distributed serving.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. Parts B and C were run with Python 3.13.</p>
+<!--SCRIPT-->
+<script>
+(function(){
+const {el,css,$}=IE;
+function rng(seed){let s=seed>>>0;return()=>{s=(s*1664525+1013904223)>>>0;return s/4294967296;};}
+function gauss(r){let u=0;while(!u)u=r();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*r());}
+function sim(pol,rate,share){const r=rng(11),r2=rng(29),R=4,PF=20000;let t=0,rr=0;const free=new Array(R).fill(0),tt=[];
+  for(let i=0;i<3000;i++){t+=-Math.log(1-r())/rate;const n=r()<share?50000:Math.round(Math.exp(6.5+0.8*gauss(r)));
+    const bl=free.map(f=>Math.max(0,f-t));let k;
+    if(pol==='round robin')k=(rr++)%R;else if(pol==='random')k=Math.floor(r2()*R);
+    else if(pol==='power of two'){const a=Math.floor(r2()*R);let b=Math.floor(r2()*(R-1));if(b>=a)b++;k=bl[a]<=bl[b]?a:b;}
+    else k=bl.indexOf(Math.min(...bl));
+    const st=Math.max(t,free[k]);free[k]=st+n/PF;tt.push(free[k]-t);}
+  tt.sort((a,b)=>a-b);return[tt[Math.floor(tt.length/2)],tt[Math.floor(0.99*(tt.length-1))]];}
+function rt(){const rate=+$('rtR').value,share=+$('rtL').value;$('rtRv').textContent=rate;$('rtLv').textContent=(share*100).toFixed(1)+'%';
+  const P=['round robin','random','power of two','least work'];const res=P.map(p=>[p,...sim(p,rate,share)]);
+  const svg=$('rtSvg');svg.innerHTML='';const mx=Math.max(...res.map(x=>x[2]));const L=v=>Math.log10(Math.max(v,0.01));const lo=L(0.01),hi=L(mx)+0.1;const W=v=>(L(v)-lo)/(hi-lo)*380;
+  res.forEach((x,i)=>{const y=10+i*46;el('text',{x:0,y:y+20,fill:css('--ink'),'font-size':13},svg,x[0]);
+    el('rect',{x:120,y,width:Math.max(2,W(x[2])),height:14,rx:3,fill:css('--dec'),'fill-opacity':.5},svg);
+    el('rect',{x:120,y:y+16,width:Math.max(2,W(x[1])),height:14,rx:3,fill:css('--kv')},svg);
+    el('text',{x:126+W(x[2]),y:y+12,fill:css('--ink'),'font-size':11},svg,'p99 '+(x[2]<1?Math.round(x[2]*1e3)+' ms':x[2].toFixed(1)+' s'));
+    el('text',{x:126+Math.max(W(x[1]),2),y:y+28,fill:css('--ink2'),'font-size':11},svg,'p50 '+(x[1]<1?Math.round(x[1]*1e3)+' ms':x[1].toFixed(1)+' s'));});
+  const mean=(1-share)*Math.exp(6.5+0.32)+share*50000;$('rtNote').textContent=`Utilization about ${Math.round(rate*mean/(4*20000)*100)}% (mean prompt ${IE.int(mean)} tokens). Bars use a log scale.`;}
+['rtR','rtL'].forEach(id=>$(id).addEventListener('input',rt));IE.onTheme(rt);
+function fact(n){let f=1;for(let i=2;i<=n;i++)f*=i;return f;}
+function ec(c,rho){const a=c*rho;let s=0;for(let k=0;k<c;k++)s+=a**k/fact(k);const top=a**c/fact(c)/(1-rho);return top/(s+top);}
+function ecd(){const c=+$('ecC').value;const svg=$('ecSvg');svg.innerHTML='';const x0=50,x1=640,y0=200,y1=10,ym=10;const X=u=>x0+u*(x1-x0),Y=v=>y0-Math.min(v,ym)/ym*(y0-y1);
+  for(let v=0;v<=ym;v+=2){el('line',{x1:x0,x2:x1,y1:Y(v),y2:Y(v),stroke:css('--line')},svg);el('text',{x:x0-6,y:Y(v)+4,'text-anchor':'end',fill:css('--ink2'),'font-size':10},svg,v);}
+  [0,0.2,0.4,0.6,0.8,1].forEach(u=>el('text',{x:X(u),y:y0+16,'text-anchor':'middle',fill:css('--ink2'),'font-size':10},svg,Math.round(u*100)+'%'));
+  let d='';for(let u=0.01;u<0.995;u+=0.005){const w=ec(c,u)/(c*(1-u));d+=(d?'L':'M')+X(u).toFixed(1)+','+Y(w).toFixed(1);}el('path',{d,fill:'none',stroke:css('--dec'),'stroke-width':2.5},svg);
+  [0.7,0.8,0.9,0.95].forEach(u=>{const w=ec(c,u)/(c*(1-u));el('circle',{cx:X(u),cy:Y(w),r:3.5,fill:css('--kv')},svg);});
+  $('ecStats').innerHTML=[0.7,0.8,0.9,0.95].map(u=>['Wait at '+Math.round(u*100)+'%',(ec(c,u)/(c*(1-u))).toFixed(2)+' ×']).map(z=>`<div class="stat"><div class="k">${z[0]}</div><div class="v">${z[1]}</div></div>`).join('');}
+$('ecC').addEventListener('input',ecd);IE.onTheme(ecd);
+})();
+</script>
