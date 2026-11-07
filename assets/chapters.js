@@ -382,7 +382,7 @@ window.IE_CHAPTERS = [
 "title": "Build a mini inference engine",
 "slug": "8-3-mini-engine",
 "part": 8,
-"ready": false
+"ready": true
 },
 {
 "n": "8.4",

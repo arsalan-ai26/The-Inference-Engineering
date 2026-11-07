@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>8.3 Build a mini inference engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="../assets/book.css">
+</head>
+<body data-chapter="8.3">
+<div class="topbar" style="padding-left:0;padding-right:0"><a href="../index.html">← The Inference Engineering Book</a><span>Part 8 · Chapter 8.3</span></div>
+<div class="shell">
+<nav class="toc" aria-label="Chapter contents"></nav>
+<main><article>
+<div class="kicker">Part 8 · Specialized workloads, engine internals and research · Chapter 8.3</div>
+<h1>Build a mini inference engine</h1>
+<p class="lede">The best way to understand an inference engine is to write one. This chapter builds a working engine for Qwen2-family models in under 200 lines of PyTorch, in seven steps that mirror vLLM's design: a model runner written from the weights, a KV cache, a forward pass over a flat list of tokens from many requests, a continuous-batching scheduler with a token budget and chunked prefill, a paged KV cache with a block pool and reference counts, per-token streaming, and prefix caching with metrics. It produces exactly the same greedy tokens as Hugging Face, survives preemption, passes randomized allocator tests, serves 16 requests 5.2 times faster than one-at-a-time generation, and cuts prefill work by 88% with prefix caching.</p>
+<div class="meta">
+  <span class="chip">Level: expert</span>
+  <span class="chip">Time: 1 to 2 days</span>
+  <span class="chip">Needs: 2.2 to 2.4, 3.2 to 3.5, 8.2</span>
+  <span class="chip">Compute: Colab CPU (GPU optional)</span>
+</div>
+
+<div class="box skip">
+  <span class="lbl">Before you start: skip check</span>
+  <ol>
+    <li>Why does a continuous-batching engine run its linear layers over a flat list of tokens rather than a padded [batch, length] tensor?</li>
+    <li>A preempted request lost its KV blocks. How does the engine resume it?</li>
+    <li>Your engine's greedy output differs from <code>model.generate(..., do_sample=False)</code>. Name a cause that is not a bug in your engine.</li>
+  </ol>
+  <details><summary>Answers</summary><ol>
+    <li>Requests in one step have different numbers of new tokens (a prefill chunk of hundreds, decodes of one). Flattening them avoids padding: the matmuls see exactly the real tokens. Only attention needs to know which tokens belong to which sequence.</li>
+    <li>By recomputation: it returns to the waiting queue with zero computed tokens, and its prompt plus generated tokens are prefilled again when blocks are free (chapter 3.3). The output is unchanged in exact arithmetic.</li>
+    <li>The model's <code>generation_config</code>. Qwen2.5-Instruct ships with <code>repetition_penalty=1.1</code>, which <code>generate</code> applies even with <code>do_sample=False</code>. Compare with <code>repetition_penalty=1.0</code> (it cost us an hour of debugging; see section 4).</li>
+  </ol></details>
+</div>
+
+<h2 id="design">1. The design</h2>
+<div class="svgwrap"><svg id="meSvg" viewBox="0 0 680 230" width="680" style="max-width:100%;height:auto" role="img" aria-label="Mini engine components and one step"></svg></div>
+<div class="tbl"><table>
+<tr><th>Step</th><th>Component</th><th>vLLM counterpart (chapter 8.2)</th><th>What to test</th></tr>
+<tr><td>1</td><td><code>Model</code>: Qwen2 forward from the weights (RMSNorm, RoPE, GQA attention with q/k/v bias, SwiGLU, tied head)</td><td><code>model_executor/models/qwen2.py</code></td><td>Logits match Hugging Face within 10⁻⁴</td></tr>
+<tr><td>2</td><td>KV cache tensor <code>[layers, 2, slots, kv_heads, head_dim]</code></td><td>KV cache allocated by the worker</td><td>Incremental decode equals full recomputation</td></tr>
+<tr><td>3</td><td><code>Model.forward</code> over a flat token list with per-sequence metadata</td><td><code>GPUModelRunner._prepare_inputs</code>, attention metadata</td><td>Mixed prefill and decode in one step</td></tr>
+<tr><td>4</td><td><code>Engine.step</code>: running requests first, then admit waiting ones within the token budget; chunked prefill</td><td><code>Scheduler.schedule</code></td><td>Same output at budgets 16 and 512</td></tr>
+<tr><td>5</td><td><code>BlockPool</code>, block tables, slot mapping, preemption by recomputation</td><td><code>BlockPool</code>, <code>KVCacheManager.allocate_slots</code>, <code>_preempt_request</code></td><td>Same output with a 12-block pool; randomized allocator properties</td></tr>
+<tr><td>6</td><td><code>step()</code> returns (request, token) events; <code>run(on_token=...)</code> streams them</td><td><code>OutputProcessor</code>, streaming responses</td><td>Tokens arrive per step, in order</td></tr>
+<tr><td>7</td><td>Block hashes (parent hash + token IDs), cache lookup on arrival, TTFT and step metrics</td><td>Prefix caching in <code>KVCacheManager</code>, <code>vllm/v1/metrics</code></td><td>Fewer computed tokens, lower TTFT, same output</td></tr>
+</table></div>
+
+<h2 id="key">2. The key ideas in the code</h2>
+<ul>
+  <li><strong>One rule for the scheduler</strong>, as in vLLM: every request has <code>computed</code> tokens and needs <code>len(tokens)</code>; each step gives running requests what they need (1 for decode, the rest of an unfinished chunked prefill), then admits waiting requests in order until the token budget is spent.</li>
+  <li><strong>Slot mapping:</strong> a token at position p of a sequence lives in block <code>block_table[p // block_size]</code>, slot <code>p % block_size</code>. The forward pass writes new keys and values to those slots, then attention gathers each sequence's slots in order.</li>
+  <li><strong>Reference counts and cached free blocks:</strong> a released block whose content is registered in the hash table stays findable until it is reallocated; a cache hit revives it and raises its count. Allocation evicts the hash of the block it hands out.</li>
+  <li><strong>Prefix hashes chain:</strong> each full block's hash covers its parent's hash and its own token IDs, so a block matches only if everything before it matches (chapter 3.5).</li>
+  <li><strong>Recompute the last prompt token</strong> even on a full cache hit, so there are logits to sample the first output token from.</li>
+</ul>
+
+<h2 id="code">3. The engine</h2>
+<details><summary>mini_engine.py (184 lines)</summary><pre>"""mini_engine.py: a small inference engine for Qwen2-family models, built step by step.
+
+Step 1 model runner   Step 2 KV cache   Step 3 batched forward over a flat token list
+Step 4 continuous batching scheduler with a token budget (chunked prefill)
+Step 5 paged KV cache: block pool, block tables, reference counts
+Step 6 streaming per request          Step 7 prefix caching and metrics
+Runs on CPU in FP32; the structure is the same as vLLM's (chapter 8.2).
+"""
+import hashlib, time, collections, torch, torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# ---------- Step 1: the model, written out from its weights ----------
+class Model:
+    def __init__(self, name):
+        hf = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32)
+        c = hf.config; sd = {k: v.detach() for k, v in hf.state_dict().items()}
+        self.L, self.H, self.KV = c.num_hidden_layers, c.num_attention_heads, c.num_key_value_heads
+        self.D = c.hidden_size // self.H; self.eps = c.rms_norm_eps
+        theta = (getattr(c, "rope_parameters", None) or {}).get("rope_theta", getattr(c, "rope_theta", 1e6))
+        self.inv_freq = 1.0 / (theta ** (torch.arange(0, self.D, 2).float() / self.D))
+        g = lambda k: sd[k]
+        self.emb = g("model.embed_tokens.weight"); self.norm = g("model.norm.weight")
+        self.head = sd.get("lm_head.weight", self.emb)            # tied embeddings in small Qwen models
+        self.layers = [{k: g(f"model.layers.{i}.{k}") for k in [
+            "input_layernorm.weight", "post_attention_layernorm.weight",
+            "self_attn.q_proj.weight", "self_attn.q_proj.bias", "self_attn.k_proj.weight", "self_attn.k_proj.bias",
+            "self_attn.v_proj.weight", "self_attn.v_proj.bias", "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"]} for i in range(self.L)]
+        self.vocab = self.emb.shape[0]; del hf
+
+    def rms(self, x, w): return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * w
+
+    def rope(self, x, pos):                                        # x: [N, heads, D], rotate-half convention
+        f = pos[:, None].float() * self.inv_freq[None]; cos, sin = f.cos().repeat(1, 2)[:, None], f.sin().repeat(1, 2)[:, None]
+        x1, x2 = x[..., : self.D // 2], x[..., self.D // 2:]
+        return x * cos + torch.cat([-x2, x1], -1) * sin
+
+    # ---------- Step 3 + 5: one forward pass over a flat list of tokens from many sequences ----------
+    def forward(self, tokens, positions, seqs, kv, block_size):
+        """tokens, positions: [N]. seqs: list of (start, length, block_table, context_len) per sequence.
+        kv: [layers, 2, blocks * block_size, KV, D]. Writes new K/V into the paged cache, returns logits of each seq's last token."""
+        x = self.emb[tokens]
+        slots = torch.cat([torch.tensor([bt[p // block_size] * block_size + p % block_size for p in range(ctx - n, ctx)])
+                           for (_, n, bt, ctx) in seqs])          # where each new token's K/V goes
+        for li, w in enumerate(self.layers):
+            h = self.rms(x, w["input_layernorm.weight"])
+            q = (h @ w["self_attn.q_proj.weight"].T + w["self_attn.q_proj.bias"]).view(-1, self.H, self.D)
+            k = (h @ w["self_attn.k_proj.weight"].T + w["self_attn.k_proj.bias"]).view(-1, self.KV, self.D)
+            v = (h @ w["self_attn.v_proj.weight"].T + w["self_attn.v_proj.bias"]).view(-1, self.KV, self.D)
+            q, k = self.rope(q, positions), self.rope(k, positions)
+            kflat, vflat = kv[li, 0], kv[li, 1]                    # [blocks * block_size, KV, D] views
+            kflat[slots] = k; vflat[slots] = v                     # paged write
+            outs = []
+            for (s, n, bt, ctx) in seqs:                           # paged attention, one sequence at a time
+                idx = torch.cat([torch.arange(b * block_size, b * block_size + block_size) for b in bt])[:ctx]
+                K = kflat[idx].repeat_interleave(self.H // self.KV, 1); V = vflat[idx].repeat_interleave(self.H // self.KV, 1)
+                qs = q[s:s + n]                                    # [n, H, D]
+                att = torch.einsum("nhd,chd-&gt;hnc", qs, K) / self.D ** 0.5
+                qpos = torch.arange(ctx - n, ctx)[:, None]; mask = torch.arange(ctx)[None] &gt; qpos
+                att = att.masked_fill(mask[None], float("-inf")).softmax(-1)
+                outs.append(torch.einsum("hnc,chd-&gt;nhd", att, V).reshape(n, -1))
+            x = x + torch.cat(outs) @ w["self_attn.o_proj.weight"].T
+            h = self.rms(x, w["post_attention_layernorm.weight"])
+            x = x + (F.silu(h @ w["mlp.gate_proj.weight"].T) * (h @ w["mlp.up_proj.weight"].T)) @ w["mlp.down_proj.weight"].T
+        last = torch.tensor([s + n - 1 for (s, n, _, _) in seqs])
+        return self.rms(x[last], self.norm) @ self.head.T
+
+# ---------- Step 5 + 7: block pool with reference counts and prefix-cache hashes ----------
+class BlockPool:
+    def __init__(self, n):
+        self.free = collections.deque(range(n)); self.ref = [0] * n
+        self.hash_of = {}; self.by_hash = {}; self.hits = self.lookups = 0
+    def alloc(self):
+        if not self.free: return None
+        b = self.free.popleft()
+        if b in self.hash_of: self.by_hash.pop(self.hash_of.pop(b), None)   # evict its cached content
+        self.ref[b] = 1; return b
+    def release(self, b):
+        self.ref[b] -= 1
+        assert self.ref[b] &gt;= 0, "double free"
+        if self.ref[b] == 0: self.free.append(b)                 # cached blocks stay findable until reused
+    def lookup(self, h):
+        self.lookups += 1; b = self.by_hash.get(h)
+        if b is None: return None
+        if self.ref[b] == 0: self.free.remove(b)                 # revive a cached free block
+        self.ref[b] += 1; self.hits += 1; return b
+    def register(self, b, h): self.hash_of[b] = h; self.by_hash[h] = b
+
+def block_hash(parent, toks): return hashlib.sha256((parent + ",".join(map(str, toks))).encode()).hexdigest()
+
+class Request:
+    def __init__(self, rid, prompt_ids, max_new, temperature=0.0):
+        self.rid, self.prompt, self.out = rid, list(prompt_ids), []
+        self.max_new, self.temp = max_new, temperature
+        self.computed = 0; self.blocks = []; self.done = False
+        self.t_arrive = time.perf_counter(); self.t_first = None; self.t_done = None
+    @property
+    def tokens(self): return self.prompt + self.out
+
+# ---------- Step 4: the engine loop with continuous batching and a token budget ----------
+class Engine:
+    def __init__(self, model, num_blocks=256, block_size=16, token_budget=256, max_running=32, prefix_caching=True, eos=None):
+        self.m, self.bs, self.budget, self.max_running = model, block_size, token_budget, max_running
+        self.kv = torch.zeros(model.L, 2, num_blocks * block_size, model.KV, model.D)
+        self.pool = BlockPool(num_blocks); self.waiting = collections.deque(); self.running = []
+        self.prefix = prefix_caching; self.eos = eos; self.steps = 0; self.preemptions = 0; self.computed_tokens = 0
+
+    def add(self, req):
+        if self.prefix:                                          # Step 7: reuse full cached blocks of the prompt
+            parent = ""
+            for i in range(0, len(req.prompt) // self.bs * self.bs, self.bs):
+                h = block_hash(parent, req.prompt[i:i + self.bs])
+                b = self.pool.lookup(h)
+                if b is None: break
+                req.blocks.append(b); req.computed += self.bs; parent = h
+            req.computed = min(req.computed, len(req.prompt) - 1)    # always recompute at least the last prompt token
+        self.waiting.append(req)
+
+    def _ensure_blocks(self, req, upto):
+        while len(req.blocks) * self.bs &lt; upto:
+            b = self.pool.alloc()
+            if b is None: return False
+            req.blocks.append(b)
+        return True
+
+    def _preempt(self, scheduled=()):                            # evict the newest running request not yet scheduled
+        cands = [r for r in self.running if r not in scheduled]
+        victim = cands[-1] if cands else self.running[-1]
+        self.running.remove(victim)
+        for b in victim.blocks: self.pool.release(b)
+        victim.blocks, victim.computed = [], 0; self.preemptions += 1; self.waiting.appendleft(victim)
+
+    def step(self):
+        budget, batch = self.budget, []                           # batch: (req, n_new_tokens)
+        for r in list(self.running):                              # running first: decodes (1 token) or unfinished prefills
+            if r not in self.running or budget &lt;= 0: continue
+            n = min(len(r.tokens) - r.computed, budget)
+            while not self._ensure_blocks(r, r.computed + n):
+                self._preempt([b[0] for b in batch] + [r])
+                if r not in self.running: break
+            if r in self.running: batch.append((r, n)); budget -= n
+        while self.waiting and budget &gt; 0 and len(self.running) &lt; self.max_running:
+            r = self.waiting[0]; n = min(len(r.tokens) - r.computed, budget)   # chunked prefill
+            had = len(r.blocks)
+            if not self._ensure_blocks(r, r.computed + n):          # no room: give back what we took, wait
+                for b in r.blocks[had:]: self.pool.release(b)
+                del r.blocks[had:]; break
+            self.waiting.popleft(); self.running.append(r); batch.append((r, n)); budget -= n
+        if not batch: return []
+        toks, pos, seqs, s = [], [], [], 0
+        for r, n in batch:
+            toks += r.tokens[r.computed:r.computed + n]; pos += list(range(r.computed, r.computed + n))
+            seqs.append((s, n, r.blocks, r.computed + n)); s += n
+        self.computed_tokens += s
+        with torch.no_grad():
+            logits = self.m.forward(torch.tensor(toks), torch.tensor(pos), seqs, self.kv, self.bs)
+        self.steps += 1; events = []
+        for (r, n), lg in zip(batch, logits):
+            r.computed += n
+            if r.computed &lt; len(r.tokens): continue                 # still prefilling (chunked)
+            if self.prefix: self._register_full_blocks(r)
+            tok = int(lg.argmax()) if r.temp == 0 else int(torch.multinomial((lg / r.temp).softmax(-1), 1))
+            r.out.append(tok); now = time.perf_counter()
+            if r.t_first is None: r.t_first = now
+            events.append((r.rid, tok))                             # Step 6: stream each new token
+            if len(r.out) &gt;= r.max_new or tok == self.eos:
+                r.done, r.t_done = True, now; self.running.remove(r)
+                for b in r.blocks: self.pool.release(b)
+        return events
+
+    def _register_full_blocks(self, r):
+        parent = ""
+        for i, b in enumerate(r.blocks):
+            if (i + 1) * self.bs &gt; r.computed: break
+            h = block_hash(parent, r.tokens[i * self.bs:(i + 1) * self.bs])
+            if b not in self.pool.hash_of and h not in self.pool.by_hash: self.pool.register(b, h)
+            parent = h
+
+    def run(self, reqs, on_token=None):
+        for r in reqs: self.add(r)
+        while self.waiting or self.running:
+            for rid, tok in self.step():
+                if on_token: on_token(rid, tok)
+        return reqs
+</pre></details>
+
+<h2 id="debug">4. Debugging notes</h2>
+<p>Three bugs we hit while building this, each a lesson that transfers to real engines:</p>
+<ul>
+  <li><strong>"Greedy" outputs that did not match.</strong> The first test showed differences from Hugging Face at tokens 7 and 16. A per-step logit comparison showed the engine agreed with Hugging Face's own forward pass to 3 × 10⁻⁵, so the forward was right. The cause was <code>generate</code> applying the checkpoint's default <code>repetition_penalty=1.1</code>. Always pin every generation setting when comparing engines (chapter 6.10).</li>
+  <li><strong>A KV write into a copy.</strong> An earlier cache layout of <code>[blocks, layers, ...]</code> made <code>kv[:, layer]</code> non-contiguous, so reshaping it produced a copy and the writes vanished. Laying the cache out as <code>[layers, 2, slots, ...]</code> keeps each layer's keys a contiguous view.</li>
+  <li><strong>A deadlock under memory pressure.</strong> With a 12-block pool, a request that failed admission kept the blocks it had partially allocated while waiting; soon waiting requests held every block and nothing could run. Fix: release a failed admission's new blocks. This is why real engines check the full allocation before committing (<code>allocate_slots</code> returns nothing if the request does not fit).</li>
+</ul>
+
+<h2 id="gap">5. Why vLLM is still much faster</h2>
+<div class="tbl"><table>
+<tr><th>Gap</th><th>Mini engine</th><th>vLLM</th><th>Chapter</th></tr>
+<tr><td>Attention</td><td>Python loop over sequences; gathers K/V with indexing; materializes the score matrix</td><td>Fused paged-attention kernels (FlashAttention, FlashInfer) over all sequences at once</td><td>4.2, 5.4</td></tr>
+<tr><td>Overhead per step</td><td>Python builds slot maps and indices every layer</td><td>Persistent input batch, metadata built once per step, CUDA graphs</td><td>5.3, 5.7</td></tr>
+<tr><td>Kernels</td><td>Separate matmuls, norms and activations</td><td>Fused QKV, fused RMSNorm with residual, fused SiLU-and-multiply</td><td>5.4</td></tr>
+<tr><td>Process layout</td><td>Everything in one thread</td><td>API server, engine core and workers overlap tokenization, scheduling and compute</td><td>8.2</td></tr>
+<tr><td>Precision</td><td>FP32</td><td>BF16, FP8, quantized weights and KV</td><td>4.1</td></tr>
+<tr><td>Features</td><td>Greedy and temperature sampling</td><td>Speculative decoding, structured output, LoRA, multimodal, parallelism</td><td>Parts 3 and 4</td></tr>
+</table></div>
+<p>Explaining each gap from first principles, and measuring how much each closes, is the exercise in Part C of the lab.</p>
+
+<h2 id="expert">6. Expert layer</h2>
+<div class="box expert">
+  <span class="lbl">From this design to a real one</span>
+  <p>The next steps follow the book: replace the attention loop with a varlen kernel (FlashAttention's <code>flash_attn_varlen_func</code> or FlashInfer's paged decode), keep the input batch persistent between steps and update it incrementally (vLLM's <code>_update_states</code>), capture decode steps as CUDA graphs per batch-size bucket (chapter 5.7), and move the API and detokenization into another process. mini-SGLang and nano-vLLM (chapter 3.4) are complete reference designs of that kind in a few thousand lines.</p>
+</div>
+
+<h2 id="mistakes">7. Common mistakes</h2>
+<ul>
+  <li>Comparing with <code>generate</code> without pinning its generation config.</li>
+  <li>Writing KV into a tensor view that is really a copy.</li>
+  <li>Holding partially allocated blocks for a request that cannot run.</li>
+  <li>Preempting a request already scheduled in the current step.</li>
+  <li>Forgetting to recompute the last prompt token on a full cache hit.</li>
+  <li>Testing only with one request, where batching bugs cannot appear.</li>
+</ul>
+
+<h2 id="lab">8. Lab</h2>
+<h3>Part A: build it in seven steps</h3>
+<p>Write the design and a test plan first (the table in section 1). Then build one step at a time, with an AI assistant if you like, reviewing each step's code and running its test before the next. The engine in section 3 is a reference to compare with at the end, not a starting point.</p>
+<h3>Part B: the tests</h3>
+<pre>from mini_engine import Model, Engine, Request, BlockPool
+m = Model("Qwen/Qwen2.5-0.5B-Instruct")
+# correctness: three prompts, 48 tokens each, against HF generate(..., do_sample=False, repetition_penalty=1.0)
+for label, kw in [("budget 512", dict(token_budget=512)), ("chunked prefill, budget 16", dict(token_budget=16)),
+                  ("tiny KV pool (12 blocks)", dict(num_blocks=12))]:
+    e = Engine(m, **kw); rs = e.run([Request(i, P[i], 48) for i in range(3)])
+    print(label, all(r.out == ref[r.rid] for r in rs), e.steps, e.preemptions)
+# allocator properties: random alloc / release / register / lookup, checking invariants after every operation
+for trial in range(2000):
+    p = BlockPool(random.randint(1, 16)); held = []
+    ...   # no double allocation, no block twice in the free list, free blocks have count 0,
+          # counts equal the number of holders, cache hits return the block registered for that hash</pre>
+<details><summary>What we measured (2 CPU cores)</summary><pre class="out">budget 512                   outputs match HF: True  steps 48  preemptions 0  (7 s)
+chunked prefill, budget 16   outputs match HF: True  steps 55  preemptions 0  (9 s)
+tiny KV pool (12 blocks)     outputs match HF: True  steps 68  preemptions 1  (11 s)
+2,000 random trials x 200 operations: all invariants held</pre>
+<p>Chunked prefill took 7 more steps to finish the prompts; the tiny pool forced one preemption and recomputation, and the output was still token-for-token identical.</p></details>
+<h3>Part C: benchmark and explain</h3>
+<pre># 16 different prompts x 48 output tokens: HF generate one request at a time vs the engine
+# 9 requests sharing a 301-token system prompt: one warm-up request, then 8 more, prefix caching off and on</pre>
+<p>Predict first: how much faster is continuous batching here, and how many fewer tokens must be computed with prefix caching?</p>
+<details><summary>What we measured (2 CPU cores)</summary><pre class="out">16 requests x 48 tokens: HF one at a time 8.4 tok/s (92 s); mini engine 44.0 tok/s (17 s), 50 steps, median TTFT 2.3 s
+prefix caching off: prompt 301 tokens, tokens computed for 8 requests 2464, time 12.2 s, mean TTFT 6.56 s, block hits 0
+prefix caching on : prompt 301 tokens, tokens computed for 8 requests 288, time 3.5 s, mean TTFT 1.16 s, block hits 136</pre>
+<p>Continuous batching gave 5.2 times the throughput of one-at-a-time generation. Prefix caching cut the computed tokens by 88% (17 full blocks of each prompt came from the cache) and mean TTFT from 6.6 s to 1.2 s. Then run vLLM on the same model (on a GPU, or its CPU build) and explain the gap with the table in section 5: measure what share of a step goes to the attention loop with the PyTorch profiler (chapter 5.6), replace it with <code style="word-break:break-all">torch.nn.functional.scaled_dot_product_attention</code> on gathered K/V, and measure again.</p>
+
+<h2 id="realworld">9. In the real world</h2>
+<div class="box real">
+  <span class="lbl">In practice</span>
+  <ul>
+    <li><strong>Small engines</strong> such as nano-vLLM and mini-SGLang are used for teaching and for prototyping scheduler ideas before porting them to production engines.</li>
+    <li><strong>Engine teams</strong> test schedulers and allocators with randomized property tests and with exact-match tests against a reference.</li>
+  </ul>
+</div>
+
+<h2 id="quiz">10. Check yourself</h2>
+<div class="widget quiz" data-quiz="qz83"></div>
+<script type="application/json" id="qz83">[
+{"q":"Where does the token at position 37 go with block size 16 and block table [5, 2, 9]?","o":["Block 5, slot 5","Block 9, slot 5","Block 2, slot 5","Block 9, slot 37"],"a":1,"e":"37 // 16 = 2 → block_table[2] = 9; 37 % 16 = 5."},
+{"q":"Why do running requests get tokens before waiting ones?","o":["They are older","So decodes are never starved by new prefills","It is required by PyTorch","To save memory"],"a":1,"e":"Same policy as vLLM's scheduler."},
+{"q":"What caused the deadlock under memory pressure?","o":["Prefix caching","A failed admission kept its partially allocated blocks","Chunked prefill","FP32"],"a":1,"e":"Release on failure, or check the full allocation first."},
+{"q":"How does the engine resume a preempted request?","o":["From saved KV","By recomputing its prompt and generated tokens","It drops it","From the API"],"a":1,"e":"Recomputation."},
+{"q":"Prefix caching in the lab reduced computed tokens by about:","o":["10%","50%","88%","100%"],"a":2,"e":"2,464 down to 288."},
+{"q":"The largest single reason vLLM is faster than this engine:","o":["Better tokenizer","Fused paged-attention and other kernels with low per-step overhead","More memory","It skips layers"],"a":1,"e":"Plus CUDA graphs and process overlap."}
+]</script>
+
+<h2 id="summary">11. Summary</h2>
+<ul>
+  <li>An engine is a model runner, a KV cache, a flat-token forward pass, a scheduler with a token budget, a block pool, streaming and a prefix cache.</li>
+  <li>Test against a reference token for token, under chunking and preemption, and test the allocator with randomized properties.</li>
+  <li>Continuous batching and prefix caching give large gains even in a 184-line engine; production speed comes from kernels, CUDA graphs and process overlap.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+<div class="tbl"><table>
+<tr><th>Source</th><th>What it adds</th></tr>
+<tr><td><a href="https://github.com/sgl-project/mini-sglang">mini-SGLang</a></td><td>A compact reference engine with radix caching and overlap scheduling.</td></tr>
+<tr><td><a href="https://neutree.ai/blog/nano-vllm-part-1">Neutree, nano-vLLM</a></td><td>A compact vLLM-style engine walkthrough.</td></tr>
+<tr><td>vLLM source (chapter 8.2)</td><td>The production counterparts of each component.</td></tr>
+</table></div>
+<p class="note">Facts checked on 7 November 2026. All results measured on 2 CPU cores with PyTorch 2.15 and Transformers 5.22.</p>
+
+<div class="navfoot"></div>
+</article></main>
+</div>
+<script src="../assets/chapters.js"></script>
+<script src="../assets/book.js"></script>
+
+<script>
+(function(){
+const {$,el,css}=IE;
+function me(){const s=$('meSvg');s.innerHTML='';
+  const box=(x,y,w,h,f,st,t,t2)=>{el('rect',{x,y,width:w,height:h,rx:6,fill:css(f),stroke:css(st)},s);el('text',{x:x+w/2,y:y+(t2?h/2-2:h/2+4),'text-anchor':'middle','font-size':11.5,'font-weight':600,fill:css('--ink')},s,t);if(t2)el('text',{x:x+w/2,y:y+h/2+13,'text-anchor':'middle','font-size':9.5,fill:css('--ink2')},s,t2);};
+  const d=el('defs',{},s),m=el('marker',{id:'meA',viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto'},d);el('path',{d:'M0,0 L10,5 L0,10 z',fill:css('--ink2')},m);
+  const ar=(x1,y1,x2,y2,t)=>{el('line',{x1,y1,x2,y2,stroke:css('--ink2'),'stroke-width':1.5,'marker-end':'url(#meA)'},s);if(t)el('text',{x:(x1+x2)/2,y:(y1+y2)/2-5,'text-anchor':'middle','font-size':9.5,fill:css('--ink2')},s,t);};
+  box(10,20,130,50,'--panel2','--line','Requests','add(): cache lookup');
+  box(190,20,150,50,'--dec-s','--dec','Scheduler','Engine.step: budget');
+  box(390,20,130,50,'--kv-s','--kv','BlockPool','alloc, release, hash');
+  box(190,120,150,60,'--pre-s','--pre','Model.forward','flat tokens + slots');
+  box(390,120,130,60,'--kv-s','--kv','Paged KV cache','[layers, 2, slots, ...]');
+  box(10,120,130,60,'--good-s','--good','Stream','(request, token)');
+  ar(140,45,188,45,'waiting');ar(340,45,388,45,'blocks');ar(265,70,265,118,'batch');ar(340,150,388,150,'KV');ar(188,150,142,150,'');
+  el('text',{x:265,y:198,'text-anchor':'middle','font-size':9.5,fill:css('--ink2')},s,'sample, append, free finished blocks');
+  el('text',{x:10,y:222,'font-size':10,fill:css('--ink2')},s,'Each step: running requests first (1 token or the rest of a chunk), then waiting ones up to the budget.');}
+IE.onTheme(me);
+})();
+</script>
+
+</body>
+</html>
